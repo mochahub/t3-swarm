@@ -1,0 +1,4 @@
+.DS_Store
+node_modules/
+*.log
+.t3-swarm.json

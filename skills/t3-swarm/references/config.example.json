@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "defaults": {
+    "leadDepth": "high",
+    "workerDepth": "medium",
+    "cooldownMinutes": 60,
+    "maxWorkerLoops": 2,
+    "antiCannibalization": true,
+    "worktreeForParallelEdits": true
+  },
+  "providers": {
+    "codex": {
+      "depthOption": "reasoningEffort",
+      "depthMap": {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "deep": "xhigh"
+      }
+    },
+    "claudeAgent": {
+      "depthOption": "effort",
+      "depthMap": {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "deep": "xhigh"
+      }
+    },
+    "antigravity": {
+      "depthOption": "thought_level",
+      "depthMap": {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "deep": "high"
+      }
+    },
+    "acpRegistry_cline": {
+      "depthOption": null,
+      "staticOptions": {
+        "mode": "act",
+        "auto_approve": true
+      },
+      "maxDepth": "medium"
+    }
+  },
+  "leads": [
+    { "provider": "codex", "model": "gpt-6.2-astra" },
+    { "provider": "claudeAgent", "model": "claude-fable-5-2" }
+  ],
+  "workers": {
+    "heavy": [
+      { "provider": "claudeAgent", "model": "claude-opus-5-5" },
+      { "provider": "codex", "model": "gpt-6.2-sol" },
+      {
+        "provider": "antigravity",
+        "model": "gemini-4-neon",
+        "depthMap": { "deep": "xhigh" }
+      }
+    ],
+    "balanced": [
+      { "provider": "claudeAgent", "model": "claude-sonnet-5-5" },
+      { "provider": "codex", "model": "gpt-6.1-terra" },
+      {
+        "provider": "acpRegistry_cline",
+        "model": "deepseek/deepseek-v4.1-flash-1017"
+      },
+      { "provider": "antigravity", "model": "gemini-4-argon" }
+    ],
+    "fast": [
+      { "provider": "codex", "model": "gpt-6-luna" },
+      { "provider": "claudeAgent", "model": "claude-haiku-5-5" },
+      { "provider": "antigravity", "model": "gemini-3.8-flash" }
+    ]
+  }
+}

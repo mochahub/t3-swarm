@@ -1,0 +1,11 @@
+{
+  "name": "t3-swarm",
+  "author": {
+    "name": "MochaHub",
+    "url": "https://github.com/mochahub"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mochahub/t3-swarm"
+  }
+}
