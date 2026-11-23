@@ -1,12 +1,17 @@
 {
   "version": 1,
+  "allowProjectOverride": false,
   "defaults": {
     "leadDepth": "high",
     "workerDepth": "medium",
     "cooldownMinutes": 60,
     "maxWorkerLoops": 2,
+    "maxParallelWorkers": 4,
     "antiCannibalization": true,
     "worktreeForParallelEdits": true
+  },
+  "bucketAliases": {
+    "openai-codex": "codex"
   },
   "providers": {
     "codex": {
@@ -37,8 +42,10 @@
       }
     },
     "acpRegistry_cline": {
+      "bucket": "cline",
       "depthOption": null,
       "staticOptions": {
+        "provider": "cline",
         "mode": "act",
         "auto_approve": true
       },
