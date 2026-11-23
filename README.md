@@ -42,6 +42,9 @@ npx skills@latest add mochahub/t3-swarm -g -a claude-code
 
 # Example: Use Codex as your Coordinator
 npx skills@latest add mochahub/t3-swarm -g -a codex
+
+# Example: Use OMP / Pi as your Coordinator
+npx skills@latest add mochahub/t3-swarm -g -a pi
 ```
 
 This installs both skills from the repository:
@@ -56,6 +59,23 @@ If you use Antigravity and also want the optional 4-line always-on trigger rule 
 {
   "entries": [
     { "path": "~/path/to/t3-swarm" }
+  ]
+}
+```
+
+### Multi-Provider Harnesses (OMP / Pi, OpenCode, Cline)
+
+If you run a multi-provider harness like **OMP (oh-my-pi)**, **Pi**, **OpenCode**, or **Cline** inside T3 Code—where multiple upstream model vendors share a single T3 `providerInstanceId`—`swarm.mjs` separates **T3 harness (`provider`)** from **quota bucket (`bucket`)**:
+
+- `bucket` is inferred automatically from `<vendor>/<model>` IDs (e.g. `openai/gpt-6.2-astra` → `openai`, `anthropic/claude-fable-5-2` → `anthropic`), or can be set explicitly per model entry in `config.json`.
+- Cooling down `openai` fails over cleanly to `anthropic` **inside the same harness** without disabling all of OMP/Pi.
+- Anti-cannibalization (`--avoid openai`) and batched worker rotation operate at the **bucket** level, spreading work across upstream providers even when every child runs on the same T3 harness.
+
+```json
+{
+  "leads": [
+    { "provider": "pi", "bucket": "openai", "model": "openai/gpt-6.2-astra" },
+    { "provider": "pi", "bucket": "anthropic", "model": "anthropic/claude-fable-5-2" }
   ]
 }
 ```

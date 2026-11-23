@@ -104,10 +104,22 @@ function saveHealth(health) {
   writeJson(HEALTH_PATH, health);
 }
 
-function isInCooldown(health, provider) {
-  const entry = health.cooldowns[provider];
+function getBucket(entry) {
+  if (entry.bucket) return entry.bucket;
+  if (typeof entry.model === "string" && entry.model.includes("/")) {
+    return entry.model.split("/")[0];
+  }
+  return entry.provider;
+}
+
+function isInCooldown(health, key) {
+  const entry = health.cooldowns[key];
   if (!entry?.until) return false;
   return Date.parse(entry.until) > Date.now();
+}
+
+function isEntryInCooldown(health, entry) {
+  return isInCooldown(health, entry.provider) || isInCooldown(health, getBucket(entry));
 }
 
 function depthRank(depth) {
@@ -228,12 +240,13 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
   const eligible = [];
   for (let i = 0; i < pool.length; i++) {
     const entry = pool[i];
-    if (excludeSet.has(entry.provider)) continue;
-    if (isInCooldown(health, entry.provider)) continue;
+    const bucket = getBucket(entry);
+    if (excludeSet.has(entry.provider) || excludeSet.has(bucket)) continue;
+    if (isEntryInCooldown(health, entry)) continue;
     if (!supportsDepth(config, entry, depth)) continue;
     const quota = await checkQuota(entry.provider, entry.model);
     if (!quota.available) continue;
-    eligible.push({ entry, idx: i });
+    eligible.push({ entry, bucket, idx: i });
   }
 
   if (eligible.length === 0) {
@@ -243,19 +256,19 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
     };
   }
 
-  // Anti-cannibalization: prefer providers NOT in avoidSet; fallback smoothly if none left
+  // Anti-cannibalization: prefer buckets/providers NOT in avoidSet; fallback smoothly if none left
   const antiCannibal = config.defaults?.antiCannibalization !== false;
   const preferred =
     antiCannibal && avoidSet.size > 0
-      ? eligible.filter((c) => !avoidSet.has(c.entry.provider))
+      ? eligible.filter((c) => !avoidSet.has(c.bucket) && !avoidSet.has(c.entry.provider))
       : eligible;
   const bucket = preferred.length > 0 ? preferred : eligible;
   const fellBackToAvoided = preferred.length === 0 && avoidSet.size > 0;
 
-  // Within a batched pick-workers call, prefer providers not yet used in this batch
+  // Within a batched pick-workers call, prefer quota buckets not yet used in this batch
   const freshInBatch =
     batchUsedProviders && batchUsedProviders.size > 0
-      ? bucket.filter((c) => !batchUsedProviders.has(c.entry.provider))
+      ? bucket.filter((c) => !batchUsedProviders.has(c.bucket))
       : bucket;
   const finalCandidates = freshInBatch.length > 0 ? freshInBatch : bucket;
 
@@ -267,13 +280,14 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
 
   health.cursors[tier] = (chosen.idx + 1) % pool.length;
   if (batchUsedProviders) {
-    batchUsedProviders.add(chosen.entry.provider);
+    batchUsedProviders.add(chosen.bucket);
   }
 
   return {
     ok: true,
     tier,
     depth,
+    bucket: chosen.bucket,
     target: buildTarget(config, chosen.entry, depth),
     fellBackToAvoided,
   };
@@ -411,8 +425,9 @@ Options:
       leads: (config.leads || []).map((l, i) => ({
         priority: i + 1,
         provider: l.provider,
+        bucket: getBucket(l),
         model: l.model,
-        inCooldown: isInCooldown(health, l.provider),
+        inCooldown: isEntryInCooldown(health, l),
       })),
       activeCooldowns: health.cooldowns,
       cursors: health.cursors,
@@ -465,12 +480,13 @@ Options:
     const healthy = [];
     for (let i = 0; i < leads.length; i++) {
       const lead = leads[i];
-      if (excludeSet.has(lead.provider)) continue;
-      if (isInCooldown(health, lead.provider)) continue;
+      const bucket = getBucket(lead);
+      if (excludeSet.has(lead.provider) || excludeSet.has(bucket)) continue;
+      if (isEntryInCooldown(health, lead)) continue;
       if (!supportsDepth(config, lead, depth)) continue;
       const quota = await checkQuota(lead.provider, lead.model);
       if (!quota.available) continue;
-      healthy.push({ lead, priority: i + 1 });
+      healthy.push({ lead, bucket, priority: i + 1 });
     }
 
     if (healthy.length === 0) {
@@ -487,13 +503,18 @@ Options:
 
     const chosen = healthy[0];
     const nextFallback = healthy[1]
-      ? { provider: healthy[1].lead.provider, model: healthy[1].lead.model }
+      ? {
+          provider: healthy[1].lead.provider,
+          bucket: healthy[1].bucket,
+          model: healthy[1].lead.model,
+        }
       : null;
 
     out({
       ok: true,
       priority: chosen.priority,
       depth,
+      bucket: chosen.bucket,
       target: buildTarget(config, chosen.lead, depth),
       fallbackAvailable: Boolean(nextFallback),
       nextFallback,

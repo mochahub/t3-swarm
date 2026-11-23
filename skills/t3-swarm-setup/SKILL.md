@@ -22,6 +22,7 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
 
 2. **Draft a smart initial configuration:**
    - **Do NOT exclude the Coordinator's own harness/provider** from Lead or Worker pools unless the user explicitly asks—`t3-swarm`'s `[SWARM ROLE: ...]` guard safely allows same-provider delegation!
+   - **Multi-provider harnesses (OMP / Pi, OpenCode, Cline, Cursor):** When one T3 `providerInstanceId` hosts models from multiple upstream vendors (e.g. `pi` with `openai/...`, `anthropic/...`, `google/...`), set `"bucket"` per entry (or rely on automatic vendor-prefix inference from `<vendor>/<model>`) so cooldowns, failover, and anti-cannibalization isolate each upstream billing bucket instead of cooling down the entire harness.
    - **Leads (ordered failover chain):** Pick the strongest reasoning/orchestration models across distinct providers (e.g. flagship reasoning models from Codex, Claude, Antigravity, etc.), ordered by capability and diversity.
    - **Worker Tiers:** Group available models across providers into:
      - `heavy`: top coding/reasoning models (e.g. Opus, Sol, Neon, flagship Pro models)

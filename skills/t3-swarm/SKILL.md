@@ -48,7 +48,7 @@ node "<skill-dir>/scripts/swarm.mjs" doctor
    ```
 3. Read `references/worker-brief.md` and call `delegate_task` with the returned `target`, prefixing the prompt with `[SWARM ROLE: WORKER]` + scoped goal, done-criteria, and verification command.
 4. **Failure handling:**
-   - Quota/rate-limit error → run `swarm.mjs cooldown <provider>`, re-run `pick-worker`, and retry once.
+   - Quota/rate-limit error → run `swarm.mjs cooldown <bucket>`, re-run `pick-worker`, and retry once.
    - Technical blocker/stuck → bump once (`medium → high` or `balanced → heavy`) rather than retrying the exact same tier.
 5. Translate the worker's output back to the user cleanly.
 
@@ -70,12 +70,12 @@ node "<skill-dir>/scripts/swarm.mjs" doctor
    *(If the user says a provider is low on quota, run `swarm.mjs cooldown <provider>` first.)*
 
 3. **Dispatch the Lead (`delegate_task`):**
-   - Load `references/lead-brief.md` and substitute `{{STATE_PATH}}`, `{{SCRIPT_PATH}}`, `{{WORKER_BRIEF_PATH}}`, `{{LEAD_PROVIDER}}`, and `{{MAX_LOOPS}}` from the JSON output of `init` / `pick-lead`.
+   - Load `references/lead-brief.md` and substitute `{{STATE_PATH}}`, `{{SCRIPT_PATH}}`, `{{WORKER_BRIEF_PATH}}`, `{{LEAD_BUCKET}}` (from `pick-lead`'s `bucket` field), and `{{MAX_LOOPS}}` from the JSON output of `init` / `pick-lead`.
    - Call `delegate_task` with the returned `target` and `mode: "async"`. End your turn and wait for completion.
 
 4. **Handle Lead Outcome:**
    - **Quota / rate-limit / mid-run exhaustion (Hot Failover):**
-     1. Run `node "<scriptPath>" cooldown <failed-lead-provider> --reason "quota_exhausted"`.
+     1. Run `node "<scriptPath>" cooldown <failed-lead-bucket> --reason "quota_exhausted"`.
      2. Run `node "<scriptPath>" pick-lead --depth <same-depth>` to get the next Lead in priority order.
      3. Re-dispatch `delegate_task` pointing the new Lead at the **exact same `statePath`** with a note: *"Resuming after Lead failover—read STATE.md and continue from the first unchecked task."*
      4. If no healthy Leads remain, inform the user clearly and offer to continue in Mode 1 or wait.
