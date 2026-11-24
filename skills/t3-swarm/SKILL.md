@@ -5,12 +5,13 @@ description: >-
   Use ONLY in top-level user conversations when the user explicitly requests swarm mode, asks to delegate
   a focused coding task (Mode 1), or when a session grows into multi-workstream/parallel work (ask the user
   in one line before escalating to Mode 2). Never auto-activate for simple questions or quick edits.
-  Ignore completely if your prompt contains a standalone line [SWARM ROLE: LEAD] or [SWARM ROLE: WORKER].
+  Ignore completely if your prompt or compacted context indicates a delegated Lead or Worker role
+  (e.g. [SWARM ROLE: LEAD] or [SWARM ROLE: WORKER]).
 ---
 
 # t3-swarm — Coordinator Playbook
 
-> **ROLE GUARD (READ FIRST):** This skill applies **only** to top-level user conversations where you are the Front-Door Coordinator. If your prompt contains a standalone line `[SWARM ROLE: LEAD]` or `[SWARM ROLE: WORKER]` (note: T3 may prepend a metadata header above it), **stop reading and ignore this skill completely**—follow only your delegated brief.
+> **ROLE GUARD (READ FIRST):** This skill applies **only** to top-level user conversations where you are the Front-Door Coordinator. If your prompt or compacted context indicates you are a delegated Lead or Worker (e.g. a standalone line `[SWARM ROLE: LEAD]` or `[SWARM ROLE: WORKER]`, even if T3 prepends metadata above it or compaction summarizes it), **stop reading and ignore this skill completely**—follow only your delegated brief.
 
 ## Operating Modes (Switch Freely Mid-Session)
 
@@ -110,7 +111,7 @@ Routing follows `weights` in `config.json`: each billing bucket gets work in pro
    - **From here on the Lead owns its worktree and the integration branch.** Until it returns `STATUS: COMPLETE`, don't run tests or gates there, don't commit, merge or cherry-pick from it, and don't run `finish`.
 
 4. **Handle Lead Outcome (Cap at 2 Lead failovers per run):**
-   - **Stop any active status schedule** (`delete_scheduled_task`) whenever the run reaches `STATUS: COMPLETE`, `STATUS: ESCALATE` (re-create if resumed), is aborted/cancelled, or the user drops back to direct mode. On a hot failover, keep the existing schedule running (it tracks the latest Lead thread in this conversation).
+   - **Stop any active status schedule** (`delete_scheduled_task`) whenever the run reaches `STATUS: COMPLETE`, `STATUS: ESCALATE` (re-create if resumed), is aborted/cancelled, or the user drops back to direct mode (if `scheduledTaskId` was lost to compaction, use `list_scheduled_tasks` outside a scheduled run to find and delete it). On a hot failover with an active schedule, update its prompt with the new Lead's `childThreadId` via `schedule_task({ scheduledTaskId, prompt })` so check-ins stay compaction-safe.
    - **Finished without a `STATUS:` line** (T3 reports the delegated task finished, but the last message is progress like "waiting for the tests"): the Lead is **not** done, and it may still be running.
      1. Read the Lead's thread once (`t3_thread_read`). If a run or background task is still active, end your turn and wait for the next completion notice. Don't poll in a loop.
      2. If it has truly stopped, send the same Lead thread one follow-up: *"Finish the remaining work, update STATE.md, and end with STATUS: COMPLETE or STATUS: ESCALATE."* Don't take over its worktree.

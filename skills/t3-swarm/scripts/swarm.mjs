@@ -1366,6 +1366,11 @@ interval progress updates during Mode 2 runs (off by default).
       typeof flags.goal === "string" ? flags.goal : "(Coordinator: fill in 1-2 sentence goal)";
     const git = getGitInfo();
     const integrationBranch = git.isGitRepo ? `swarm/${runId}` : null;
+    const leadBriefPath = path.join(REFERENCES_DIR, "lead-brief.md");
+    const workerBriefPath = path.join(REFERENCES_DIR, "worker-brief.md");
+    const maxWorkerLoops = config.defaults?.maxWorkerLoops ?? 2;
+    const maxParallelWorkers = config.defaults?.maxParallelWorkers ?? 4;
+    const worktreeForParallelEdits = config.defaults?.worktreeForParallelEdits !== false;
     const content = `# Swarm Run: ${runId}
 - **Status:** RUNNING
 
@@ -1374,7 +1379,8 @@ interval progress updates during Mode 2 runs (off by default).
 - **Done criteria:** (tests/checks required before completion)
 - **Verify:** targeted (workers): (narrowest test/lint command per area) | full gate (Lead only, once, on the integration branch): (command)
 - **Boundaries:** (out-of-scope or constraints)
-- **Config:** \`${configPath}\` (${configSource})${
+- **Config:** \`${configPath}\` (${configSource})
+- **Runtime:** \`script: ${SCRIPT_PATH}\` | \`leadBrief: ${leadBriefPath}\` | \`workerBrief: ${workerBriefPath}\` | \`worktreeParallel: ${worktreeForParallelEdits}\` | \`maxLoops: ${maxWorkerLoops}\` | \`maxParallel: ${maxParallelWorkers}\`${
       git.isGitRepo
         ? `\n- **Git Base:** \`${git.branch}@${git.commit}\` (dirty: ${git.dirty}) | **Integration Branch:** \`${integrationBranch}\``
         : ""
@@ -1395,11 +1401,11 @@ interval progress updates during Mode 2 runs (off by default).
       configSource,
       scriptPath: SCRIPT_PATH,
       referencesDir: REFERENCES_DIR,
-      leadBriefPath: path.join(REFERENCES_DIR, "lead-brief.md"),
-      workerBriefPath: path.join(REFERENCES_DIR, "worker-brief.md"),
-      maxWorkerLoops: config.defaults?.maxWorkerLoops ?? 2,
-      maxParallelWorkers: config.defaults?.maxParallelWorkers ?? 4,
-      worktreeForParallelEdits: config.defaults?.worktreeForParallelEdits !== false,
+      leadBriefPath,
+      workerBriefPath,
+      maxWorkerLoops,
+      maxParallelWorkers,
+      worktreeForParallelEdits,
       statusUpdates: resolveStatusUpdates(config),
       git,
       integrationBranch,

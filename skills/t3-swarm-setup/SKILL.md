@@ -4,12 +4,13 @@ description: >-
   Interactive setup and reconfiguration for t3-swarm. Discovers the user's enabled T3 Code providers,
   models, and option schemas via orchestrator_capabilities, builds ~/.t3/swarm/config.json, and validates it.
   Use when the user asks to set up, configure, or update t3-swarm, or when t3-swarm reports status: unconfigured.
-  Ignore completely if your prompt contains a standalone line [SWARM ROLE: LEAD] or [SWARM ROLE: WORKER].
+  Ignore completely if your prompt or compacted context indicates a delegated Lead or Worker role
+  (e.g. [SWARM ROLE: LEAD] or [SWARM ROLE: WORKER]).
 ---
 
 # t3-swarm-setup — Auto-Discover & Configure
 
-> **ROLE GUARD:** Applies only to top-level user conversations. If your prompt contains a standalone line `[SWARM ROLE: LEAD]` or `[SWARM ROLE: WORKER]` (T3 may prepend a metadata header above it), ignore this skill completely.
+> **ROLE GUARD:** Applies only to top-level user conversations. If your prompt or compacted context indicates you are a delegated Lead or Worker (e.g. `[SWARM ROLE: LEAD]` or `[SWARM ROLE: WORKER]`), ignore this skill completely.
 
 ## Goal
 Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually enabled** T3 providers, billing buckets, and option schemas—with zero hardcoded assumptions.

@@ -166,6 +166,7 @@ The `t3-swarm-setup` skill calls T3's `orchestrator_capabilities` (using `search
 - **Verify narrowly, gate once.** Parallel workers run only targeted checks; the Lead runs the full gate once, on the integrated branch. Several full suites at once contend for the same CPU, so each one runs slower than one would alone.
 - **No early returns.** Workers and Leads run verification in the foreground, because ending a turn is the return. The Coordinator never touches a Lead's worktree before `STATUS: COMPLETE`, and `finish` refuses to archive a run whose ledger doesn't say `Status: COMPLETE`.
 - **Reviews go through the router**, run in the shared checkout, and append findings to a file as they go, so a quota cutoff never loses them.
+- **Compaction-resilient across all tiers.** `STATE.md` carries a `Runtime` line (`script`, `leadBrief`, `workerBrief`, worktree/loop caps) so a compacted Lead recovers its full contract and paths in two reads; workers check `git status`/`git diff` instead of redoing edits; and Role Guards match both literal `[SWARM ROLE: ...]` tags and compacted role summaries.
 
 ---
 
