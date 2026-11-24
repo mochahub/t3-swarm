@@ -395,6 +395,12 @@ function keyMatchesEntry(config, key, entry) {
   return candidates.includes(key);
 }
 
+// --exclude takes the same key forms as cooldowns: provider, bucket, model, provider:model, or a glob.
+function isExcluded(config, excludeSet, entry) {
+  for (const key of excludeSet) if (keyMatchesEntry(config, key, entry)) return true;
+  return false;
+}
+
 // Returns the active cooldown key that blocks this entry, or null.
 function activeCooldownKey(config, health, entry) {
   const now = Date.now();
@@ -508,7 +514,7 @@ async function rankLeads(config, health, depth, excludeSet) {
     }
     const bucket = getBucket(config, lead);
     const base = { priority, source, model: lead.model, bucket };
-    if (excludeSet.has(lead.provider) || excludeSet.has(bucket)) {
+    if (isExcluded(config, excludeSet, lead)) {
       skipped.push({ ...base, reason: "excluded" });
       continue;
     }
@@ -855,7 +861,7 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
       continue;
     }
     const bucket = getBucket(config, entry);
-    if (excludeSet.has(entry.provider) || excludeSet.has(bucket)) {
+    if (isExcluded(config, excludeSet, entry)) {
       skipped.push({ model: entry.model, bucket, reason: "excluded" });
       continue;
     }
@@ -980,7 +986,7 @@ Duration: minutes ("90") or "45m", "1h42m", "7d" (1 minute to 7 days).
 Options:
   --config <path>    Override config path (default: ~/.t3/swarm/config.json)
   --avoid <b1,b2>    Scale these buckets by weights.leadBucketMultiplier (default 0.5)
-  --exclude <b1,b2>  Hard-exclude bucket(s)/provider(s) for this pick
+  --exclude <k1,k2>  Skip these for this pick (same key forms as cooldowns, e.g. claudeAgent:claude-fable-5-2)
   --force-wave       Bypass maxParallelWorkers cap on pick-workers
   --reason "..."     Optional note when setting a cooldown
   --force            finish: archive even if the ledger Status is not COMPLETE
