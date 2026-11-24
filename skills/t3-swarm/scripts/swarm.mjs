@@ -946,7 +946,23 @@ Options:
     ensureDir(ARCHIVE_DIR);
     const dest = path.join(ARCHIVE_DIR, path.basename(fileName));
     fs.renameSync(src, dest);
-    out({ ok: true, archivedTo: dest, runStatus, ...(runStatus !== "COMPLETE" ? { forced: true } : {}) });
+    // Companion files (e.g. <run-id>.findings-review.txt) move with the ledger.
+    const prefix = `${path.basename(fileName, ".md")}.`;
+    const companions = fs
+      .readdirSync(RUNS_DIR)
+      .filter((f) => f.startsWith(prefix))
+      .map((f) => {
+        const to = path.join(ARCHIVE_DIR, f);
+        fs.renameSync(path.join(RUNS_DIR, f), to);
+        return to;
+      });
+    out({
+      ok: true,
+      archivedTo: dest,
+      ...(companions.length ? { companions } : {}),
+      runStatus,
+      ...(runStatus !== "COMPLETE" ? { forced: true } : {}),
+    });
     return;
   }
 
