@@ -704,6 +704,15 @@ function getGitInfo() {
   }
 }
 
+function readLedgerStatus(filePath) {
+  try {
+    const match = fs.readFileSync(filePath, "utf8").match(/^\s*-\s*\*\*Status:\*\*\s*`?([A-Za-z_]+)/m);
+    return match ? match[1].toUpperCase() : null;
+  } catch {
+    return null;
+  }
+}
+
 function checkWritable(dir) {
   try {
     ensureDir(dir);
@@ -1182,8 +1191,7 @@ interval progress updates during Mode 2 runs (off by default).
       out({ ok: false, error: `Run file not found: ${src}` }, 1);
       return;
     }
-    const statusMatch = fs.readFileSync(src, "utf8").match(/^\s*-\s*\*\*Status:\*\*\s*`?([A-Za-z_]+)/m);
-    const runStatus = statusMatch ? statusMatch[1].toUpperCase() : null;
+    const runStatus = readLedgerStatus(src);
     if (runStatus !== "COMPLETE" && !flags.force) {
       out(
         {
@@ -1336,7 +1344,17 @@ interval progress updates during Mode 2 runs (off by default).
         .sort()
         .reverse()
         .slice(0, 5)
-        .map((f) => path.join(RUNS_DIR, f));
+        .map((f) => {
+          const fullPath = path.join(RUNS_DIR, f);
+          const stat = fs.statSync(fullPath);
+          return {
+            runId: path.basename(f, ".md"),
+            path: fullPath,
+            status: readLedgerStatus(fullPath),
+            updatedAt: stat.mtime.toISOString(),
+            ageMinutes: Math.max(0, Math.round((Date.now() - stat.mtimeMs) / 60_000)),
+          };
+        });
     }
 
     out({
