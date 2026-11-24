@@ -51,6 +51,8 @@ const DEFAULT_BUCKET_ALIASES = {
   "openai-codex": "codex",
 };
 const MAX_COOLDOWN_MINUTES = 10080; // 7 days
+const DEFAULT_STATUS_UPDATE_MINUTES = 15;
+const MAX_STATUS_UPDATE_MINUTES = 1440; // 24 hours
 
 let cachedHooks = undefined;
 async function loadHooks() {
@@ -795,7 +797,58 @@ function validateConfig(config) {
   }
 
   validateWeights(config, errors, warnings);
+  validateStatusUpdates(config, errors, warnings);
   return { errors, warnings };
+}
+
+function resolveStatusUpdates(config) {
+  const su = config.statusUpdates;
+  if (!su || typeof su !== "object" || Array.isArray(su) || su.enabled !== true) {
+    return { enabled: false };
+  }
+  const intervalMinutes =
+    Number.isInteger(su.intervalMinutes) &&
+    su.intervalMinutes >= 1 &&
+    su.intervalMinutes <= MAX_STATUS_UPDATE_MINUTES
+      ? su.intervalMinutes
+      : DEFAULT_STATUS_UPDATE_MINUTES;
+  return {
+    enabled: true,
+    intervalMinutes,
+    everyMs: intervalMinutes * 60_000,
+  };
+}
+
+function validateStatusUpdates(config, errors, warnings) {
+  if (config.statusUpdates === undefined) return;
+  const su = config.statusUpdates;
+  if (!su || typeof su !== "object" || Array.isArray(su)) {
+    errors.push("`statusUpdates` must be an object.");
+    return;
+  }
+  if (su.enabled !== undefined && typeof su.enabled !== "boolean") {
+    errors.push("statusUpdates.enabled must be true or false.");
+  }
+  if (su.intervalMinutes !== undefined) {
+    if (
+      !Number.isInteger(su.intervalMinutes) ||
+      su.intervalMinutes < 1 ||
+      su.intervalMinutes > MAX_STATUS_UPDATE_MINUTES
+    ) {
+      errors.push(
+        `statusUpdates.intervalMinutes must be an integer from 1 to ${MAX_STATUS_UPDATE_MINUTES}; set enabled: false to disable.`
+      );
+    } else if (su.enabled === true && su.intervalMinutes < 5) {
+      warnings.push(
+        `statusUpdates.intervalMinutes is short (${su.intervalMinutes}m); 10–15m is recommended to avoid check-in noise.`
+      );
+    }
+  }
+  if (su.enabled === undefined && su.intervalMinutes !== undefined) {
+    warnings.push(
+      "statusUpdates.intervalMinutes is set without statusUpdates.enabled: true; status updates stay off until enabled is true."
+    );
+  }
 }
 
 function validateWeights(config, errors, warnings) {
@@ -995,6 +1048,8 @@ Options:
 Weights (config "weights"): buckets {bucket: n} sets each quota bucket's share of work (default 1; 0 =
 only when nothing else is available); a per-entry "weight" overrides one model in one tier.
 leadSelection "priority" (default) | "weighted"; leadBucketMultiplier (default 0.5); maxSessionsPerBucket.
+Status updates (config "statusUpdates"): optional { enabled: true, intervalMinutes: 15 } schedules T3
+interval progress updates during Mode 2 runs (off by default).
 `);
     return;
   }
@@ -1240,6 +1295,7 @@ leadSelection "priority" (default) | "weighted"; leadBucketMultiplier (default 0
         writable,
         hooksLoaded: fs.existsSync(HOOKS_PATH),
         selection,
+        statusUpdates: resolveStatusUpdates(config),
         leads: resolvedLeads,
         workers: resolvedWorkers,
         activeCooldowns: healthRes.activeCooldowns,
@@ -1293,6 +1349,7 @@ leadSelection "priority" (default) | "weighted"; leadBucketMultiplier (default 0
       leads: healthRes.leads,
       activeCooldowns: healthRes.activeCooldowns,
       credits: healthRes.credits,
+      statusUpdates: resolveStatusUpdates(config),
       recentRuns,
     });
     return;
@@ -1343,6 +1400,7 @@ leadSelection "priority" (default) | "weighted"; leadBucketMultiplier (default 0
       maxWorkerLoops: config.defaults?.maxWorkerLoops ?? 2,
       maxParallelWorkers: config.defaults?.maxParallelWorkers ?? 4,
       worktreeForParallelEdits: config.defaults?.worktreeForParallelEdits !== false,
+      statusUpdates: resolveStatusUpdates(config),
       git,
       integrationBranch,
     });

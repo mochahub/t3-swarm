@@ -21,6 +21,10 @@
     "leadBucketMultiplier": 0.5,
     "leadSelection": "priority"
   },
+  "statusUpdates": {
+    "enabled": false,
+    "intervalMinutes": 15
+  },
   "bucketAliases": {
     "openai-codex": "codex"
   },

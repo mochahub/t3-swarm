@@ -44,6 +44,7 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
      - For Codex models, ask whether `serviceTier` should stay at default or be set explicitly in `staticOptions`.
      - If a provider/model exposes no thinking-depth option, set `"depthOption": null`, configure safe non-interactive `staticOptions` (e.g. `{"mode": "act", "auto_approve": true}` where supported), and set `"maxDepth": "medium"`.
      - When one model in a provider supports deeper thinking than siblings (e.g. `gemini-4-neon` supports `xhigh` while `gemini-4-argon` stops at `high`), put the safe lower cap in `providers.<id>.depthMap` and add a per-model `"depthMap"` override.
+   - **Optional periodic status updates (`statusUpdates`):** Off by default (`{ "enabled": false, "intervalMinutes": 15 }`). Ask if the user wants automatic T3 interval check-ins during long Mode 2 runs (e.g. every 15 minutes); if yes, set `enabled: true` and their chosen `intervalMinutes` (10–15m recommended).
    - **Optional `scriptPath`:** Record the resolved path to `t3-swarm/scripts/swarm.mjs` in `config.json` if helpful for non-Antigravity harnesses.
 
 3. **Confirm with the user in 1 turn:**
@@ -51,7 +52,7 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
    - Lead failover order (model + resolved billing `bucket`)
    - Heavy / Balanced / Fast worker pools (model + resolved `bucket`)
    - Quota weights per bucket and the lead selection mode
-   - Key defaults (`leadDepth: high`, `workerDepth: medium`, `cooldownMinutes: 60`, `maxWorkerLoops: 2`, `maxParallelWorkers: 4`, `antiCannibalization: true`, `leadFallbackToHeavy: true`, `allowProjectOverride: false`)
+   - Key defaults (`leadDepth: high`, `workerDepth: medium`, `cooldownMinutes: 60`, `maxWorkerLoops: 2`, `maxParallelWorkers: 4`, `antiCannibalization: true`, `leadFallbackToHeavy: true`, `allowProjectOverride: false`, `statusUpdates: off`)
    - Any billing-bucket or `serviceTier` question for multi-provider harnesses.
 
 4. **Write & verify:**

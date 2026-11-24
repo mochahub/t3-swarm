@@ -113,6 +113,23 @@ If your subscriptions differ in size, tell the router. Each billing bucket gets 
 - Weights balance the **number of tasks**, not tokens: a Lead session or an Opus task uses far more quota than a Haiku task. When a big bucket is in cooldown, part of its share moves to the others.
 - `doctor` prints every entry's weight and rejects weight keys that match no configured bucket, so a typo can't silently leave a bucket at weight 1.
 
+### Periodic status updates (optional)
+
+For long Mode 2 runs, you can have the Coordinator post automatic progress updates and a rough ETA on a T3 interval schedule (off by default):
+
+```json
+{
+  "statusUpdates": {
+    "enabled": true,
+    "intervalMinutes": 15
+  }
+}
+```
+
+- When enabled (or when you ask for periodic updates on a single run), the Coordinator creates a thread-bound T3 `schedule_task` right after launching the Lead and deletes it as soon as the run finishes, escalates, or is cancelled.
+- **Zero extra process on the Lead or workers:** On each tick, the Coordinator reads `STATE.md` and `t3_thread_read` on the active Lead thread (plus `t3_thread_list` for worker running/completed counts when needed) without interrupting a busy Lead or burning flagship Lead quota. Short runs that finish before the first interval never trigger an update at all.
+- Never used in Mode 1, and ignored in repo `.t3-swarm.json` overrides.
+
 ### Can my Coordinator's provider ALSO be a Lead or Worker?
 
 **Yes!** Installing `t3-swarm` on Antigravity (or Claude Code, Codex, or OMP) does **not** lock that harness into Tier 0 only.

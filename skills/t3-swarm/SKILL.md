@@ -99,10 +99,18 @@ Routing follows `weights` in `config.json`: each billing bucket gets work in pro
 
 3. **Dispatch the Lead (`delegate_task`):**
    - Load `references/lead-brief.md` **unchanged** at the top (so `[SWARM ROLE: LEAD]` stays on line 1) and substitute `{{STATE_PATH}}`, `{{SCRIPT_PATH}}`, `{{CONFIG_PATH}}`, `{{WORKER_BRIEF_PATH}}`, `{{LEAD_BUCKET}}` (from `pick-lead`'s `bucket` field), `{{WORKTREE_PARALLEL}}`, and `{{MAX_LOOPS}}`.
-   - Call `delegate_task` with the returned `target` unchanged, `mode: "async"`, and `isolation: "worktree"` when isolating from a dirty/main checkout. End your turn and wait for completion.
+   - Call `delegate_task` with the returned `target` unchanged, `mode: "async"`, and `isolation: "worktree"` when isolating from a dirty/main checkout.
+   - **Optional periodic status updates (Mode 2 only):** If `init` returned `statusUpdates.enabled: true` (or the user asked for periodic updates on this run), call `schedule_task` once with `title: "Swarm status: <slug>"`, `bindToCurrentThread: true`, `schedule: { type: "interval", everyMs: <everyMs> }`, and a concise prompt referencing `<runId>`, `<statePath>`, and the Lead's `childThreadId`:
+     - On each tick, read `<statePath>` and call `t3_thread_read` (`view: "messages"`, `limit: 5`; `view: "activity"` only if messages are stale) on the active Lead thread (`<childThreadId>`, or the latest failover Lead in this thread). If the Lead is waiting on workers, `t3_thread_list(includeSubagents: true)` gives running/completed worker counts.
+     - **Never interrupt the Lead or touch workers:** do **not** call `t3_thread_send` on a running/waiting Lead, and do **not** call `t3_thread_read` on worker threads (reading a child's final result marks it delivered before the Lead gets it).
+     - **Self-cleanup & delivered results:** if `<statePath>` is already `COMPLETE`, `ESCALATE`, or archived—or `t3_thread_read` returns the Lead's final result (which marks it delivered)—call `delete_scheduled_task` immediately and handle the outcome normally.
+     - Otherwise post a concise 3–5 line update (elapsed time, done / in-flight / remaining tasks, current focus or blockers, and a rough ETA from elapsed time and remaining waves) and end your turn.
+     - If `schedule_task` is unavailable in this environment, skip with a 1-line note rather than blocking the run.
+   - End your turn and wait for completion.
    - **From here on the Lead owns its worktree and the integration branch.** Until it returns `STATUS: COMPLETE`, don't run tests or gates there, don't commit, merge or cherry-pick from it, and don't run `finish`.
 
 4. **Handle Lead Outcome (Cap at 2 Lead failovers per run):**
+   - **Stop any active status schedule** (`delete_scheduled_task`) whenever the run reaches `STATUS: COMPLETE`, `STATUS: ESCALATE` (re-create if resumed), is aborted/cancelled, or the user drops back to direct mode. On a hot failover, keep the existing schedule running (it tracks the latest Lead thread in this conversation).
    - **Finished without a `STATUS:` line** (T3 reports the delegated task finished, but the last message is progress like "waiting for the tests"): the Lead is **not** done, and it may still be running.
      1. Read the Lead's thread once (`t3_thread_read`). If a run or background task is still active, end your turn and wait for the next completion notice. Don't poll in a loop.
      2. If it has truly stopped, send the same Lead thread one follow-up: *"Finish the remaining work, update STATE.md, and end with STATUS: COMPLETE or STATUS: ESCALATE."* Don't take over its worktree.
