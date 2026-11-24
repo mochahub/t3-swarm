@@ -4,11 +4,13 @@
  *
  * Manages:
  *   - Machine-local config (~/.t3/swarm/config.json) + opt-in safe project override (.t3-swarm.json)
- *   - Locked, atomic cooldowns & round-robin cursors (~/.t3/swarm/health.json). A cooldown key can name a
- *     provider, a billing bucket, one model (`provider:model` or bare model id), or a `*` glob of those.
+ *   - Locked, atomic cooldowns & weighted round-robin credits (~/.t3/swarm/health.json). A cooldown key can
+ *     name a provider, a billing bucket, one model (`provider:model` or bare model id), or a `*` glob of those.
+ *   - Quota weights (config `weights`): smooth weighted round-robin (nginx) per worker tier, so each bucket
+ *     gets work in proportion to its weight; optional weighted Lead selection that sticks to a run.
  *   - Single-file run state ledgers (~/.t3/swarm/runs/<run-id>.md) with a Status line that gates `finish`
  *   - Lead failover selection (falling back to the heavy worker pool) & tier:depth worker routing with
- *     bucket-level anti-cannibalization
+ *     the Lead's bucket weighted down
  *   - Optional user quota hook (~/.t3/swarm/hooks.mjs -> export async function checkQuota(...))
  */
 
@@ -140,7 +142,7 @@ function atomicWriteJson(filePath, data) {
 
 function loadHealthLocked() {
   if (!fs.existsSync(HEALTH_PATH)) {
-    return { ok: true, health: { cooldowns: {}, cursors: {} }, mutated: false };
+    return { ok: true, health: { cooldowns: {}, credits: { workers: {}, leads: {} }, leadPicks: {} }, mutated: false };
   }
   let raw;
   try {
@@ -167,12 +169,28 @@ function loadHealthLocked() {
     };
   }
 
-  health.cooldowns = health.cooldowns && typeof health.cooldowns === "object" ? health.cooldowns : {};
-  health.cursors = health.cursors && typeof health.cursors === "object" ? health.cursors : {};
+  const isObj = (v) => v && typeof v === "object" && !Array.isArray(v);
+  health.cooldowns = isObj(health.cooldowns) ? health.cooldowns : {};
+  health.credits = isObj(health.credits) ? health.credits : {};
+  health.credits.workers = isObj(health.credits.workers) ? health.credits.workers : {};
+  health.credits.leads = isObj(health.credits.leads) ? health.credits.leads : {};
+  health.leadPicks = isObj(health.leadPicks) ? health.leadPicks : {};
 
-  // Auto-prune expired cooldowns
   const now = Date.now();
   let mutated = false;
+  // Plain round-robin cursors were replaced by weighted credits
+  if ("cursors" in health) {
+    delete health.cursors;
+    mutated = true;
+  }
+  // Forget per-run Lead picks after 7 days
+  for (const [runId, pick] of Object.entries(health.leadPicks)) {
+    if (!pick?.at || now - Date.parse(pick.at) > MAX_COOLDOWN_MINUTES * 60_000) {
+      delete health.leadPicks[runId];
+      mutated = true;
+    }
+  }
+  // Auto-prune expired cooldowns
   for (const [key, entry] of Object.entries(health.cooldowns)) {
     if (!entry?.until || Date.parse(entry.until) <= now) {
       delete health.cooldowns[key];
@@ -414,15 +432,69 @@ function entriesMatchingKey(config, key) {
   return [...byTarget.values()];
 }
 
-// Lead candidates in priority order: configured leads, then (unless disabled) the heavy worker pool.
+const entryId = (entry) => `${entry.provider}:${entry.model}`;
+
+function weightsCfg(config) {
+  const w = config.weights;
+  return w && typeof w === "object" && !Array.isArray(w) ? w : {};
+}
+
+// A bucket's configured weight (keyed by bucket, else by provider); 1 when unlisted.
+function bucketWeight(config, entry, bucket) {
+  const table = weightsCfg(config).buckets || {};
+  if (typeof table[bucket] === "number") return table[bucket];
+  if (typeof table[entry.provider] === "number") return table[entry.provider];
+  return 1;
+}
+
+// An entry's own weight: its explicit `weight`, else its bucket's weight.
+function baseWeight(config, entry, bucket = getBucket(config, entry)) {
+  return typeof entry.weight === "number" ? entry.weight : bucketWeight(config, entry, bucket);
+}
+
+// Multiplier for buckets passed in --avoid (the Lead's or Coordinator's own bucket).
+function avoidMultiplier(config) {
+  if (config.defaults?.antiCannibalization === false) return 1;
+  const m = weightsCfg(config).leadBucketMultiplier;
+  return typeof m === "number" && m >= 0 ? m : 0.5;
+}
+
+/**
+ * Smooth weighted round-robin (the nginx algorithm). Every positive-weight candidate gains its weight in
+ * credit, the highest credit wins and pays back the round's total. Ties go to the lowest `tieKey(c)` (e.g.
+ * a bucket not yet used in this wave), then config order; tied candidates have equal credit, so this never
+ * shifts long-run shares. Weight-0 candidates never gain credit and are chosen only when no positive-weight
+ * candidate exists. Mutates `credits`.
+ */
+function swrrPick(credits, candidates, tieKey = () => 0) {
+  const positive = candidates.filter((c) => c.weight > 0);
+  if (positive.length === 0) {
+    const fallback = [...candidates].sort((a, b) => tieKey(a) - tieKey(b))[0];
+    return { chosen: fallback, charge: 0 };
+  }
+  const total = positive.reduce((sum, c) => sum + c.weight, 0);
+  for (const c of positive) credits[c.id] = (Number(credits[c.id]) || 0) + c.weight;
+  let best = null;
+  for (const c of positive) {
+    const diff = best ? credits[c.id] - credits[best.id] : 1;
+    if (diff > 1e-9 || (Math.abs(diff) <= 1e-9 && tieKey(c) < tieKey(best))) best = c;
+  }
+  credits[best.id] -= total;
+  return { chosen: best, charge: total };
+}
+
+// Lead candidates: configured leads in order, then (unless disabled) the heavy worker pool by weight.
+// Pure: never touches credits, so cooldown/doctor/status can call it safely.
 async function rankLeads(config, health, depth, excludeSet) {
   const candidates = (config.leads || []).map((lead, i) => ({ lead, priority: i + 1, source: "leads" }));
   if (config.defaults?.leadFallbackToHeavy !== false) {
     const seen = new Set(candidates.map((c) => `${c.lead?.provider}:${c.lead?.model}`));
-    for (const w of config.workers?.heavy || []) {
-      const id = `${w?.provider}:${w?.model}`;
-      if (seen.has(id)) continue;
-      seen.add(id);
+    const heavy = (config.workers?.heavy || [])
+      .filter((w) => w?.provider && w?.model && !seen.has(entryId(w)))
+      .map((w, i) => ({ w, i, weight: baseWeight(config, w) }))
+      .sort((a, b) => b.weight - a.weight || a.i - b.i);
+    for (const { w } of heavy) {
+      seen.add(entryId(w));
       candidates.push({ lead: w, priority: candidates.length + 1, source: "heavy-fallback" });
     }
   }
@@ -454,9 +526,58 @@ async function rankLeads(config, health, depth, excludeSet) {
       skipped.push({ ...base, reason: quota.reason || "quota_hook" });
       continue;
     }
-    healthy.push({ lead, bucket, priority, source });
+    healthy.push({ lead, bucket, priority, source, weight: baseWeight(config, lead, bucket) });
   }
   return { healthy, skipped };
+}
+
+const LEAD_REFUND_WINDOW_MS = 15 * 60_000;
+
+/**
+ * Choose the Lead for a run. With --run, the choice sticks to that run: repeat calls return the same Lead
+ * while it stays healthy; if it has gone unhealthy, pick again (refunding its turn when it failed within
+ * 15 minutes, i.e. before doing real work). Mutates health.credits.leads and health.leadPicks.
+ */
+function chooseLead(config, health, healthy, runId) {
+  const weighted = weightsCfg(config).leadSelection === "weighted";
+  const prior = runId ? health.leadPicks[runId] : null;
+  let refunded = false;
+  if (prior) {
+    const same = healthy.find((h) => entryId(h.lead) === prior.id);
+    if (same) return { chosen: same, sticky: true, changed: false };
+    if (prior.charge > 0 && Date.now() - Date.parse(prior.at) < LEAD_REFUND_WINDOW_MS) {
+      health.credits.leads[prior.id] = (Number(health.credits.leads[prior.id]) || 0) + prior.charge;
+      refunded = true;
+    }
+  }
+
+  let chosen = healthy[0];
+  let charge = 0;
+  const fromLeads = healthy.filter((h) => h.source === "leads");
+  if (weighted && fromLeads.length > 0) {
+    const live = new Set((config.leads || []).filter((l) => l?.provider && l?.model).map(entryId));
+    for (const id of Object.keys(health.credits.leads)) if (!live.has(id)) delete health.credits.leads[id];
+    const pick = swrrPick(
+      health.credits.leads,
+      fromLeads.map((h) => ({ id: entryId(h.lead), weight: h.weight, h }))
+    );
+    chosen = pick.chosen.h;
+    charge = pick.charge;
+  }
+  if (runId) {
+    health.leadPicks[runId] = {
+      id: entryId(chosen.lead),
+      at: new Date().toISOString(),
+      charge,
+      ...(prior ? { failoverFrom: prior.id } : {}),
+    };
+  }
+  return {
+    chosen,
+    sticky: false,
+    changed: Boolean(runId) || charge > 0 || refunded,
+    ...(prior ? { failoverFrom: prior.id, refunded } : {}),
+  };
 }
 
 const DURATION_RE = /^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i;
@@ -613,6 +734,9 @@ function validateConfig(config) {
     if (entry.maxDepth !== undefined && !DEPTH_ORDER.includes(entry.maxDepth)) {
       errors.push(`${label} has invalid maxDepth "${entry.maxDepth}". Must be one of: ${DEPTH_ORDER.join(", ")}.`);
     }
+    if (entry.weight !== undefined && !(typeof entry.weight === "number" && Number.isFinite(entry.weight) && entry.weight >= 0)) {
+      errors.push(`${label} has invalid weight ${JSON.stringify(entry.weight)}; use a number >= 0.`);
+    }
     if (entry.provider && !config.providers?.[entry.provider]) {
       warnings.push(
         `${label} uses provider "${entry.provider}" with no \`providers.${entry.provider}\` block—thinking depth options will NOT be sent.`
@@ -664,10 +788,58 @@ function validateConfig(config) {
     }
   }
 
+  validateWeights(config, errors, warnings);
   return { errors, warnings };
 }
 
-async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet, batchUsedBuckets) {
+function validateWeights(config, errors, warnings) {
+  if (config.weights === undefined) return;
+  const w = config.weights;
+  if (!w || typeof w !== "object" || Array.isArray(w)) {
+    errors.push("`weights` must be an object.");
+    return;
+  }
+  const known = new Set();
+  for (const { entry } of configuredEntries(config)) {
+    known.add(entry.provider);
+    known.add(getBucket(config, entry));
+  }
+  if (w.buckets !== undefined) {
+    if (!w.buckets || typeof w.buckets !== "object" || Array.isArray(w.buckets)) {
+      errors.push("`weights.buckets` must be an object of bucket -> number.");
+    } else {
+      for (const [key, val] of Object.entries(w.buckets)) {
+        if (!(typeof val === "number" && Number.isFinite(val) && val >= 0)) {
+          errors.push(`weights.buckets.${key} must be a number >= 0.`);
+        }
+        if (!known.has(key)) {
+          errors.push(
+            `weights.buckets.${key} matches no configured bucket or provider (${[...known].join(", ")}); a typo here silently leaves that bucket at weight 1.`
+          );
+        }
+      }
+    }
+  }
+  const m = w.leadBucketMultiplier;
+  if (m !== undefined && !(typeof m === "number" && m >= 0 && m <= 1)) {
+    errors.push("weights.leadBucketMultiplier must be a number from 0 to 1.");
+  }
+  if (w.leadSelection !== undefined && !["priority", "weighted"].includes(w.leadSelection)) {
+    errors.push('weights.leadSelection must be "priority" or "weighted".');
+  }
+  const cap = w.maxSessionsPerBucket;
+  if (cap !== undefined && !(Number.isInteger(cap) && cap >= 1)) {
+    errors.push("weights.maxSessionsPerBucket must be an integer >= 1.");
+  }
+  if (w.leadSelection === "weighted") {
+    const leads = (config.leads || []).filter((l) => l?.provider && l?.model);
+    if (leads.length > 0 && leads.every((l) => baseWeight(config, l) === 0)) {
+      warnings.push("weights.leadSelection is weighted but every lead has weight 0; leads will go in list order.");
+    }
+  }
+}
+
+async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet, batchCounts) {
   const pool = config.workers?.[tier] || [];
   if (pool.length === 0) {
     return { ok: false, error: `No workers configured for tier "${tier}".` };
@@ -712,29 +884,45 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
     };
   }
 
-  const antiCannibal = config.defaults?.antiCannibalization !== false;
-  const preferred =
-    antiCannibal && avoidSet.size > 0
-      ? eligible.filter((c) => !avoidSet.has(c.bucket) && !avoidSet.has(c.entry.provider))
-      : eligible;
-  const bucketPool = preferred.length > 0 ? preferred : eligible;
-  const fellBackToAvoided = preferred.length === 0 && avoidSet.size > 0;
-
-  const freshInBatch =
-    batchUsedBuckets && batchUsedBuckets.size > 0
-      ? bucketPool.filter((c) => !batchUsedBuckets.has(c.bucket))
-      : bucketPool;
-  const finalCandidates = freshInBatch.length > 0 ? freshInBatch : bucketPool;
-
-  const cursor = Number.isInteger(health.cursors[tier]) ? health.cursors[tier] : 0;
-  const chosen = finalCandidates.find((c) => c.idx >= cursor) || finalCandidates[0];
-
-  health.cursors[tier] = (chosen.idx + 1) % pool.length;
-  if (batchUsedBuckets) {
-    batchUsedBuckets.add(chosen.bucket);
+  // Effective weights. A bucket's weight is shared by its eligible models in this tier (so listing two
+  // Claude models doesn't double Claude's share); an explicit per-entry `weight` is used as-is.
+  const perBucket = new Map();
+  for (const c of eligible) {
+    if (typeof c.entry.weight !== "number") perBucket.set(c.bucket, (perBucket.get(c.bucket) || 0) + 1);
+  }
+  const mult = avoidMultiplier(config);
+  const isAvoided = (c) => avoidSet.has(c.bucket) || avoidSet.has(c.entry.provider);
+  for (const c of eligible) {
+    c.weight =
+      typeof c.entry.weight === "number"
+        ? c.entry.weight
+        : bucketWeight(config, c.entry, c.bucket) / perBucket.get(c.bucket);
+    if (isAvoided(c)) c.weight *= mult;
   }
 
+  // Optional soft cap on live sessions per bucket in one wave (the avoided Lead/Coordinator session counts).
+  const cap = weightsCfg(config).maxSessionsPerBucket;
+  let candidates = eligible;
+  let capRelaxed = false;
+  if (Number.isInteger(cap) && cap > 0) {
+    const sessions = (c) => (batchCounts?.get(c.bucket) || 0) + (isAvoided(c) ? 1 : 0);
+    const underCap = eligible.filter((c) => sessions(c) < cap);
+    if (underCap.length > 0) candidates = underCap;
+    else capRelaxed = true;
+  }
+
+  const live = new Set(pool.filter((e) => e?.provider && e?.model).map(entryId));
+  const credits = (health.credits.workers[tier] ||= {});
+  for (const id of Object.keys(credits)) if (!live.has(id)) delete credits[id];
+  const { chosen } = swrrPick(
+    credits,
+    candidates.map((c) => ({ ...c, id: entryId(c.entry) })),
+    (c) => (batchCounts?.get(c.bucket) || 0) + (isAvoided(c) ? 1 : 0)
+  );
+  if (batchCounts) batchCounts.set(chosen.bucket, (batchCounts.get(chosen.bucket) || 0) + 1);
+
   const { target, depthDropped } = buildTarget(config, chosen.entry, depth);
+  const round = (n) => Math.round(n * 1000) / 1000;
   return {
     ok: true,
     tier,
@@ -742,7 +930,10 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
     bucket: chosen.bucket,
     target,
     depthDropped,
-    fellBackToAvoided,
+    weight: round(chosen.weight),
+    candidates: candidates.map((c) => ({ model: c.entry.model, bucket: c.bucket, weight: round(c.weight) })),
+    ...(isAvoided(chosen) ? { onAvoidedBucket: true } : {}),
+    ...(capRelaxed ? { capRelaxed: true } : {}),
   };
 }
 
@@ -771,9 +962,9 @@ Commands:
   status                                   Show leads, resolved buckets, cooldowns & recent runs
   init <slug> [--goal "..."]               Create a single-file STATE.md ledger for Mode 2
   finish <run-id> [--force]                Archive a run whose ledger says Status: COMPLETE
-  pick-lead [--depth high] [--exclude b]   Pick the highest-priority healthy Lead (heavy pool as fallback)
-  pick-worker <tier[:depth]> [--avoid b]   Pick one load-balanced worker target
-  pick-workers <spec>... [--avoid b]       Pick a batch of workers across buckets in one call
+  pick-lead [--run id] [--depth high]      Pick the Lead (heavy pool as fallback); --run makes it stick to a run
+  pick-worker <tier[:depth]> [--avoid b]   Pick one worker by quota weight
+  pick-workers <spec>... [--avoid b]       Pick a wave of workers in one call
   cooldown <key> [duration] [--until t]    Put a key in cooldown (default: defaults.cooldownMinutes)
   clear-cooldown <key|all>                 Clear cooldown(s)
 
@@ -788,11 +979,16 @@ Duration: minutes ("90") or "45m", "1h42m", "7d" (1 minute to 7 days).
 
 Options:
   --config <path>    Override config path (default: ~/.t3/swarm/config.json)
-  --avoid <b1,b2>    Deprioritize bucket(s)/provider(s) (anti-cannibalization)
+  --avoid <b1,b2>    Scale these buckets by weights.leadBucketMultiplier (default 0.5)
   --exclude <b1,b2>  Hard-exclude bucket(s)/provider(s) for this pick
   --force-wave       Bypass maxParallelWorkers cap on pick-workers
   --reason "..."     Optional note when setting a cooldown
   --force            finish: archive even if the ledger Status is not COMPLETE
+  --run <run-id>     pick-lead: reuse this run's Lead while healthy; otherwise fail over and record it
+
+Weights (config "weights"): buckets {bucket: n} sets each quota bucket's share of work (default 1; 0 =
+only when nothing else is available); a per-entry "weight" overrides one model in one tier.
+leadSelection "priority" (default) | "weighted"; leadBucketMultiplier (default 0.5); maxSessionsPerBucket.
 `);
     return;
   }
@@ -868,9 +1064,7 @@ Options:
         const fromLeads = healthy.filter((h) => h.source === "leads");
         leadCheck = {
           healthyLeads: fromLeads.length,
-          nextLead: healthy[0]
-            ? { provider: healthy[0].lead.provider, model: healthy[0].lead.model, source: healthy[0].source }
-            : null,
+          availableLeads: healthy.map((h) => `${entryId(h.lead)}${h.source === "leads" ? "" : " (heavy fallback)"}`),
         };
         if (healthy.length === 0) {
           warnings.push(
@@ -1007,6 +1201,7 @@ Options:
       provider: l?.provider,
       model: l?.model,
       bucket: l?.provider && l?.model ? getBucket(config, l) : null,
+      weight: l?.provider && l?.model ? baseWeight(config, l) : null,
     }));
     const resolvedWorkers = Object.fromEntries(
       VALID_TIERS.map((t) => [
@@ -1015,9 +1210,16 @@ Options:
           provider: w?.provider,
           model: w?.model,
           bucket: w?.provider && w?.model ? getBucket(config, w) : null,
+          weight: w?.provider && w?.model ? baseWeight(config, w) : null,
         })),
       ])
     );
+    const wc = weightsCfg(config);
+    const selection = {
+      leadSelection: wc.leadSelection === "weighted" ? "weighted" : "priority",
+      leadBucketMultiplier: avoidMultiplier(config),
+      maxSessionsPerBucket: Number.isInteger(wc.maxSessionsPerBucket) ? wc.maxSessionsPerBucket : null,
+    };
 
     out(
       {
@@ -1031,6 +1233,7 @@ Options:
         swarmHome: SWARM_HOME,
         writable,
         hooksLoaded: fs.existsSync(HOOKS_PATH),
+        selection,
         leads: resolvedLeads,
         workers: resolvedWorkers,
         activeCooldowns: healthRes.activeCooldowns,
@@ -1048,7 +1251,7 @@ Options:
       payload: {
         ok: true,
         activeCooldowns: health.cooldowns,
-        cursors: health.cursors,
+        credits: health.credits,
         leads: (config.leads || []).map((l, i) => ({
           priority: i + 1,
           provider: l.provider,
@@ -1083,7 +1286,7 @@ Options:
       referencesDir: REFERENCES_DIR,
       leads: healthRes.leads,
       activeCooldowns: healthRes.activeCooldowns,
-      cursors: healthRes.cursors,
+      credits: healthRes.credits,
       recentRuns,
     });
     return;
@@ -1148,6 +1351,11 @@ Options:
       return;
     }
     const excludeSet = parseCsvSet(flags.exclude);
+    if (flags.run === true) {
+      out({ ok: false, error: "--run needs the run id from `init`." }, 1);
+      return;
+    }
+    const runId = typeof flags.run === "string" ? flags.run : null;
     const res = await withHealth(async (health) => {
       const { healthy, skipped } = await rankLeads(config, health, depth, excludeSet);
 
@@ -1166,23 +1374,24 @@ Options:
         };
       }
 
-      const chosen = healthy[0];
-      const nextFallback = healthy[1]
-        ? {
-            provider: healthy[1].lead.provider,
-            bucket: healthy[1].bucket,
-            model: healthy[1].lead.model,
-            source: healthy[1].source,
-          }
+      const choice = chooseLead(config, health, healthy, runId);
+      const chosen = choice.chosen;
+      const next = healthy.find((h) => h !== chosen);
+      const nextFallback = next
+        ? { provider: next.lead.provider, bucket: next.bucket, model: next.lead.model, source: next.source }
         : null;
       const { target, depthDropped } = buildTarget(config, chosen.lead, depth);
 
       return {
-        save: false,
+        save: choice.changed,
         payload: {
           ok: true,
           priority: chosen.priority,
           source: chosen.source,
+          selection: weightsCfg(config).leadSelection === "weighted" ? "weighted" : "priority",
+          weight: chosen.weight,
+          ...(runId ? { runId, sticky: choice.sticky } : {}),
+          ...(choice.failoverFrom ? { failoverFrom: choice.failoverFrom, refunded: choice.refunded } : {}),
           ...(chosen.source === "heavy-fallback"
             ? { note: "Every configured lead is unavailable; using the heavy worker pool as Lead." }
             : {}),
@@ -1267,7 +1476,7 @@ Options:
     const excludeSet = parseCsvSet(flags.exclude);
 
     const res = await withHealth(async (health) => {
-      const batchUsedBuckets = new Set();
+      const batchCounts = new Map();
       const picks = [];
       for (const spec of specs) {
         const parsed = parseSpec(spec, config.defaults?.workerDepth || "medium");
@@ -1279,7 +1488,7 @@ Options:
           parsed.depth,
           avoidSet,
           excludeSet,
-          batchUsedBuckets
+          batchCounts
         );
         if (!pick.ok) return { save: false, payload: pick };
         picks.push(pick);

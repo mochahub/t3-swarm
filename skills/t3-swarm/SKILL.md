@@ -53,6 +53,10 @@ A cooldown broader than the limit hides healthy models: one model's weekly cap, 
 - Always quote globs (zsh fails on an unquoted `*`).
 - Read the `cooldown` output: `affects` lists every configured model you just blocked, and `warnings` says when no Lead is left. If that's wider than intended, `clear-cooldown <key>` and use a narrower one.
 
+## Quota Weights
+
+Routing follows `weights` in `config.json`: each billing bucket gets work in proportion to its weight (e.g. Claude 10, Codex 5, Gemini 1), and `--avoid <bucket>` scales that bucket down (×0.5 by default) instead of excluding it. Don't hand-pick a different model to spare a quota; if the shares are wrong, change the weights through `t3-swarm-setup`. A weight of `0` means "only when nothing else is available".
+
 ---
 
 ## Mode 1 — Direct Worker Flow (No Lead, No Ledger)
@@ -60,7 +64,7 @@ A cooldown broader than the limit hides healthy models: one model's weekly cap, 
 1. Pick `(tier, depth)` in one snap judgment:
    - **Tier:** `fast` (search/docs/boilerplate/checks) · `balanced` *(default)* (features/tests/clear bugs) · `heavy` (tricky bugs/architecture)
    - **Depth:** `low` (obvious path) · `medium` *(default)* · `high` (subtle edge cases/debugging) · `deep` *(rare)*
-2. Run (optionally pass `--avoid <your-own-bucket>` when other buckets are healthy):
+2. Run (pass `--avoid <your-own-bucket>` so your own quota is weighted down):
    ```bash
    node "<script-path>" pick-worker <tier>:<depth>
    ```
@@ -88,8 +92,9 @@ A cooldown broader than the limit hides healthy models: one model's weekly cap, 
 2. **Pick the active Lead:**
    - Default depth is `high`; use `--depth deep` only for genuinely hard architecture or large cross-system refactors (never `max`/`ultra` unless the user asks).
    ```bash
-   node "<script-path>" pick-lead --depth high
+   node "<script-path>" pick-lead --depth high --run <runId>
    ```
+   - Always pass `--run <runId>` (from `init`). The Lead choice then sticks to the run: calling `pick-lead` again returns the same Lead while it is healthy, so a check never changes it. With `weights.leadSelection: "weighted"`, leads rotate across runs by weight.
    *(If the user says a bucket/provider is low on quota, run `swarm.mjs cooldown <bucket>` first.)*
 
 3. **Dispatch the Lead (`delegate_task`):**
@@ -104,7 +109,7 @@ A cooldown broader than the limit hides healthy models: one model's weekly cap, 
      3. If it stopped because of quota, treat it as a hot failover (below).
    - **Quota / rate-limit / mid-run exhaustion (Hot Failover):**
      1. Scope the cooldown to what ran out (see *Quota Cooldowns*), e.g. `cooldown claudeAgent:claude-fable-5-2 --until <reset>` for a model cap, or the bucket for an account limit.
-     2. Run `node "<scriptPath>" pick-lead --depth <same-depth>` to get the next Lead. When every configured lead is out it falls back to the heavy worker pool (`"source": "heavy-fallback"`); that's expected.
+     2. Run `node "<scriptPath>" pick-lead --depth <same-depth> --run <runId>` to get the next Lead; it records the failover (`failoverFrom`) and, when the failed Lead died within 15 minutes, gives it its turn back. When every configured lead is out it falls back to the heavy worker pool (`"source": "heavy-fallback"`); that's expected.
      3. Re-dispatch `delegate_task` with `lead-brief.md` unchanged at the top, and **append** a failover note at the end: *"Resuming after Lead failover — inspect `STATE.md`, check any recorded `taskId`s / git branches first so you don't duplicate or clash with prior work, and continue from remaining unchecked tasks."*
      4. If no Lead is available or 2 failovers have already occurred, check in with the user **in a plain-text message** listing concrete options (e.g. clear a too-broad cooldown, wait until a reset time, or name a model to lead). Don't use an interactive question tool for this: some clients can't submit it, and the swarm then sits idle until someone notices.
    - **Non-quota Lead crash/error:** Inspect `STATE.md`, retry once on the next healthy Lead (or report clearly to the user if systemic).

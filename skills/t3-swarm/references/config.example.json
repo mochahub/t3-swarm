@@ -11,6 +11,16 @@
     "worktreeForParallelEdits": true,
     "leadFallbackToHeavy": true
   },
+  "weights": {
+    "buckets": {
+      "claudeAgent": 10,
+      "codex": 5,
+      "antigravity": 1,
+      "cline-pass": 0.5
+    },
+    "leadBucketMultiplier": 0.5,
+    "leadSelection": "priority"
+  },
   "bucketAliases": {
     "openai-codex": "codex"
   },

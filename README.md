@@ -4,7 +4,7 @@ A lightweight, **three-tier multi-provider orchestration skill** for [T3 Code](h
 
 - **Tier 0 — Coordinator:** Your single point of contact. Translates intent into crisp contracts, handles quota failover, and reports results in plain English.
 - **Tier 1 — The Brains (Ordered Lead Failover Chain):** High-judgment models (e.g. Astra 6.2 → Fable 5.2) that plan, assign worker tiers, unblock 99% of technical issues autonomously, and review milestone diffs—never wasting flagship quota on grunt work.
-- **Tier 2 — Execution Worker Pool:** Parallel, worktree-isolated workers grouped into **Heavy / Balanced / Fast** tiers and load-balanced across all your billing buckets with anti-cannibalization.
+- **Tier 2 — Execution Worker Pool:** Parallel, worktree-isolated workers grouped into **Heavy / Balanced / Fast** tiers and spread across your billing buckets in proportion to how much quota each one has.
 
 Compatible with **`npx skills`** (`skills/<name>/SKILL.md`) and **Antigravity Plugins** (`plugin.json`).
 
@@ -85,6 +85,34 @@ Bucket resolution order:
 }
 ```
 
+### Quota weights: send more work to your biggest plans
+
+If your subscriptions differ in size, tell the router. Each billing bucket gets worker tasks in proportion to its weight:
+
+```json
+{
+  "weights": {
+    "buckets": { "claudeAgent": 10, "codex": 5, "antigravity": 1, "cline-pass": 0.5 },
+    "leadBucketMultiplier": 0.5,
+    "leadSelection": "weighted"
+  },
+  "leads": [
+    { "provider": "codex",       "model": "gpt-6.2-astra",    "weight": 2 },
+    { "provider": "claudeAgent", "model": "claude-fable-5-2", "weight": 1 },
+    { "provider": "antigravity", "model": "gemini-4-argon",   "weight": 0 }
+  ]
+}
+```
+
+- **Workers** are picked by smooth weighted round-robin (the nginx algorithm): deterministic, and evenly interleaved rather than bursty. With the weights above, balanced-tier tasks come out at about Claude 61%, Codex 30%, Gemini 6%, Cline 3%.
+- **A bucket's weight is shared by its models within a tier**, so listing two Claude models in one tier doesn't double Claude's share. A per-model `"weight"` overrides its bucket for that one tier entry.
+- **The Lead's own bucket is scaled, not excluded:** `leadBucketMultiplier` (default `0.5`) applies to `--avoid` buckets. Under a Claude Lead the example becomes Claude and Codex about 43% each, Gemini 9%, Cline 4%.
+- **Weight `0` means "only when nothing else is available"**: for workers, and for leads it means failover-only.
+- **Leads:** `"priority"` (default) always takes the first healthy lead in list order. `"weighted"` rotates leads across runs by their `weight` (the example: Astra leads 2 runs in 3, Fable 1, Argon only if both are out). `pick-lead --run <run-id>` keeps a run's Lead fixed, so calling it again never changes it.
+- **Optional `maxSessionsPerBucket`** caps live sessions on one bucket in a wave, the Lead's included. Waves no longer have to use a different bucket per worker, so set it to `2` if you want that spread back; `3` caps concurrency with little effect on shares.
+- Weights balance the **number of tasks**, not tokens: a Lead session or an Opus task uses far more quota than a Haiku task. When a big bucket is in cooldown, part of its share moves to the others.
+- `doctor` prints every entry's weight and rejects weight keys that match no configured bucket, so a typo can't silently leave a bucket at weight 1.
+
 ### Can my Coordinator's provider ALSO be a Lead or Worker?
 
 **Yes!** Installing `t3-swarm` on Antigravity (or Claude Code, Codex, or OMP) does **not** lock that harness into Tier 0 only.
@@ -131,7 +159,7 @@ User configuration and runtime state live outside the installed skill so updates
 ```text
 ~/.t3/swarm/
 ├── config.json          # Your Lead priority list, Worker tiers, billing buckets & option maps
-├── health.json          # Locked, atomic cooldown windows & round-robin cursors
+├── health.json          # Locked, atomic cooldown windows, weighted round-robin credits & per-run Lead picks
 ├── hooks.mjs            # Optional: export async function checkQuota(provider, model, bucket)
 ├── runs/<run-id>.md     # Single-file STATE.md per active Mode 2 run
 └── archive/             # Archived runs after `swarm.mjs finish <run-id>`
@@ -160,13 +188,13 @@ node "$SCRIPT" status
 # Initialize a single-file STATE.md for a Mode 2 run (records git base + integration branch)
 node "$SCRIPT" init "billing-webhooks" --goal "Add Stripe webhook handler + tests"
 
-# Pick the highest-priority healthy Lead (falls back to the heavy worker pool if every lead is out)
-node "$SCRIPT" pick-lead --depth high
+# Pick the Lead for a run (sticks to the run; falls back to the heavy worker pool if every lead is out)
+node "$SCRIPT" pick-lead --depth high --run <run-id>
 
-# Pick one load-balanced worker (Mode 1)
+# Pick one worker by quota weight (Mode 1)
 node "$SCRIPT" pick-worker balanced:medium
 
-# Pick a parallel wave of workers in one call, avoiding the active Lead's bucket (Mode 2)
+# Pick a parallel wave of workers in one call, weighting the active Lead's bucket down (Mode 2)
 node "$SCRIPT" pick-workers heavy:high balanced:medium fast:low --avoid codex
 
 # Mark a cooldown (1 minute to 7 days), scoped to what actually ran out

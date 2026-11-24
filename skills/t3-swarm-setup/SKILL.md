@@ -33,6 +33,11 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
      - End with a **sibling model inside an already-used bucket** (e.g. `claude-opus-5-5` after `claude-fable-5-2`), so one model's own cap (like a weekly model limit) doesn't either.
      - If every lead is out, `pick-lead` falls back to the `heavy` worker pool (`defaults.leadFallbackToHeavy`, default `true`). Keep it on unless the user objects.
    - **Worker Tiers:** Group available models across buckets into `heavy`, `balanced`, and `fast`.
+   - **Quota weights:** Ask roughly how large each subscription is relative to the others (e.g. *"Claude 10×, Codex 5×, Gemini 1×, Cline 0.5×"*) and write them to `weights.buckets`, keyed by the resolved bucket names `doctor` prints. Each bucket then gets that share of worker tasks (a bucket's weight is shared by its models within a tier). Optional:
+     - A per-model `"weight"` on one tier's entry overrides its bucket there only (e.g. a roomier Gemini Flash limit in `fast`).
+     - `weights.leadSelection: "weighted"` rotates leads across runs by each lead's `weight` (default: its bucket's weight); `"priority"` (default) always takes the first healthy lead. A lead with weight `0` is failover-only.
+     - `weights.leadBucketMultiplier` (default `0.5`) scales the Lead's own bucket for its workers; `0` reproduces the old "avoid unless nothing else" behavior.
+     - `weights.maxSessionsPerBucket` caps live sessions per bucket in one wave, the Lead's included (off by default; `3` costs little, `2` pushes noticeably more work to small buckets).
    - **Exact Option & Depth Mapping:**
      - Always create a `providers.<id>` entry for every provider referenced in `leads` or `workers`.
      - Map abstract depths `low`, `medium`, `high`, `deep` **only** to values present in that model's live `values` array. Keep `deep` at `xhigh` (or `high` if `xhigh` is absent)—never default to `max`/`ultra`/`ultrathink` unless asked.
@@ -45,6 +50,7 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
    Show a compact table with:
    - Lead failover order (model + resolved billing `bucket`)
    - Heavy / Balanced / Fast worker pools (model + resolved `bucket`)
+   - Quota weights per bucket and the lead selection mode
    - Key defaults (`leadDepth: high`, `workerDepth: medium`, `cooldownMinutes: 60`, `maxWorkerLoops: 2`, `maxParallelWorkers: 4`, `antiCannibalization: true`, `leadFallbackToHeavy: true`, `allowProjectOverride: false`)
    - Any billing-bucket or `serviceTier` question for multi-provider harnesses.
 
@@ -56,4 +62,4 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
      node "<path-to-swarm.mjs>" pick-lead
      node "<path-to-swarm.mjs>" pick-workers heavy:high balanced:medium fast:low
      ```
-   - Verify `doctor` reports `"ok": true`, `"writable": true`, zero errors, and the expected resolved `bucket` for every entry. Fix any warning that every lead shares one bucket.
+   - Verify `doctor` reports `"ok": true`, `"writable": true`, zero errors, and the expected resolved `bucket` for every entry. Fix any warning that every lead shares one bucket, and any `weights` error (a misspelled bucket key would silently leave that bucket at weight 1).
