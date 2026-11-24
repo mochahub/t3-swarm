@@ -25,10 +25,13 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
    - **Keep the Coordinator's own harness eligible** for Lead and Worker pools unless the user asks otherwise—the `[SWARM ROLE: ...]` guard keeps same-provider delegation safe.
    - **Map billing buckets accurately (critical for multi-provider harnesses like OMP/Pi, Cline, OpenCode):**
      - Ask the user how multi-provider harnesses are billed:
-       - *Shared credit pool* (e.g. Cline default credits): set `"bucket": "cline"` and `"staticOptions": { "provider": "cline", ... }` on `providers.acpRegistry_cline` so all models share one cooldown bucket.
+       - *Shared credit pool* (e.g. Cline credits or a Cline Pass): set `"bucket"` and `"staticOptions": { "provider": ... }` on `providers.acpRegistry_cline` to that pool (`"cline"` or `"cline-pass"`) so all its models share one cooldown bucket.
        - *Linked subscription* (e.g. Cline `provider: "openai-codex"` sharing quota with T3 `codex`): map via `bucketAliases` (`"openai-codex": "codex"`) or explicit `"bucket": "codex"` so cooldowns and anti-cannibalization stay synchronized.
        - *Per-vendor API keys / OAuth* (e.g. OMP/Pi hosting `openai/...`, `anthropic/...`, `google/...`): leave `bucket` to auto-namespace (`pi:openai`, `pi:anthropic`, `pi:google`) or set explicit `"bucket"` per entry if it shares quota with another T3 provider.
-   - **Leads (ordered failover chain):** Pick the strongest reasoning/orchestration models across distinct billing buckets, ordered by preference.
+   - **Leads (ordered failover chain):** Pick the strongest reasoning/orchestration models, ordered by preference. The chain must survive both kinds of limit:
+     - Span **at least two billing buckets**, so one account-wide limit can't stop every Lead.
+     - End with a **sibling model inside an already-used bucket** (e.g. `claude-opus-5-5` after `claude-fable-5-2`), so one model's own cap (like a weekly model limit) doesn't either.
+     - If every lead is out, `pick-lead` falls back to the `heavy` worker pool (`defaults.leadFallbackToHeavy`, default `true`). Keep it on unless the user objects.
    - **Worker Tiers:** Group available models across buckets into `heavy`, `balanced`, and `fast`.
    - **Exact Option & Depth Mapping:**
      - Always create a `providers.<id>` entry for every provider referenced in `leads` or `workers`.
@@ -42,7 +45,7 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
    Show a compact table with:
    - Lead failover order (model + resolved billing `bucket`)
    - Heavy / Balanced / Fast worker pools (model + resolved `bucket`)
-   - Key defaults (`leadDepth: high`, `workerDepth: medium`, `cooldownMinutes: 60`, `maxWorkerLoops: 2`, `maxParallelWorkers: 4`, `antiCannibalization: true`, `allowProjectOverride: false`)
+   - Key defaults (`leadDepth: high`, `workerDepth: medium`, `cooldownMinutes: 60`, `maxWorkerLoops: 2`, `maxParallelWorkers: 4`, `antiCannibalization: true`, `leadFallbackToHeavy: true`, `allowProjectOverride: false`)
    - Any billing-bucket or `serviceTier` question for multi-provider harnesses.
 
 4. **Write & verify:**
@@ -53,4 +56,4 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
      node "<path-to-swarm.mjs>" pick-lead
      node "<path-to-swarm.mjs>" pick-workers heavy:high balanced:medium fast:low
      ```
-   - Verify `doctor` reports `"ok": true`, `"writable": true`, zero errors, and the expected resolved `bucket` for every entry.
+   - Verify `doctor` reports `"ok": true`, `"writable": true`, zero errors, and the expected resolved `bucket` for every entry. Fix any warning that every lead shares one bucket.

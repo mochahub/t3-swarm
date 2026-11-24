@@ -66,7 +66,7 @@ When a single T3 `providerInstanceId` hosts models from multiple upstream vendor
 Bucket resolution order:
 1. Explicit per-entry `bucket`
 2. Upstream `staticOptions.provider` mapped via `bucketAliases` (e.g. Cline `openai-codex` → `codex`, sharing cooldowns & anti-cannibalization with T3 Codex!)
-3. Provider-level shared `bucket` (e.g. `providers.acpRegistry_cline.bucket = "cline"` keeps all Cline-credit models in one bucket)
+3. Provider-level shared `bucket` (e.g. `providers.acpRegistry_cline.bucket = "cline-pass"` keeps all Cline Pass models in one bucket)
 4. Namespaced vendor prefix (`${provider}:${vendor}`, e.g. `pi:openai`, `pi:anthropic`) so separate harnesses never collide accidentally
 5. Fallback to `provider`
 
@@ -113,6 +113,15 @@ The `t3-swarm-setup` skill calls T3's `orchestrator_capabilities` (using `search
 - **Mid-session switch:** When a normal chat grows multi-track, your Coordinator asks in one line if you want to escalate to swarm mode. Say *"drop back to direct"* anytime to step down.
 - **Manual quota hint:** Notice a provider running low in T3? Just say *"Codex is almost out, lead with Fable"*—the Coordinator marks a cooldown on that bucket and routes cleanly without waiting for a rate-limit error.
 
+### Built-in guardrails
+
+- **Cooldowns are scoped to what ran out.** A key can be a whole bucket (`codex`), one model (`claudeAgent:claude-fable-5-2`), or a quoted glob (`'antigravity:claude-*'`). One model's weekly cap no longer hides its healthy siblings. `cooldown` prints every model it blocks and warns when no Lead is left.
+- **Reset times are honored.** Pass the time from the error (`1h42m`, `7d`, or `--until <ISO time>`) instead of a fixed 60 minutes.
+- **The Lead chain can't run dry silently.** When every configured lead is cooling down, `pick-lead` falls back to the heavy worker pool.
+- **Verify narrowly, gate once.** Parallel workers run only targeted checks; the Lead runs the full gate once, on the integrated branch. Several full suites at once contend for the same CPU, so each one runs slower than one would alone.
+- **No early returns.** Workers and Leads run verification in the foreground, because ending a turn is the return. The Coordinator never touches a Lead's worktree before `STATUS: COMPLETE`, and `finish` refuses to archive a run whose ledger doesn't say `Status: COMPLETE`.
+- **Reviews go through the router**, run in the shared checkout, and append findings to a file as they go, so a quota cutoff never loses them.
+
 ---
 
 ## Configuration & State (`~/.t3/swarm/`)
@@ -151,7 +160,7 @@ node "$SCRIPT" status
 # Initialize a single-file STATE.md for a Mode 2 run (records git base + integration branch)
 node "$SCRIPT" init "billing-webhooks" --goal "Add Stripe webhook handler + tests"
 
-# Pick the highest-priority healthy Lead
+# Pick the highest-priority healthy Lead (falls back to the heavy worker pool if every lead is out)
 node "$SCRIPT" pick-lead --depth high
 
 # Pick one load-balanced worker (Mode 1)
@@ -160,11 +169,13 @@ node "$SCRIPT" pick-worker balanced:medium
 # Pick a parallel wave of workers in one call, avoiding the active Lead's bucket (Mode 2)
 node "$SCRIPT" pick-workers heavy:high balanced:medium fast:low --avoid codex
 
-# Mark or clear a bucket cooldown (1..10080 minutes)
-node "$SCRIPT" cooldown codex 60 --reason "quota_exhausted"
+# Mark a cooldown (1 minute to 7 days), scoped to what actually ran out
+node "$SCRIPT" cooldown codex --until 2026-11-24T08:00:00Z --reason "plan limit"   # whole bucket
+node "$SCRIPT" cooldown claudeAgent:claude-fable-5-2 7d --reason "weekly model cap"  # one model
+node "$SCRIPT" cooldown 'antigravity:claude-*' 1h42m                                # model family (quote globs)
 node "$SCRIPT" clear-cooldown codex
 
-# Archive a completed run file
+# Archive a run once its ledger says Status: COMPLETE (--force for an abandoned run)
 node "$SCRIPT" finish <run-id>
 ```
 

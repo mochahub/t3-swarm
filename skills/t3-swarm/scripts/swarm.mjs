@@ -4,9 +4,11 @@
  *
  * Manages:
  *   - Machine-local config (~/.t3/swarm/config.json) + opt-in safe project override (.t3-swarm.json)
- *   - Locked, atomic provider/bucket cooldowns & round-robin cursors (~/.t3/swarm/health.json)
- *   - Single-file run state ledgers (~/.t3/swarm/runs/<run-id>.md)
- *   - Lead failover selection & tier:depth worker routing with bucket-level anti-cannibalization
+ *   - Locked, atomic cooldowns & round-robin cursors (~/.t3/swarm/health.json). A cooldown key can name a
+ *     provider, a billing bucket, one model (`provider:model` or bare model id), or a `*` glob of those.
+ *   - Single-file run state ledgers (~/.t3/swarm/runs/<run-id>.md) with a Status line that gates `finish`
+ *   - Lead failover selection (falling back to the heavy worker pool) & tier:depth worker routing with
+ *     bucket-level anti-cannibalization
  *   - Optional user quota hook (~/.t3/swarm/hooks.mjs -> export async function checkQuota(...))
  */
 
@@ -356,15 +358,117 @@ function getBucket(config, entry) {
   return entry.provider;
 }
 
-function isInCooldown(health, key) {
-  const entry = health.cooldowns[key];
-  if (!entry?.until) return false;
-  return Date.parse(entry.until) > Date.now();
+function globToRegExp(glob) {
+  const escaped = glob.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`);
 }
 
-function isEntryInCooldown(config, health, entry) {
-  const bucket = getBucket(config, entry);
-  return isInCooldown(health, entry.provider) || isInCooldown(health, bucket);
+// Every name a cooldown key may use to hit this entry: provider, billing bucket, bare model id, provider:model.
+function cooldownCandidates(config, entry) {
+  return [entry.provider, getBucket(config, entry), entry.model, `${entry.provider}:${entry.model}`];
+}
+
+function keyMatchesEntry(config, key, entry) {
+  const candidates = cooldownCandidates(config, entry);
+  if (key.includes("*")) {
+    const re = globToRegExp(key);
+    return candidates.some((c) => re.test(c));
+  }
+  return candidates.includes(key);
+}
+
+// Returns the active cooldown key that blocks this entry, or null.
+function activeCooldownKey(config, health, entry) {
+  const now = Date.now();
+  for (const [key, cd] of Object.entries(health.cooldowns)) {
+    if (!cd?.until || Date.parse(cd.until) <= now) continue;
+    if (keyMatchesEntry(config, key, entry)) return key;
+  }
+  return null;
+}
+
+function configuredEntries(config) {
+  const list = [];
+  (config.leads || []).forEach((entry, i) => {
+    if (entry?.provider && entry?.model) list.push({ role: "lead", priority: i + 1, entry });
+  });
+  for (const tier of VALID_TIERS) {
+    for (const entry of config.workers?.[tier] || []) {
+      if (entry?.provider && entry?.model) list.push({ role: tier, entry });
+    }
+  }
+  return list;
+}
+
+// Configured entries a cooldown key would block, grouped by provider:model.
+function entriesMatchingKey(config, key) {
+  const byTarget = new Map();
+  for (const { role, entry } of configuredEntries(config)) {
+    if (!keyMatchesEntry(config, key, entry)) continue;
+    const id = `${entry.provider}:${entry.model}`;
+    if (!byTarget.has(id)) {
+      byTarget.set(id, { provider: entry.provider, model: entry.model, bucket: getBucket(config, entry), roles: [] });
+    }
+    byTarget.get(id).roles.push(role);
+  }
+  return [...byTarget.values()];
+}
+
+// Lead candidates in priority order: configured leads, then (unless disabled) the heavy worker pool.
+async function rankLeads(config, health, depth, excludeSet) {
+  const candidates = (config.leads || []).map((lead, i) => ({ lead, priority: i + 1, source: "leads" }));
+  if (config.defaults?.leadFallbackToHeavy !== false) {
+    const seen = new Set(candidates.map((c) => `${c.lead?.provider}:${c.lead?.model}`));
+    for (const w of config.workers?.heavy || []) {
+      const id = `${w?.provider}:${w?.model}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      candidates.push({ lead: w, priority: candidates.length + 1, source: "heavy-fallback" });
+    }
+  }
+
+  const healthy = [];
+  const skipped = [];
+  for (const { lead, priority, source } of candidates) {
+    if (!lead?.provider || !lead?.model) {
+      skipped.push({ priority, source, reason: "invalid_entry" });
+      continue;
+    }
+    const bucket = getBucket(config, lead);
+    const base = { priority, source, model: lead.model, bucket };
+    if (excludeSet.has(lead.provider) || excludeSet.has(bucket)) {
+      skipped.push({ ...base, reason: "excluded" });
+      continue;
+    }
+    const cdKey = activeCooldownKey(config, health, lead);
+    if (cdKey) {
+      skipped.push({ ...base, reason: `cooldown:${cdKey}` });
+      continue;
+    }
+    if (!supportsDepth(config, lead, depth)) {
+      skipped.push({ ...base, reason: `depth_cap(${depth})` });
+      continue;
+    }
+    const quota = await checkQuota(lead.provider, lead.model, bucket);
+    if (!quota.available) {
+      skipped.push({ ...base, reason: quota.reason || "quota_hook" });
+      continue;
+    }
+    healthy.push({ lead, bucket, priority, source });
+  }
+  return { healthy, skipped };
+}
+
+const DURATION_RE = /^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i;
+
+// "90" -> 90 minutes; "1h42m5s" / "7d" / "45m" -> minutes (rounded up). NaN when unparseable.
+function parseDurationMinutes(raw) {
+  const s = String(raw).trim();
+  if (/^\d+(\.\d+)?$/.test(s)) return Math.ceil(Number(s));
+  const m = s.match(DURATION_RE);
+  if (!s || !m || (!m[1] && !m[2] && !m[3] && !m[4])) return NaN;
+  const [, d, h, mi, se] = m;
+  return Math.ceil(Number(d || 0) * 1440 + Number(h || 0) * 60 + Number(mi || 0) + Number(se || 0) / 60);
 }
 
 function supportsDepth(config, entry, depth) {
@@ -529,10 +633,22 @@ function validateConfig(config) {
     errors.push(`defaults.workerDepth "${config.defaults.workerDepth}" is invalid.`);
   }
 
+  const fallback = config.defaults?.leadFallbackToHeavy;
+  if (fallback !== undefined && typeof fallback !== "boolean") {
+    errors.push("defaults.leadFallbackToHeavy must be true or false.");
+  }
+
   if (!Array.isArray(config.leads) || config.leads.length === 0) {
     warnings.push("No leads configured (Mode 2 requires at least one lead).");
   } else {
     config.leads.forEach((l, i) => checkEntry(l, `leads[${i}]`));
+    const valid = config.leads.filter((l) => l?.provider && l?.model);
+    const leadBuckets = new Set(valid.map((l) => getBucket(config, l)));
+    if (valid.length > 0 && leadBuckets.size < 2) {
+      warnings.push(
+        `Every lead bills to "${[...leadBuckets][0]}"; one account-wide limit stops all of them. Add a lead from another bucket.`
+      );
+    }
   }
 
   if (!config.workers || typeof config.workers !== "object") {
@@ -549,21 +665,6 @@ function validateConfig(config) {
   }
 
   return { errors, warnings };
-}
-
-function collectKnownTargets(config) {
-  const known = new Set(Object.keys(config.providers || {}));
-  for (const l of config.leads || []) {
-    if (l?.provider) known.add(l.provider);
-    if (l?.provider && l?.model) known.add(getBucket(config, l));
-  }
-  for (const tier of VALID_TIERS) {
-    for (const w of config.workers?.[tier] || []) {
-      if (w?.provider) known.add(w.provider);
-      if (w?.provider && w?.model) known.add(getBucket(config, w));
-    }
-  }
-  return known;
 }
 
 async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet, batchUsedBuckets) {
@@ -586,8 +687,9 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
       skipped.push({ model: entry.model, bucket, reason: "excluded" });
       continue;
     }
-    if (isEntryInCooldown(config, health, entry)) {
-      skipped.push({ model: entry.model, bucket, reason: "cooldown" });
+    const cdKey = activeCooldownKey(config, health, entry);
+    if (cdKey) {
+      skipped.push({ model: entry.model, bucket, reason: `cooldown:${cdKey}` });
       continue;
     }
     if (!supportsDepth(config, entry, depth)) {
@@ -668,12 +770,21 @@ Commands:
   doctor                                   Validate config, buckets, write access & paths
   status                                   Show leads, resolved buckets, cooldowns & recent runs
   init <slug> [--goal "..."]               Create a single-file STATE.md ledger for Mode 2
-  finish <run-id>                          Archive a completed run file to ~/.t3/swarm/archive/
-  pick-lead [--depth high] [--exclude b]   Pick highest-priority healthy Lead target
+  finish <run-id> [--force]                Archive a run whose ledger says Status: COMPLETE
+  pick-lead [--depth high] [--exclude b]   Pick the highest-priority healthy Lead (heavy pool as fallback)
   pick-worker <tier[:depth]> [--avoid b]   Pick one load-balanced worker target
   pick-workers <spec>... [--avoid b]       Pick a batch of workers across buckets in one call
-  cooldown <bucket> [minutes]              Mark quota bucket (or provider) in cooldown (1..10080m)
-  clear-cooldown <bucket|all>              Clear cooldown(s)
+  cooldown <key> [duration] [--until t]    Put a key in cooldown (default: defaults.cooldownMinutes)
+  clear-cooldown <key|all>                 Clear cooldown(s)
+
+Cooldown keys (scope the cooldown to what actually ran out):
+  <provider>:<model>   one model only, e.g. claudeAgent:claude-fable-5-2
+  <bucket>             every model billed to that bucket, e.g. codex
+  <provider>           every model on that T3 provider
+  <model>              that model id on every provider
+  globs                quote them, e.g. 'antigravity:claude-*'
+Duration: minutes ("90") or "45m", "1h42m", "7d" (1 minute to 7 days).
+--until: an ISO time, e.g. 2026-11-24T00:00:00Z (clamped to 7 days).
 
 Options:
   --config <path>    Override config path (default: ~/.t3/swarm/config.json)
@@ -681,6 +792,7 @@ Options:
   --exclude <b1,b2>  Hard-exclude bucket(s)/provider(s) for this pick
   --force-wave       Bypass maxParallelWorkers cap on pick-workers
   --reason "..."     Optional note when setting a cooldown
+  --force            finish: archive even if the ledger Status is not COMPLETE
 `);
     return;
   }
@@ -694,44 +806,89 @@ Options:
   if (cmd === "cooldown") {
     const key = positional[1];
     if (!key) {
-      out({ ok: false, error: "Usage: swarm.mjs cooldown <bucket> [minutes]" }, 1);
+      out({ ok: false, error: "Usage: swarm.mjs cooldown <key> [duration] [--until <ISO time>]" }, 1);
       return;
     }
     const loaded = loadConfig(flags.config);
-    const defaultMins = loaded.ok ? loaded.config.defaults?.cooldownMinutes ?? 60 : 60;
-    const minutes = positional[2] ? Number(positional[2]) : defaultMins;
-    if (!Number.isFinite(minutes) || minutes < 1 || minutes > MAX_COOLDOWN_MINUTES) {
-      out(
-        {
-          ok: false,
-          error: `Invalid minutes "${positional[2]}". Must be between 1 and ${MAX_COOLDOWN_MINUTES}.`,
-        },
-        1
-      );
-      return;
-    }
-    let warning = null;
-    if (loaded.ok) {
-      const known = collectKnownTargets(loaded.config);
-      if (!known.has(key)) {
-        warning = `"${key}" is not a configured provider or bucket (${[...known].join(", ")}); cooldown saved anyway.`;
+    const warnings = [];
+    let untilMs;
+    let minutes;
+    if (flags.until !== undefined) {
+      if (positional[2]) {
+        out({ ok: false, error: "Pass either a duration or --until, not both." }, 1);
+        return;
       }
+      const parsedUntil = typeof flags.until === "string" ? Date.parse(flags.until) : NaN;
+      if (!Number.isFinite(parsedUntil)) {
+        out({ ok: false, error: `Invalid --until "${flags.until}". Use an ISO time such as 2026-11-24T00:00:00Z.` }, 1);
+        return;
+      }
+      if (parsedUntil <= Date.now()) {
+        out({ ok: false, error: `--until ${flags.until} has already passed.` }, 1);
+        return;
+      }
+      untilMs = parsedUntil;
+      const maxUntil = Date.now() + MAX_COOLDOWN_MINUTES * 60_000;
+      if (untilMs > maxUntil) {
+        untilMs = maxUntil;
+        warnings.push(`--until is more than 7 days away; clamped to ${new Date(untilMs).toISOString()}.`);
+      }
+      minutes = Math.ceil((untilMs - Date.now()) / 60_000);
+    } else {
+      const defaultMins = loaded.ok ? loaded.config.defaults?.cooldownMinutes ?? 60 : 60;
+      minutes = positional[2] ? parseDurationMinutes(positional[2]) : defaultMins;
+      if (!Number.isFinite(minutes) || minutes < 1 || minutes > MAX_COOLDOWN_MINUTES) {
+        out(
+          {
+            ok: false,
+            error: `Invalid duration "${positional[2]}". Use minutes or e.g. 45m, 1h42m, 7d (1 minute to 7 days).`,
+          },
+          1
+        );
+        return;
+      }
+      untilMs = Date.now() + minutes * 60_000;
     }
-    const res = await withHealth((health) => {
-      const until = new Date(Date.now() + minutes * 60_000).toISOString();
+
+    const affects = loaded.ok ? entriesMatchingKey(loaded.config, key) : [];
+    if (loaded.ok && affects.length === 0) {
+      warnings.push(`"${key}" matches no configured lead or worker; cooldown saved anyway.`);
+    }
+    const res = await withHealth(async (health) => {
       health.cooldowns[key] = {
-        until,
+        until: new Date(untilMs).toISOString(),
         minutes,
         reason: typeof flags.reason === "string" ? flags.reason : "quota_or_rate_limit",
         setAt: new Date().toISOString(),
       };
+      let leadCheck = {};
+      if (loaded.ok) {
+        const depth = loaded.config.defaults?.leadDepth || "high";
+        const { healthy } = await rankLeads(loaded.config, health, depth, new Set());
+        const fromLeads = healthy.filter((h) => h.source === "leads");
+        leadCheck = {
+          healthyLeads: fromLeads.length,
+          nextLead: healthy[0]
+            ? { provider: healthy[0].lead.provider, model: healthy[0].lead.model, source: healthy[0].source }
+            : null,
+        };
+        if (healthy.length === 0) {
+          warnings.push(
+            "No Lead can run now. If only one model ran out, clear this key and cool down `<provider>:<model>` instead of the whole bucket."
+          );
+        } else if (fromLeads.length === 0) {
+          warnings.push("Every configured lead is in cooldown; pick-lead will use the heavy worker pool.");
+        }
+      }
       return {
         save: true,
         payload: {
           ok: true,
-          bucket: key,
+          key,
           cooldown: health.cooldowns[key],
-          ...(warning ? { warning } : {}),
+          affects,
+          ...leadCheck,
+          ...(warnings.length ? { warnings } : {}),
         },
       };
     });
@@ -742,15 +899,16 @@ Options:
   if (cmd === "clear-cooldown") {
     const key = positional[1];
     if (!key) {
-      out({ ok: false, error: "Usage: swarm.mjs clear-cooldown <bucket|all>" }, 1);
+      out({ ok: false, error: "Usage: swarm.mjs clear-cooldown <key|all>" }, 1);
       return;
     }
     const res = await withHealth((health) => {
+      const existed = key === "all" || Object.prototype.hasOwnProperty.call(health.cooldowns, key);
       if (key === "all") health.cooldowns = {};
       else delete health.cooldowns[key];
       return {
         save: true,
-        payload: { ok: true, cleared: key, activeCooldowns: health.cooldowns },
+        payload: { ok: true, cleared: key, existed, activeCooldowns: health.cooldowns },
       };
     });
     out(res, res.ok ? 0 : 1);
@@ -760,7 +918,7 @@ Options:
   if (cmd === "finish") {
     const runId = positional[1];
     if (!runId) {
-      out({ ok: false, error: "Usage: swarm.mjs finish <run-id>" }, 1);
+      out({ ok: false, error: "Usage: swarm.mjs finish <run-id> [--force]" }, 1);
       return;
     }
     const fileName = runId.endsWith(".md") ? runId : `${runId}.md`;
@@ -769,10 +927,26 @@ Options:
       out({ ok: false, error: `Run file not found: ${src}` }, 1);
       return;
     }
+    const statusMatch = fs.readFileSync(src, "utf8").match(/^\s*-\s*\*\*Status:\*\*\s*`?([A-Za-z_]+)/m);
+    const runStatus = statusMatch ? statusMatch[1].toUpperCase() : null;
+    if (runStatus !== "COMPLETE" && !flags.force) {
+      out(
+        {
+          ok: false,
+          status: "not_complete",
+          runStatus,
+          error:
+            `Ledger Status is ${runStatus ?? "missing"}, not COMPLETE. The Lead may still be running: ` +
+            "wait for its STATUS: COMPLETE. Pass --force only to archive an abandoned run.",
+        },
+        1
+      );
+      return;
+    }
     ensureDir(ARCHIVE_DIR);
     const dest = path.join(ARCHIVE_DIR, path.basename(fileName));
     fs.renameSync(src, dest);
-    out({ ok: true, archivedTo: dest });
+    out({ ok: true, archivedTo: dest, runStatus, ...(runStatus !== "COMPLETE" ? { forced: true } : {}) });
     return;
   }
 
@@ -864,7 +1038,7 @@ Options:
           provider: l.provider,
           bucket: getBucket(config, l),
           model: l.model,
-          inCooldown: isEntryInCooldown(config, health, l),
+          cooldownKey: l?.provider && l?.model ? activeCooldownKey(config, health, l) : null,
         })),
       },
     }));
@@ -911,10 +1085,12 @@ Options:
     const git = getGitInfo();
     const integrationBranch = git.isGitRepo ? `swarm/${runId}` : null;
     const content = `# Swarm Run: ${runId}
+- **Status:** RUNNING
 
 ## Goal & Boundaries
 - **Goal:** ${goal}
 - **Done criteria:** (tests/checks required before completion)
+- **Verify:** targeted (workers): (narrowest test/lint command per area) | full gate (Lead only, once, on the integration branch): (command)
 - **Boundaries:** (out-of-scope or constraints)
 - **Config:** \`${configPath}\` (${configSource})${
       git.isGitRepo
@@ -957,36 +1133,7 @@ Options:
     }
     const excludeSet = parseCsvSet(flags.exclude);
     const res = await withHealth(async (health) => {
-      const leads = config.leads || [];
-      const healthy = [];
-      const skipped = [];
-
-      for (let i = 0; i < leads.length; i++) {
-        const lead = leads[i];
-        if (!lead?.provider || !lead?.model) {
-          skipped.push({ priority: i + 1, reason: "invalid_entry" });
-          continue;
-        }
-        const bucket = getBucket(config, lead);
-        if (excludeSet.has(lead.provider) || excludeSet.has(bucket)) {
-          skipped.push({ priority: i + 1, model: lead.model, bucket, reason: "excluded" });
-          continue;
-        }
-        if (isEntryInCooldown(config, health, lead)) {
-          skipped.push({ priority: i + 1, model: lead.model, bucket, reason: "cooldown" });
-          continue;
-        }
-        if (!supportsDepth(config, lead, depth)) {
-          skipped.push({ priority: i + 1, model: lead.model, bucket, reason: `depth_cap(${depth})` });
-          continue;
-        }
-        const quota = await checkQuota(lead.provider, lead.model, bucket);
-        if (!quota.available) {
-          skipped.push({ priority: i + 1, model: lead.model, bucket, reason: quota.reason || "quota_hook" });
-          continue;
-        }
-        healthy.push({ lead, bucket, priority: i + 1 });
-      }
+      const { healthy, skipped } = await rankLeads(config, health, depth, excludeSet);
 
       if (healthy.length === 0) {
         return {
@@ -994,7 +1141,9 @@ Options:
           payload: {
             ok: false,
             status: "no_healthy_lead",
-            error: `No eligible Lead available for depth "${depth}".`,
+            error: `No eligible Lead available for depth "${depth}" (configured leads and heavy fallback).`,
+            hint:
+              "Check `skipped`: if a whole bucket is cooled down for one model's limit, clear it and cool down `<provider>:<model>` instead. Then ask the user in plain text.",
             skipped,
             activeCooldowns: health.cooldowns,
           },
@@ -1007,6 +1156,7 @@ Options:
             provider: healthy[1].lead.provider,
             bucket: healthy[1].bucket,
             model: healthy[1].lead.model,
+            source: healthy[1].source,
           }
         : null;
       const { target, depthDropped } = buildTarget(config, chosen.lead, depth);
@@ -1016,6 +1166,11 @@ Options:
         payload: {
           ok: true,
           priority: chosen.priority,
+          source: chosen.source,
+          ...(chosen.source === "heavy-fallback"
+            ? { note: "Every configured lead is unavailable; using the heavy worker pool as Lead." }
+            : {}),
+          ...(skipped.length ? { skipped } : {}),
           depth,
           bucket: chosen.bucket,
           target,
