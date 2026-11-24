@@ -160,6 +160,10 @@ Off by default. With `"viewer": { "enabled": true }` in config, the Coordinator 
 - messages moving between agents, including between Leads;
 - agents on other machines, inside labelled frames.
 
+![The live view during a two-Lead run: briefs go down to Leads and workers, the Leads agree a contract on the board, results come back up, and box-1's workers sit in their own frames](docs/images/live-view.gif)
+
+*A two-Lead run (sample data): each Lead plans its tasks, then dispatches workers, two of them to box-1. The Leads agree an API contract, the inspector shows one worker's live command, and the results flow back up to the Coordinator.*
+
 Tap an agent to see what it's doing. To open one by hand: `node skills/t3-swarm/scripts/swarm-viz.mjs --root <any thread of the run>`.
 
 ### Can my Coordinator's provider ALSO be a Lead or Worker?
