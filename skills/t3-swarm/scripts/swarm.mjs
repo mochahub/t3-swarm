@@ -15,7 +15,7 @@
  */
 
 import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -44,8 +44,11 @@ const KNOWN_COMMANDS = new Set([
   "pick-lead",
   "pick-worker",
   "pick-workers",
+  "post",
+  "board",
   "cooldown",
   "clear-cooldown",
+  "machines",
 ]);
 const DEFAULT_BUCKET_ALIASES = {
   "openai-codex": "codex",
@@ -98,12 +101,12 @@ function sleepSync(ms) {
   Atomics.wait(view, 0, 0, ms);
 }
 
-function acquireLock(timeoutMs = 3000) {
-  ensureDir(SWARM_HOME);
+function acquireLock(timeoutMs = 3000, lockPath = LOCK_PATH) {
+  ensureDir(path.dirname(lockPath));
   const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
-      const fd = fs.openSync(LOCK_PATH, "wx");
+      const fd = fs.openSync(lockPath, "wx");
       fs.writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
       fs.closeSync(fd);
       return true;
@@ -111,27 +114,38 @@ function acquireLock(timeoutMs = 3000) {
       if (err?.code !== "EEXIST") throw err;
       // Recover stale lock older than 10 seconds
       try {
-        const stat = fs.statSync(LOCK_PATH);
+        const stat = fs.statSync(lockPath);
         if (Date.now() - stat.mtimeMs > 10_000) {
-          fs.unlinkSync(LOCK_PATH);
+          fs.unlinkSync(lockPath);
           continue;
         }
       } catch {
         continue;
       }
       if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for lock ${LOCK_PATH}`);
+        throw new Error(`Timed out waiting for lock ${lockPath}`);
       }
       sleepSync(25);
     }
   }
 }
 
-function releaseLock() {
+function releaseLock(lockPath = LOCK_PATH) {
   try {
-    fs.unlinkSync(LOCK_PATH);
+    fs.unlinkSync(lockPath);
   } catch {
     // ignore
+  }
+}
+
+// Serialize writers of one file (several Leads post to a run's board at once).
+function withFileLock(filePath, fn) {
+  const lockPath = `${filePath}.lock`;
+  acquireLock(5000, lockPath);
+  try {
+    return fn();
+  } finally {
+    releaseLock(lockPath);
   }
 }
 
@@ -144,7 +158,7 @@ function atomicWriteJson(filePath, data) {
 
 function loadHealthLocked() {
   if (!fs.existsSync(HEALTH_PATH)) {
-    return { ok: true, health: { cooldowns: {}, credits: { workers: {}, leads: {} }, leadPicks: {} }, mutated: false };
+    return { ok: true, health: { cooldowns: {}, credits: { workers: {}, leads: {}, envs: {} }, leadPicks: {} }, mutated: false };
   }
   let raw;
   try {
@@ -176,6 +190,7 @@ function loadHealthLocked() {
   health.credits = isObj(health.credits) ? health.credits : {};
   health.credits.workers = isObj(health.credits.workers) ? health.credits.workers : {};
   health.credits.leads = isObj(health.credits.leads) ? health.credits.leads : {};
+  health.credits.envs = isObj(health.credits.envs) ? health.credits.envs : {};
   health.leadPicks = isObj(health.leadPicks) ? health.leadPicks : {};
 
   const now = Date.now();
@@ -546,9 +561,10 @@ const LEAD_REFUND_WINDOW_MS = 15 * 60_000;
  * while it stays healthy; if it has gone unhealthy, pick again (refunding its turn when it failed within
  * 15 minutes, i.e. before doing real work). Mutates health.credits.leads and health.leadPicks.
  */
-function chooseLead(config, health, healthy, runId) {
+function chooseLead(config, health, healthy, runId, stream = null) {
   const weighted = weightsCfg(config).leadSelection === "weighted";
-  const prior = runId ? health.leadPicks[runId] : null;
+  const pickKey = runId && stream ? `${runId}#${stream}` : runId; // single-Lead runs keep the plain run key
+  const prior = pickKey ? health.leadPicks[pickKey] : null;
   let refunded = false;
   if (prior) {
     const same = healthy.find((h) => entryId(h.lead) === prior.id);
@@ -559,9 +575,23 @@ function chooseLead(config, health, healthy, runId) {
     }
   }
 
-  let chosen = healthy[0];
+  // Workstream Leads of one run: prefer a model no other workstream is using, so one model's limit
+  // can't stop two workstreams and the Leads think differently. Reuse only when nothing else is healthy.
+  let pool = healthy;
+  let sharedWith = null;
+  if (runId && stream && stream !== "integrate") { // the integration pass runs alone, after the others
+    const taken = new Map();
+    for (const [k, v] of Object.entries(health.leadPicks)) {
+      if (k.startsWith(`${runId}#`) && k !== pickKey && v?.id) taken.set(v.id, k.slice(runId.length + 1));
+    }
+    const free = healthy.filter((h) => !taken.has(entryId(h.lead)));
+    if (free.length) pool = free;
+    else if (taken.size) sharedWith = taken.get(entryId(healthy[0].lead)) || [...taken.values()][0];
+  }
+
+  let chosen = pool[0];
   let charge = 0;
-  const fromLeads = healthy.filter((h) => h.source === "leads");
+  const fromLeads = pool.filter((h) => h.source === "leads");
   if (weighted && fromLeads.length > 0) {
     const live = new Set((config.leads || []).filter((l) => l?.provider && l?.model).map(entryId));
     for (const id of Object.keys(health.credits.leads)) if (!live.has(id)) delete health.credits.leads[id];
@@ -572,8 +602,8 @@ function chooseLead(config, health, healthy, runId) {
     chosen = pick.chosen.h;
     charge = pick.charge;
   }
-  if (runId) {
-    health.leadPicks[runId] = {
+  if (pickKey) {
+    health.leadPicks[pickKey] = {
       id: entryId(chosen.lead),
       at: new Date().toISOString(),
       charge,
@@ -583,8 +613,9 @@ function chooseLead(config, health, healthy, runId) {
   return {
     chosen,
     sticky: false,
-    changed: Boolean(runId) || charge > 0 || refunded,
+    changed: Boolean(pickKey) || charge > 0 || refunded,
     ...(prior ? { failoverFrom: prior.id, refunded } : {}),
+    ...(sharedWith ? { sharedWith } : {}),
   };
 }
 
@@ -807,7 +838,98 @@ function validateConfig(config) {
 
   validateWeights(config, errors, warnings);
   validateStatusUpdates(config, errors, warnings);
+  validateMachines(config, errors, warnings);
+  validateViewer(config, errors);
   return { errors, warnings };
+}
+
+function validateMachines(config, errors, warnings) {
+  if (config.environments !== undefined) {
+    warnings.push("`environments` is ignored: boxes aren't listed in config. The Coordinator registers the linked machines that answer each run (`machines --register`); `machines` in config holds only policy (local label/tags, tags and weights by label).");
+  }
+  const mc = config.machines;
+  if (mc !== undefined) {
+    if (!mc || typeof mc !== "object" || Array.isArray(mc)) {
+      errors.push("`machines` must be an object: { use, local: { label, tags, weight }, match: { \"<label glob>\": { tags, weight } }, maxAgeHours }.");
+    } else {
+      if (mc.use !== undefined && typeof mc.use !== "boolean") errors.push("machines.use must be true or false.");
+      if (mc.maxAgeHours !== undefined && !(typeof mc.maxAgeHours === "number" && mc.maxAgeHours > 0)) errors.push("machines.maxAgeHours must be a number > 0.");
+      const rule = (r, where) => {
+        if (!r || typeof r !== "object" || Array.isArray(r)) return errors.push(`${where} must be an object.`);
+        if (r.tags !== undefined && !(Array.isArray(r.tags) && r.tags.every((t) => typeof t === "string"))) errors.push(`${where}.tags must be an array of strings.`);
+        if (r.weight !== undefined && !(typeof r.weight === "number" && r.weight >= 0)) errors.push(`${where}.weight must be a number >= 0.`);
+      };
+      if (mc.local !== undefined) {
+        rule(mc.local, "machines.local");
+        if (mc.local?.label !== undefined && (typeof mc.local.label !== "string" || !mc.local.label)) errors.push("machines.local.label must be a non-empty string.");
+      }
+      if (mc.match !== undefined) {
+        if (!mc.match || typeof mc.match !== "object" || Array.isArray(mc.match)) errors.push("machines.match must map a label glob (\"box-*\") to { tags, weight }.");
+        else for (const [g, r] of Object.entries(mc.match)) rule(r, `machines.match["${g}"]`);
+      }
+      if (mc.provider !== undefined) {
+        const p = mc.provider;
+        if (!p || typeof p !== "object" || Array.isArray(p)) errors.push("machines.provider must be { command, count, max }.");
+        else {
+          const cmdOk = (typeof p.command === "string" && p.command.trim()) || (Array.isArray(p.command) && p.command.length && p.command.every((x) => typeof x === "string"));
+          if (!cmdOk) errors.push("machines.provider.command must be the box skill's provider command: a path, or an argv array.");
+          else {
+            const exe = (Array.isArray(p.command) ? p.command[0] : p.command.trim()).replace(/^~(?=$|\/)/, os.homedir());
+            if (exe.includes("/") && !fs.existsSync(exe)) warnings.push(`machines.provider.command ${exe} doesn't exist (yet): runs will go without boxes until it does.`);
+          }
+          if (p.count !== undefined && !(Number.isInteger(p.count) && p.count >= 0)) errors.push("machines.provider.count must be an integer >= 0 (0 = start none unless asked).");
+          if (p.max !== undefined && !(Number.isInteger(p.max) && p.max >= 1)) errors.push("machines.provider.max must be an integer >= 1.");
+          if (Number.isInteger(p.count) && Number.isInteger(p.max) && p.count > p.max) warnings.push("machines.provider.count is above max; runs ask for max.");
+        }
+      }
+    }
+  }
+  for (const role of ["workers", "leads"]) {
+    const m = config.placement?.[role];
+    if (m !== undefined && !["local", "spread", "remote"].includes(m)) errors.push(`placement.${role} must be "local", "spread" or "remote".`);
+  }
+  if (config.placement?.leads && config.placement.leads !== "local") {
+    warnings.push("Leads placed off this machine run swarm.mjs there, with that machine's health.json: cooldowns and quota shares won't be shared. Keep placement.leads \"local\" unless the box has the same config and you accept that.");
+  }
+}
+
+// Live viewer (scripts/swarm-viz.mjs): off unless config turns it on with `viewer: { enabled: true }`.
+const VIZ_PATH = path.join(path.dirname(SCRIPT_PATH), "swarm-viz.mjs");
+const DEFAULT_VIEWER_PORT = 4777;
+function resolveViewer(config, runId = null) {
+  const v = config.viewer;
+  if (!v || typeof v !== "object" || v.enabled !== true) return { enabled: false };
+  const port = Number.isInteger(v.port) ? v.port : DEFAULT_VIEWER_PORT;
+  return {
+    enabled: true,
+    port,
+    start: `node "${VIZ_PATH}" --detach --root "<first Lead's childThreadId>" --port ${port}${runId ? ` --run ${runId}` : ""}`,
+  };
+}
+function validateViewer(config, errors) {
+  const v = config.viewer;
+  if (v === undefined) return;
+  if (!v || typeof v !== "object" || Array.isArray(v)) return errors.push("`viewer` must be an object: { enabled: true, port: 4777 }.");
+  if (v.enabled !== undefined && typeof v.enabled !== "boolean") errors.push("viewer.enabled must be true or false.");
+  if (v.port !== undefined && !(Number.isInteger(v.port) && v.port >= 1024 && v.port <= 65535)) errors.push("viewer.port must be an integer from 1024 to 65535.");
+}
+// Stop a run's viewer (finish): its pidfile names the process; check it is ours before signalling.
+function stopViewer(runId) {
+  const pidFile = path.join(RUNS_DIR, `${runId}.viz.pid`);
+  if (!fs.existsSync(pidFile)) return null;
+  let stopped = false;
+  try {
+    const { pid } = JSON.parse(fs.readFileSync(pidFile, "utf8"));
+    const cmdline = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    if (cmdline.includes("swarm-viz.mjs")) {
+      process.kill(pid, "SIGTERM");
+      stopped = true;
+    }
+  } catch {
+    // already gone
+  }
+  try { fs.unlinkSync(pidFile); } catch {}
+  return stopped;
 }
 
 function resolveStatusUpdates(config) {
@@ -907,7 +1029,9 @@ function validateWeights(config, errors, warnings) {
   }
 }
 
-async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet, batchCounts) {
+async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet, batchCounts, where = {}) {
+  const envs = machineList(config);
+  const needs = where.needs || new Set();
   const pool = config.workers?.[tier] || [];
   if (pool.length === 0) {
     return { ok: false, error: `No workers configured for tier "${tier}".` };
@@ -940,6 +1064,15 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
     if (!quota.available) {
       skipped.push({ model: entry.model, bucket, reason: quota.reason || "quota_hook" });
       continue;
+    }
+    if (envs.length) {
+      const ok = where.place
+        ? envs.some((e) => (e.label === where.place || e.id === where.place || (where.place === "local" && e.local)) && !envMisfit(health, e, { provider: entry.provider, needs }))
+        : envs.some((e) => !envMisfit(health, e, { provider: entry.provider, needs }));
+      if (!ok) {
+        skipped.push({ model: entry.model, bucket, reason: `no_environment(${[...needs].join("+") || where.place || "any"})` });
+        continue;
+      }
     }
     eligible.push({ entry, bucket, idx: i });
   }
@@ -991,7 +1124,7 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
 
   const { target, depthDropped } = buildTarget(config, chosen.entry, depth);
   const round = (n) => Math.round(n * 1000) / 1000;
-  return {
+  const pick = {
     ok: true,
     tier,
     depth,
@@ -1003,10 +1136,486 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
     ...(isAvoided(chosen) ? { onAvoidedBucket: true } : {}),
     ...(capRelaxed ? { capRelaxed: true } : {}),
   };
+  if (envs.length) {
+    const placed = chooseEnvironment(config, health, { provider: chosen.entry.provider, needs, place: where.place, role: "workers", batch: where.envBatch });
+    if (placed.error) return { ok: false, error: placed.error, ...(placed.skipped ? { skipped: placed.skipped } : {}) };
+    applyPlacement(pick, placed.env, placed.skipped);
+  }
+  return pick;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Workstreams: one run, several Leads. Each workstream has its own ledger (<run-id>.<stream>.md) and
+// branch (swarm/<run-id>--<stream>); the run ledger lists them, and an integration pass merges them.
+// Leads coordinate on the run's board (<run-id>.board.md): they claim the files they will touch,
+// agree shared contracts, and ask each other questions, so their work doesn't overlap.
+// ---------------------------------------------------------------------------------------------------
+const DEFAULT_MAX_WORKSTREAMS = 4;
+const RESERVED_STREAMS = new Set(["integrate", "all", "coordinator", "board", "run"]);
+const RUN_ID_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-[a-z0-9-]+-[0-9a-f]{4}$/;
+const BOARD_KINDS = ["claim", "release", "contract", "ack", "ask", "answer", "note", "done"];
+
+function parseStreams(raw, config) {
+  const max = config.defaults?.maxWorkstreams ?? DEFAULT_MAX_WORKSTREAMS;
+  const names = String(raw || "")
+    .split(",")
+    .map((s) => slugify(s).slice(0, 24))
+    .filter((s) => s && s !== "run");
+  const dupes = names.filter((n, i) => names.indexOf(n) !== i);
+  if (dupes.length) return { error: `Duplicate workstream name(s): ${[...new Set(dupes)].join(", ")}.` };
+  const reserved = names.filter((n) => RESERVED_STREAMS.has(n));
+  if (reserved.length) return { error: `Reserved workstream name(s): ${reserved.join(", ")}. Pick other names.` };
+  if (names.length < 2) return { error: "--streams needs at least 2 names (e.g. ios,android,web). Omit it for a single Lead." };
+  if (names.length > max) return { error: `At most ${max} workstreams per run (defaults.maxWorkstreams). Split the goal into separate runs.` };
+  return { streams: names };
+}
+
+const streamLedgerPath = (runId, stream) => path.join(RUNS_DIR, `${runId}.${stream}.md`);
+const boardFilePath = (runId) => path.join(RUNS_DIR, `${runId}.board.md`);
+const runLedgerPath = (runId) => path.join(RUNS_DIR, `${path.basename(String(runId), ".md")}.md`);
+
+// Workstream names of a run, from its ledger files (works for active runs).
+function runStreams(runId) {
+  if (!fs.existsSync(RUNS_DIR)) return [];
+  const prefix = `${runId}.`;
+  return fs
+    .readdirSync(RUNS_DIR)
+    .filter((f) => f.startsWith(prefix) && f.endsWith(".md") && f !== `${runId}.board.md`)
+    .map((f) => f.slice(prefix.length, -3))
+    .filter((s) => s && !s.includes("."))
+    .sort();
+}
+
+// Board lines: `- #<n> | <ISO time> | <from> → <to> | <kind> | <paths or -> | <text>`
+function readBoard(runId) {
+  const file = boardFilePath(runId);
+  if (!fs.existsSync(file)) return null;
+  const posts = [];
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    const m = line.match(/^- #(\d+) \| (\S+) \| (\S+) → (\S+) \| (\w+) \| ([^|]*) \|\s?(.*)$/);
+    if (!m) continue;
+    const paths = m[6].trim() === "-" ? [] : m[6].split(",").map((p) => p.trim()).filter(Boolean);
+    posts.push({ n: Number(m[1]), at: m[2], from: m[3], to: m[4], kind: m[5], paths, text: m[7] });
+  }
+  return { file, posts };
+}
+
+function normClaim(p) {
+  return String(p).trim().replace(/^\.\//, "").replace(/\/?\*.*$/, "").replace(/\/+$/, "");
+}
+// Two claims overlap when one is the other or contains it ("app/ui" and "app/ui/shop.gd"); "" claims everything.
+function claimsOverlap(a, b) {
+  const x = normClaim(a), y = normClaim(b);
+  return x === "" || y === "" || x === y || x.startsWith(y + "/") || y.startsWith(x + "/");
+}
+// Replay claims and releases into who holds what now. `done` releases everything the stream held.
+function activeClaims(posts) {
+  const held = new Map();
+  for (const p of posts) {
+    if (!held.has(p.from)) held.set(p.from, []);
+    const mine = held.get(p.from);
+    if (p.kind === "claim") for (const path_ of p.paths) if (!mine.includes(path_)) mine.push(path_);
+    if (p.kind === "release") held.set(p.from, p.paths.length ? mine.filter((x) => !p.paths.some((r) => claimsOverlap(r, x) && normClaim(r).length <= normClaim(x).length)) : []);
+    if (p.kind === "done") held.set(p.from, []);
+  }
+  for (const [k, v] of held) if (!v.length) held.delete(k);
+  return held;
+}
+
+// A contract post's text starts with `[owner: <stream|all>]` (and `, replaces #<n>` when it supersedes one).
+// The owner implements it; `all` means each workstream implements its own side.
+const CONTRACT_HEAD_RE = /^\[owner: ([a-z0-9-]+)(?:, replaces #(\d+))?\]\s*/;
+function parseContract(p) {
+  const m = p.text.match(CONTRACT_HEAD_RE);
+  return { owner: m ? m[1] : null, replaces: m?.[2] ? Number(m[2]) : null, text: m ? p.text.slice(m[0].length) : p.text };
+}
+const refsPost = (text, n) => new RegExp(`#${n}(?!\\d)`).test(text);
+
+// What the board says now: who holds which paths, which contracts are settled, which asks are open.
+// A contract is settled when it has an owner and every Lead that must implement it (other than the
+// proposer) has acked it. An ask closes when the asked side answers, or releases the paths it asked about.
+function boardState(posts, streams) {
+  const done = new Set(posts.filter((p) => p.kind === "done").map((p) => p.from));
+  const contracts = posts.filter((p) => p.kind === "contract").map((p) => {
+    const c = parseContract(p);
+    const acks = [...new Set(posts.filter((q) => q.kind === "ack" && q.n > p.n && refsPost(q.text, p.n)).map((q) => q.from))];
+    const must = c.owner === "all" ? streams.filter((s) => s !== p.from) : c.owner && c.owner !== p.from ? [c.owner] : [];
+    // The Coordinator's ack ("#n verified") settles a contract it has checked on the branches itself.
+    const missingAcks = acks.includes("coordinator") ? [] : must.filter((s) => !acks.includes(s));
+    return { n: p.n, by: p.from, owner: c.owner, ...(c.replaces ? { replaces: c.replaces } : {}), text: c.text, acks, missingAcks };
+  });
+  const replaced = new Set(contracts.map((c) => c.replaces).filter(Boolean));
+  for (const c of contracts) {
+    c.state = replaced.has(c.n) ? "replaced" : !c.owner ? "no owner" : c.missingAcks.length ? "waiting for acks" : "settled";
+  }
+  const openAsks = posts
+    .filter((p) => p.kind === "ask")
+    .filter((p) => !posts.some((q) => q.n > p.n && (
+      (q.kind === "answer" && (q.to === p.from || q.to === "all") && (p.to === "all" || q.from === p.to || q.from === "coordinator")) ||
+      (q.kind === "release" && p.paths.length && (p.to === "all" || q.from === p.to) && q.paths.some((r) => p.paths.some((x) => claimsOverlap(r, x))))
+    )))
+    .map((p) => ({ n: p.n, from: p.from, to: p.to, paths: p.paths, text: p.text, ...(done.has(p.to) ? { note: `${p.to} has posted done; its Lead won't read this` } : {}) }));
+  return { done, claims: Object.fromEntries(activeClaims(posts)), contracts, openAsks };
+}
+
+// Contracts and asks still unsettled, for one workstream (`done`) or the whole run (integration pass).
+function unsettled(state, stream = null) {
+  const live = state.contracts.filter((c) => c.state !== "replaced" && c.state !== "settled");
+  const issues = [];
+  for (const c of live) {
+    if (stream && c.by !== stream && c.owner !== stream && !c.missingAcks.includes(stream)) continue;
+    issues.push({ contract: c.n, by: c.by, owner: c.owner, state: c.state, ...(c.missingAcks.length ? { missingAcks: c.missingAcks } : {}), text: c.text });
+  }
+  for (const a of state.openAsks) {
+    if (stream && a.to !== stream && a.from !== stream) continue;
+    issues.push({ ask: a.n, from: a.from, to: a.to, text: a.text });
+  }
+  return issues;
+}
+
+// The run ledger's Workstreams rows: `- <stream> | ledger: .. | branch: .. | lead: .. | thread: .. | status: ..`
+// (the Coordinator fills lead/thread/status as it dispatches each Lead).
+function workstreamRows(runId) {
+  const rows = {};
+  let text = "";
+  try { text = fs.readFileSync(runLedgerPath(runId), "utf8"); } catch { return rows; }
+  const sec = text.split(/^## Workstreams\s*$/m)[1]?.split(/^## /m)[0] ?? "";
+  for (const line of sec.split("\n")) {
+    const name = line.match(/^- ([a-z0-9-]+) \|/)?.[1];
+    if (!name) continue;
+    const field = (k) => {
+      const v = line.match(new RegExp(`\\| ${k}: \`?([^|\`]+?)\`?\\s*(?:\\||$)`))?.[1]?.trim();
+      return v && v !== "(pending)" ? v : null;
+    };
+    rows[name] = { branch: field("branch"), lead: field("lead"), thread: field("thread"), status: field("status") };
+  }
+  return rows;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Machines: which machine a delegate runs on. Boxes come and go, so config never lists them. Each run,
+// the Coordinator asks T3 which linked environments answer now and registers them with `machines --register`
+// (machines.json, a cache next to health.json). A box's project for this repo is found by the repo's
+// origin URL, which T3 also keys projects by (repositoryIdentity.canonicalKey). Config holds policy only:
+// `machines` { use, local: {label, tags, weight}, match: {"<label glob>": {tags, weight}}, maxAgeHours }
+// and `placement`. Workers spread across machines by weight; Leads stay local by default so one router
+// and one health.json keep routing every quota.
+// ---------------------------------------------------------------------------------------------------
+const MACHINES_PATH = path.join(SWARM_HOME, "machines.json");
+const DEFAULT_MACHINE_MAX_AGE_HOURS = 12;
+const OS_TAGS = { darwin: "mac", macos: "mac", linux: "linux", win32: "windows", windows: "windows" };
+const osTag = (o) => OS_TAGS[String(o || "").toLowerCase()] || null;
+
+// "git@github.com:Owner/Repo.git", "https://user:token@github.com/owner/repo", "ssh://git@host:22/o/r.git"
+// -> "github.com/owner/repo", the form T3 gives as a project's repositoryIdentity.canonicalKey.
+function canonicalRepoKey(url) {
+  const s = String(url || "").trim();
+  let host, p;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) {
+    try {
+      const u = new URL(s);
+      host = u.hostname;
+      p = decodeURIComponent(u.pathname);
+    } catch {
+      return null;
+    }
+  } else {
+    const scp = /^(?:[^@/\s]+@)?([^:/\s]+):(?!\/)(.+)$/.exec(s);
+    if (!scp) return null;
+    [, host, p] = scp;
+  }
+  p = p.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+  return host && p ? `${host}/${p}`.toLowerCase() : null;
+}
+let repoKeyMemo;
+function currentRepoKey() {
+  if (repoKeyMemo !== undefined) return repoKeyMemo;
+  try {
+    repoKeyMemo = canonicalRepoKey(execFileSync("git", ["remote", "get-url", "origin"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
+  } catch {
+    repoKeyMemo = null;
+  }
+  return repoKeyMemo;
+}
+
+function readMachinesFile() {
+  try {
+    const j = JSON.parse(fs.readFileSync(MACHINES_PATH, "utf8"));
+    return Array.isArray(j?.machines) ? j : { machines: [] };
+  } catch {
+    return { machines: [] };
+  }
+}
+const globRe = (g) => new RegExp(`^${String(g).split("*").map((x) => x.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`, "i");
+function matchRules(config, label) {
+  const rules = config.machines?.match;
+  if (!rules || typeof rules !== "object" || Array.isArray(rules)) return [];
+  return Object.entries(rules).filter(([g]) => globRe(g).test(label)).map(([, r]) => (r && typeof r === "object" ? r : {}));
+}
+const ruleTags = (r) => (Array.isArray(r?.tags) ? r.tags.map(String) : []);
+const machineMaxAgeMs = (config) => {
+  const h = config.machines?.maxAgeHours;
+  return (typeof h === "number" && h > 0 ? h : DEFAULT_MACHINE_MAX_AGE_HOURS) * 3_600_000;
+};
+// This machine's own tags: its OS plus machines.local.tags.
+function localMachine(config, repo) {
+  const lc = config.machines?.local || {};
+  return {
+    id: null, label: String(lc.label || "local"), local: true,
+    tags: new Set([osTag(os.platform()), ...ruleTags(lc)].filter(Boolean)),
+    weight: typeof lc.weight === "number" && lc.weight >= 0 ? lc.weight : 1,
+    providers: null, projectId: null, repo,
+  };
+}
+function remoteMachine(config, m, repo, lease) {
+  const rules = matchRules(config, String(m.label));
+  const projects = Object.fromEntries(Object.entries(m.projects || {}).map(([k, v]) => [String(k).toLowerCase(), String(v)]));
+  return {
+    id: String(m.environmentId), label: String(m.label), local: false,
+    tags: new Set([osTag(m.os), ...rules.flatMap(ruleTags)].filter(Boolean)),
+    weight: rules.map((r) => r.weight).find((w) => typeof w === "number" && w >= 0) ?? 1,
+    providers: Array.isArray(m.providers) ? new Set(m.providers.map(String)) : null,
+    projectId: repo ? projects[repo] || null : null,
+    repo,
+    seenAt: m.seenAt || null,
+    // with a box provider: null = no lease needed; else whether this pick's run holds the box
+    held: lease ? lease.machines.some((x) => x.environmentId === m.environmentId || x.label === m.label) : null,
+    run: lease?.run ?? null,
+  };
+}
+// Leases: `machines acquire` records the boxes the provider gave a run (<runId>.boxes.json). With a provider,
+// a run places work only on boxes it holds, so another run's release can't stop a box under its workers.
+let cliFlags = {};
+const leasePath = (runId) => path.join(RUNS_DIR, `${path.basename(String(runId))}.boxes.json`);
+function readLease(runId) {
+  try {
+    const j = JSON.parse(fs.readFileSync(leasePath(runId), "utf8"));
+    return Array.isArray(j?.machines) ? j : null;
+  } catch {
+    return null;
+  }
+}
+// Leases of runs still in runs/ (finish archives a run's lease with its ledger).
+function liveLeases() {
+  let files = [];
+  try { files = fs.readdirSync(RUNS_DIR).filter((f) => f.endsWith(".boxes.json")); } catch {}
+  return files.map((f) => ({ run: f.slice(0, -".boxes.json".length), ...(readLease(f.slice(0, -".boxes.json".length)) || { machines: [] }) }));
+}
+// The run a pick belongs to: --run, else the swarm/<runId>[--<stream>] branch this checkout is on.
+let runMemo;
+function currentRun() {
+  if (typeof cliFlags.run === "string") return cliFlags.run;
+  if (runMemo !== undefined) return runMemo;
+  runMemo = null;
+  try {
+    const branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const rest = /^swarm\/(.+)$/.exec(branch)?.[1];
+    if (rest) {
+      const cands = [rest, rest.includes("--") ? rest.slice(0, rest.lastIndexOf("--")) : null].filter(Boolean);
+      runMemo = cands.find((c) => fs.existsSync(runLedgerPath(c))) || null;
+    }
+  } catch {}
+  return runMemo;
+}
+
+// The machines a pick may use: this one plus each box registered within maxAgeHours. Empty when no box
+// is registered (or machines.use is false): picks then carry no placement and run here.
+let machinesMemo;
+function machineList(config) {
+  if (machinesMemo) return machinesMemo;
+  if (config.machines?.use === false) return (machinesMemo = []);
+  const repo = currentRepoKey();
+  const now = Date.now();
+  // With a box provider, boxes belong to runs: look up this pick's run and what it holds.
+  const run = boxProvider(config) ? currentRun() : null;
+  const lease = boxProvider(config) ? { run, machines: run ? readLease(run)?.machines || [] : [] } : null;
+  const remote = readMachinesFile().machines
+    .filter((m) => m?.environmentId && m?.label && now - Date.parse(m.seenAt || 0) <= machineMaxAgeMs(config))
+    .map((m) => remoteMachine(config, m, repo, lease));
+  return (machinesMemo = remote.length ? [localMachine(config, repo), ...remote] : []);
+}
+// One machine as status, doctor and `machines` show it.
+function machineSummary(e) {
+  return {
+    label: e.label,
+    local: e.local,
+    ...(e.id ? { environmentId: e.id } : {}),
+    tags: [...e.tags],
+    weight: e.weight,
+    ...(e.local ? {} : { providers: e.providers ? [...e.providers] : "any", projectHere: e.projectId || null, seenAt: e.seenAt, ...(e.held !== null ? { leasedToThisRun: e.held } : {}) }),
+  };
+}
+// Check a `machines --register` payload: what an agent builds from t3_environment_links, t3_environment_read,
+// orchestrator_capabilities and t3_project_list for each reachable box.
+function parseMachinesInput(raw) {
+  let list;
+  try {
+    list = JSON.parse(raw);
+  } catch (err) {
+    return { error: `--register needs a JSON array: ${err.message}` };
+  }
+  if (!Array.isArray(list)) return { error: "--register needs a JSON array of { environmentId, label, os, providers, projects }." };
+  const errors = [], ids = new Set(), labels = new Set();
+  const seenAt = new Date().toISOString();
+  const machines = list.map((m, i) => {
+    const where = `machine ${i}`;
+    if (!m || typeof m !== "object") return errors.push(`${where} must be an object.`), null;
+    if (typeof m.environmentId !== "string" || !m.environmentId) errors.push(`${where} needs the linked environment's \`environmentId\`.`);
+    if (typeof m.label !== "string" || !m.label) errors.push(`${where} needs its T3 \`label\`.`);
+    if (ids.has(m.environmentId)) errors.push(`${where}: environmentId listed twice.`);
+    if (labels.has(m.label)) errors.push(`${where}: label "${m.label}" listed twice.`);
+    ids.add(m.environmentId);
+    labels.add(m.label);
+    if (m.providers !== undefined && !(Array.isArray(m.providers) && m.providers.every((p) => typeof p === "string"))) errors.push(`${where}.providers must be an array of provider ids.`);
+    const projects = m.projects ?? {};
+    if (typeof projects !== "object" || Array.isArray(projects) || !Object.values(projects).every((v) => typeof v === "string")) {
+      errors.push(`${where}.projects must map each project's canonicalKey (e.g. "github.com/owner/repo") to its project id there.`);
+    }
+    return {
+      environmentId: m.environmentId,
+      label: m.label,
+      ...(m.os ? { os: String(m.os) } : {}),
+      ...(Array.isArray(m.providers) ? { providers: m.providers } : {}),
+      projects,
+      seenAt,
+    };
+  });
+  return errors.length ? { error: errors.join(" ") } : { machines };
+}
+
+// Box provider: the user's own box skill ships a command that brings boxes up and lets them go
+// (boat.dev, e2b, anything). The swarm decides when and how many; the provider decides how.
+//   <command> acquire --run <id> --count <n> [--needs a,b] -> {"ok", "machines": [{label, environmentId}], "errors"}
+//   <command> release --run <id>                           -> {"ok", ...}
+// It must print one JSON object on stdout (progress on stderr) and return acquire only once each box answers
+// in T3. Read from the global config only: a repo's .t3-swarm.json can't name a command for the router to run.
+const PROVIDER_TIMEOUT_MS = { acquire: 10 * 60_000, release: 5 * 60_000 };
+function boxProvider(config) {
+  const p = config.machines?.provider;
+  if (!p || typeof p !== "object" || config.machines?.use === false) return null;
+  const argv = (Array.isArray(p.command) ? p.command.map(String) : typeof p.command === "string" && p.command.trim() ? [p.command.trim()] : null);
+  if (!argv) return null;
+  argv[0] = argv[0].replace(/^~(?=$|\/)/, os.homedir());
+  const max = Number.isInteger(p.max) && p.max >= 1 ? p.max : 2;
+  const count = Math.min(Number.isInteger(p.count) && p.count >= 0 ? p.count : 1, max);
+  return { argv, count, max };
+}
+// What init tells the Coordinator about boxes: only when a provider is configured.
+function boxesInfo(config, runId) {
+  const p = boxProvider(config);
+  if (!p) return {};
+  return { boxes: { count: p.count, max: p.max, acquire: `node "${SCRIPT_PATH}" machines acquire --run ${runId}` } };
+}
+function runProvider(provider, verb, args) {
+  const r = spawnSync(provider.argv[0], [...provider.argv.slice(1), verb, ...args], {
+    encoding: "utf8",
+    timeout: PROVIDER_TIMEOUT_MS[verb] || 60_000,
+    stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  const tail = (t) => String(t || "").trim().split("\n").slice(-8).join("\n");
+  if (r.error) return { ok: false, error: `${verb}: ${r.error.code === "ETIMEDOUT" ? `no answer within ${PROVIDER_TIMEOUT_MS[verb] / 60_000} min` : r.error.message}`, stderr: tail(r.stderr) };
+  const text = String(r.stdout || "").trim();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    try { json = JSON.parse(text.split("\n").filter(Boolean).pop()); } catch {}
+  }
+  if (!json || typeof json !== "object") return { ok: false, error: `${verb}: the provider printed no JSON object (exit ${r.status}).`, stderr: tail(r.stderr) };
+  if (json.ok === false || r.status !== 0) return { ok: false, error: `${verb}: ${json.error || `exit ${r.status}`}`, ...(json.errors ? { errors: json.errors } : {}), stderr: tail(r.stderr) };
+  return { ok: true, json };
+}
+
+function placementMode(config, role) {
+  const envs = machineList(config);
+  const set = config.placement?.[role];
+  if (set) return set;
+  return role === "workers" && envs.some((e) => !e.local) ? "spread" : "local";
+}
+const envKey = (env) => `env:${env.label}`;
+function envCooldown(health, env) {
+  for (const k of [envKey(env), env.id && `env:${env.id}`].filter(Boolean)) {
+    const c = health.cooldowns[k];
+    if (c && Date.parse(c.until) > Date.now()) return k;
+  }
+  return null;
+}
+function parseNeeds(raw) {
+  return new Set(String(raw || "").split(/[,+]/).map((s) => s.trim()).filter(Boolean));
+}
+// Why a machine can't take this delegate, or null when it can. Pure (no credits touched).
+function envMisfit(health, e, { provider, needs = new Set() }) {
+  if (![...needs].every((t) => e.tags.has(t))) return `missing tags ${[...needs].filter((t) => !e.tags.has(t)).join("+")}`;
+  if (e.providers && provider && !e.providers.has(provider)) return `provider ${provider} not signed in there`;
+  if (!e.local && e.held === false) {
+    return e.run ? `not leased to run ${e.run} (machines acquire --run ${e.run})` : "boxes are leased per run: pass --run <runId>, or pick from the run's swarm/ branch";
+  }
+  if (!e.local && !e.projectId) return e.repo ? `no project for ${e.repo} there` : "this checkout has no origin remote, so no project there matches it";
+  const cd = envCooldown(health, e);
+  return cd ? `cooldown:${cd}` : null;
+}
+/**
+ * Choose where one delegate runs. `needs` = tags the machine must have; `place` = a label/id or "local"
+ * to force it. Returns { env, skipped? } (env null when no box is registered: it runs here) or { error }.
+ */
+function chooseEnvironment(config, health, { provider, needs = new Set(), place = null, role = "workers", batch = null }) {
+  const envs = machineList(config);
+  if (envs.length === 0) {
+    return place && place !== "local"
+      ? { error: `No machine "${place}" is registered. The Coordinator registers the boxes that answer now with \`machines --register\`.` }
+      : { env: null };
+  }
+  const skipped = [];
+  const fits = (e) => envMisfit(health, e, { provider, needs });
+  if (place) {
+    const e = envs.find((x) => x.label === place || x.id === place || (place === "local" && x.local));
+    if (!e) return { error: `Unknown machine "${place}". Registered: ${envs.map((x) => x.label).join(", ")}.` };
+    const why = fits(e);
+    return why ? { error: `Can't place on ${e.label}: ${why}.` } : { env: e };
+  }
+  const eligible = [];
+  for (const e of envs) {
+    const why = fits(e);
+    if (why) skipped.push({ environment: e.label, reason: why });
+    else eligible.push(e);
+  }
+  if (!eligible.length) return { error: `No machine can run this (${[...needs].join("+") || "no tags"}, ${provider}).`, skipped };
+  const mode = placementMode(config, role);
+  let pool = eligible;
+  if (mode === "local" && needs.size === 0) pool = eligible.filter((e) => e.local).length ? eligible.filter((e) => e.local) : eligible;
+  if (mode === "remote") pool = eligible.filter((e) => !e.local).length ? eligible.filter((e) => !e.local) : eligible;
+  const positive = pool.filter((e) => e.weight > 0);
+  if (positive.length) pool = positive; // weight 0 = only when nothing else fits
+  const { chosen } = swrrPick(
+    health.credits.envs,
+    pool.map((e) => ({ e, id: e.label, weight: e.weight || 1 })),
+    (c) => batch?.get(c.id) || 0
+  );
+  if (batch) batch.set(chosen.id, (batch.get(chosen.id) || 0) + 1);
+  return { env: chosen.e, ...(skipped.length ? { skipped } : {}) };
+}
+// Fold a placement into a pick: remote machines get target.environmentId + projectId. `skipped` says why
+// any box was passed over, so work that silently stays here (wrong checkout, project not on the box) shows.
+function applyPlacement(pick, env, skipped) {
+  if (!env) return pick;
+  if (!env.local) pick.target = { ...pick.target, environmentId: env.id, projectId: env.projectId };
+  pick.placement = { environment: env.label, remote: !env.local, ...(env.id ? { environmentId: env.id, projectId: env.projectId } : {}), tags: [...env.tags] };
+  // T3 runs a task on a linked machine in that machine's checkout and refuses isolation "worktree" there.
+  if (!env.local) pick.placement.note = `Runs in ${env.label}'s own checkout: leave isolation out (T3 refuses "worktree" there) and have the worker start in its own worktree from origin/<branch> (lead-brief: Machines).`;
+  if (skipped?.length) pick.placement.skipped = skipped;
+  return pick;
+}
+
+// The worker brief, verbatim: every worker task starts with it, then the scoped part. Returned with each
+// pick so the delegating agent copies text it just read instead of retyping (and shortening) the file.
+function readWorkerBrief() {
+  try { return fs.readFileSync(path.join(REFERENCES_DIR, "worker-brief.md"), "utf8").trimEnd() + "\n"; } catch { return null; }
 }
 
 function parseSpec(spec, defaultDepth) {
-  const [rawTier, rawDepth] = String(spec || "").split(":");
+  const [specCore, needsRaw] = String(spec || "").split("@");
+  const [rawTier, rawDepth] = specCore.split(":");
   const tier = rawTier?.trim().toLowerCase();
   const depth = rawDepth?.trim().toLowerCase() || defaultDepth || "medium";
   if (!VALID_TIERS.includes(tier)) {
@@ -1015,12 +1624,13 @@ function parseSpec(spec, defaultDepth) {
   if (!DEPTH_ORDER.includes(depth)) {
     return { error: `Invalid depth "${depth}". Expected one of: ${DEPTH_ORDER.join(", ")}` };
   }
-  return { tier, depth };
+  return { tier, depth, needs: parseNeeds(needsRaw) }; // "balanced:high@android+linux" -> needs {android, linux}
 }
 
 async function main() {
   const { positional, flags } = parseFlags(process.argv.slice(2));
   const cmd = positional[0];
+  cliFlags = flags;
 
   if (!cmd || cmd === "help" || flags.help) {
     console.log(`t3-swarm router CLI
@@ -1028,13 +1638,24 @@ async function main() {
 Commands:
   doctor                                   Validate config, buckets, write access & paths
   status                                   Show leads, resolved buckets, cooldowns & recent runs
-  init <slug> [--goal "..."]               Create a single-file STATE.md ledger for Mode 2
-  finish <run-id> [--force]                Archive a run whose ledger says Status: COMPLETE
-  pick-lead [--run id] [--depth high]      Pick the Lead (heavy pool as fallback); --run makes it stick to a run
-  pick-worker <tier[:depth]> [--avoid b]   Pick one worker by quota weight
-  pick-workers <spec>... [--avoid b]       Pick a wave of workers in one call
+  init <slug> [--goal "..."] [--streams a,b]  Create the run ledger; --streams adds one Lead per workstream
+                                           (a ledger + branch each, and a board the Leads coordinate on)
+  finish <run-id> [--force]                Archive a run (and its workstream ledgers/board) once Status: COMPLETE
+  pick-lead [--run id] [--stream s] [--depth high]
+                                           Pick the Lead (heavy pool as fallback); --run makes it stick to a run,
+                                           --stream to one workstream of it (prefers a model no other stream uses)
+  pick-worker <tier[:depth][@tags]> [--avoid b]   Pick one worker by quota weight (and a machine for it)
+  pick-workers <spec>... [--avoid b]       Pick a wave of workers in one call, spread across machines
+  post <run-id> --from <stream> [--to s|all] [--kind k] [--paths "a,b"] "text"
+                                           Post to the run's board: claim|release|contract|ack|ask|answer|note|done.
+                                           A claim overlapping another stream's claim is refused until they agree.
+                                           A contract needs --owner <stream|all> (who implements it); an ack
+                                           names it ("#4 ok"); --replaces <n> supersedes contract #n.
+  board <run-id> [--since n] [--for s]     Read the board: posts, who holds which paths, open asks, contracts
   cooldown <key> [duration] [--until t]    Put a key in cooldown (default: defaults.cooldownMinutes)
   clear-cooldown <key|all>                 Clear cooldown(s)
+  machines [--register '<json>'|-] [--drop a,b] [--clear]  Show, add or remove the machines picks may use
+  machines acquire|release --run <id> [--count n]  Have the box provider bring a run's boxes up / let them go
 
 Cooldown keys (scope the cooldown to what actually ran out):
   <provider>:<model>   one model only, e.g. claudeAgent:claude-fable-5-2
@@ -1053,6 +1674,26 @@ Options:
   --reason "..."     Optional note when setting a cooldown
   --force            finish: archive even if the ledger Status is not COMPLETE
   --run <run-id>     pick-lead: reuse this run's Lead while healthy; otherwise fail over and record it
+  --stream <name>    pick-lead: the workstream this Lead owns (or "integrate" for the final merge pass,
+                     refused until every workstream is COMPLETE and the board is settled; --force skips that)
+  --needs <t1,t2>    pick-*: only machines with these tags (also "spec@tag+tag" per worker)
+  --place <label>    pick-*: force a machine by label/id, or "local" for this one
+
+Machines: boxes come and go, so config doesn't list them. With a box provider (config machines.provider:
+{ command, count: 1, max: 2 }, the user's own box skill's command), the Coordinator runs \`machines acquire
+--run <id>\` after init: the provider brings the run's boxes up and the run leases them; finish releases them.
+Then it registers the linked machines that answer: machines --register '[{ "environmentId": "<id>", "label":
+"box-1", "os": "linux", "providers": ["claudeAgent","codex"], "projects": { "github.com/owner/repo": "<id>" } }]'
+(from t3_environment_links, t3_environment_read, orchestrator_capabilities, t3_project_list); --drop removes
+one that stopped answering. A pick uses a box's project for this checkout's origin, and with a provider only
+the boxes its run leases (--run, or the swarm/<runId> branch). Registrations last machines.maxAgeHours (12).
+Config "machines" also holds policy: { use: false to never leave this machine, local: { label, tags, weight },
+match: { "box-*": { tags: ["godot"], weight: 2 } } }. Each machine's OS adds a tag (mac, linux).
+placement { workers: "spread" (default with boxes) | "local" | "remote", leads: "local" (default) }. Cool down
+a box that stops answering with \`cooldown env:box-1 30m\`.
+
+Viewer (config "viewer"): { enabled: true, port: 4777 } makes init return the command that starts the
+live view (scripts/swarm-viz.mjs) for the run; finish stops it. Off by default.
 
 Weights (config "weights"): buckets {bucket: n} sets each quota bucket's share of work (default 1; 0 =
 only when nothing else is available); a per-entry "weight" overrides one model in one tier.
@@ -1116,7 +1757,10 @@ interval progress updates during Mode 2 runs (off by default).
       untilMs = Date.now() + minutes * 60_000;
     }
 
-    const affects = loaded.ok ? entriesMatchingKey(loaded.config, key) : [];
+    const envMatches = loaded.ok && key.startsWith("env:")
+      ? machineList(loaded.config).filter((e) => key === envKey(e) || (e.id && key === `env:${e.id}`)).map((e) => ({ environment: e.label, remote: !e.local }))
+      : [];
+    const affects = envMatches.length ? envMatches : loaded.ok ? entriesMatchingKey(loaded.config, key) : [];
     if (loaded.ok && affects.length === 0) {
       warnings.push(`"${key}" matches no configured lead or worker; cooldown saved anyway.`);
     }
@@ -1179,6 +1823,150 @@ interval progress updates during Mode 2 runs (off by default).
     return;
   }
 
+  // Leads of one run coordinate here. `post` appends under a lock; a claim that overlaps another
+  // workstream's active claim is refused (not recorded) so the two Leads have to agree first.
+  if (cmd === "post") {
+    const runId = positional[1];
+    let text = positional.slice(2).join(" ").replace(/\s+/g, " ").trim();
+    const kind = typeof flags.kind === "string" ? flags.kind : "note";
+    const from = typeof flags.from === "string" ? flags.from : null;
+    const to = typeof flags.to === "string" ? flags.to : "all";
+    const paths = typeof flags.paths === "string" ? flags.paths.split(",").map((p) => p.trim()).filter(Boolean) : [];
+    if (!runId || !from) {
+      out({ ok: false, error: 'Usage: swarm.mjs post <run-id> --from <stream> [--to <stream|all|coordinator>] [--kind claim|release|contract|ack|ask|answer|note|done] [--paths "a,b"] [--owner <stream|all> (contract)] [--replaces <n> (contract)] "text"' }, 1);
+      return;
+    }
+    if (!BOARD_KINDS.includes(kind)) {
+      out({ ok: false, error: `Unknown --kind "${kind}". Use one of: ${BOARD_KINDS.join(", ")}.` }, 1);
+      return;
+    }
+    const streams = runStreams(runId);
+    const known = new Set([...streams, "coordinator", "integrate"]);
+    if (!known.has(from) || (to !== "all" && !known.has(to))) {
+      out({ ok: false, error: `--from/--to must be one of: ${[...known].join(", ")}${to !== "all" ? ", all" : ""}.` }, 1);
+      return;
+    }
+    if (kind === "claim" && !paths.length) {
+      out({ ok: false, error: 'A claim needs --paths "dir/or/file,..." (what you will edit).' }, 1);
+      return;
+    }
+    if ((flags.owner !== undefined || flags.replaces !== undefined) && kind !== "contract") {
+      out({ ok: false, error: "--owner and --replaces only go with --kind contract." }, 1);
+      return;
+    }
+    if (kind === "contract") {
+      const owner = typeof flags.owner === "string" ? flags.owner : null;
+      if (!owner || (owner !== "all" && !streams.includes(owner))) {
+        out({ ok: false, error: `A contract needs --owner <stream>: the workstream that implements it (one of: ${streams.join(", ")}), or --owner all when each workstream implements its own side. The owner claims the paths and acks it.` }, 1);
+        return;
+      }
+      const replaces = flags.replaces !== undefined ? Number(String(flags.replaces).replace(/^#/, "")) : null;
+      if (replaces !== null && !(Number.isInteger(replaces) && replaces > 0)) {
+        out({ ok: false, error: "--replaces needs the number of the contract it supersedes (e.g. --replaces 4)." }, 1);
+        return;
+      }
+      text = `[owner: ${owner}${replaces ? `, replaces #${replaces}` : ""}] ${text}`.trim();
+    }
+    const file = boardFilePath(runId);
+    if (!fs.existsSync(file)) {
+      out({ ok: false, error: `No board for ${runId} (it is created by \`init --streams\`).` }, 1);
+      return;
+    }
+    const rows = workstreamRows(runId);
+    const result = withFileLock(file, () => {
+      const { posts } = readBoard(runId);
+      const before = boardState(posts, streams);
+      const contractNs = new Set(before.contracts.map((c) => c.n));
+      if (kind === "claim") {
+        const conflicts = [];
+        for (const [owner, held] of activeClaims(posts)) {
+          if (owner === from) continue;
+          const hit = held.filter((h) => paths.some((p) => claimsOverlap(p, h)));
+          if (hit.length) conflicts.push({ owner, paths: hit, ...(rows[owner]?.thread ? { leadThread: rows[owner].thread } : {}) });
+        }
+        if (conflicts.length) {
+          return {
+            ok: false,
+            status: "conflict",
+            conflicts,
+            hint: "Not recorded. Ask the owner (post --kind ask --to <owner> --paths <paths>) to release it, split it, or agree a contract where one side owns the shared piece. If it blocks you, also t3_thread_send its leadThread.",
+          };
+        }
+      }
+      if (kind === "contract") {
+        const r = parseContract({ text }).replaces;
+        if (r && !contractNs.has(r)) return { ok: false, error: `#${r} is not a contract on this board; --replaces names the contract this one supersedes.` };
+      }
+      if (kind === "ack") {
+        const refs = [...text.matchAll(/#(\d+)/g)].map((m) => Number(m[1]));
+        if (!refs.length || refs.some((r) => !contractNs.has(r))) {
+          return { ok: false, error: `An ack names the contract it accepts: post --kind ack "#<n> ok". Contracts on this board: ${[...contractNs].map((x) => "#" + x).join(", ") || "none"}.` };
+        }
+      }
+      const n = (posts.length ? posts[posts.length - 1].n : 0) + 1;
+      const at = new Date().toISOString();
+      const line = `- #${n} | ${at} | ${from} → ${to} | ${kind} | ${paths.length ? paths.join(", ") : "-"} | ${text}\n`;
+      fs.appendFileSync(file, line, "utf8");
+      const after = [...posts, { n, at, from, to, kind, paths, text }];
+      const res = { ok: true, posted: { n, at, from, to, kind, paths, text }, claims: Object.fromEntries(activeClaims(after)) };
+      const warnings = [];
+      if (kind === "ask" && to !== "all" && to !== "coordinator" && before.done.has(to)) {
+        warnings.push(`${to} has posted done: its Lead has finished and won't read this. Don't t3_thread_send it (that starts a new task); ask the coordinator instead (--to coordinator), and return STATUS: ESCALATE if it blocks you.`);
+      }
+      if (kind === "done") {
+        const issues = unsettled(boardState(after, streams), from);
+        if (issues.length) {
+          res.unsettled = issues;
+          warnings.push("Recorded, but contracts or asks involving you are unsettled (see `unsettled`). List them in your STATUS: COMPLETE; the integration pass won't start until the Coordinator settles them.");
+        }
+      }
+      if (warnings.length) res.warnings = warnings;
+      return res;
+    });
+    out(result, result.ok ? 0 : 1);
+    return;
+  }
+
+  if (cmd === "board") {
+    const runId = positional[1];
+    if (!runId) {
+      out({ ok: false, error: "Usage: swarm.mjs board <run-id> [--since <n>] [--for <stream>]" }, 1);
+      return;
+    }
+    const board = readBoard(runId);
+    if (!board) {
+      out({ ok: false, error: `No board for ${runId}.` }, 1);
+      return;
+    }
+    const since = Number(flags.since ?? 0) || 0;
+    const forStream = typeof flags.for === "string" ? flags.for : null;
+    // Contracts concern everyone, so --for keeps them along with posts to/from that workstream.
+    const posts = board.posts.filter((p) => p.n > since && (!forStream || p.to === "all" || p.to === forStream || p.from === forStream || p.kind === "contract"));
+    const names = runStreams(runId);
+    const state = boardState(board.posts, names);
+    const rows = workstreamRows(runId);
+    out({
+      ok: true,
+      runId,
+      boardPath: board.file,
+      lastN: board.posts.length ? board.posts[board.posts.length - 1].n : 0,
+      // Each Lead's thread comes from the run ledger's Workstreams rows, which fill in as Leads start:
+      // read it here rather than from your first read of the ledger. A `done` Lead has finished.
+      streams: names.map((st) => ({
+        name: st,
+        status: readLedgerStatus(streamLedgerPath(runId, st)),
+        lead: rows[st]?.lead ?? null,
+        leadThread: rows[st]?.thread ?? null,
+        done: state.done.has(st),
+      })),
+      claims: state.claims,
+      openAsks: state.openAsks,
+      contracts: state.contracts,
+      posts,
+    });
+    return;
+  }
+
   if (cmd === "finish") {
     const runId = positional[1];
     if (!runId) {
@@ -1192,6 +1980,7 @@ interval progress updates during Mode 2 runs (off by default).
       return;
     }
     const runStatus = readLedgerStatus(src);
+    const streamStatuses = runStreams(path.basename(fileName, ".md")).map((st) => ({ name: st, status: readLedgerStatus(streamLedgerPath(path.basename(fileName, ".md"), st)) }));
     if (runStatus !== "COMPLETE" && !flags.force) {
       out(
         {
@@ -1206,6 +1995,11 @@ interval progress updates during Mode 2 runs (off by default).
       );
       return;
     }
+    const viewerStopped = stopViewer(path.basename(fileName, ".md"));
+    // Let the run's boxes go: the provider stops what no other run still holds (unknown runs are a no-op).
+    const finishCfg = loadConfig(flags.config);
+    const provider = finishCfg.ok ? boxProvider(finishCfg.config) : null;
+    const released = provider ? runProvider(provider, "release", ["--run", path.basename(fileName, ".md")]) : null;
     ensureDir(ARCHIVE_DIR);
     const dest = path.join(ARCHIVE_DIR, path.basename(fileName));
     fs.renameSync(src, dest);
@@ -1223,6 +2017,9 @@ interval progress updates during Mode 2 runs (off by default).
       ok: true,
       archivedTo: dest,
       ...(companions.length ? { companions } : {}),
+      ...(streamStatuses.length ? { streams: streamStatuses } : {}),
+      ...(viewerStopped !== null ? { viewerStopped } : {}),
+      ...(released ? { boxesReleased: released.ok ? released.json : { ok: false, error: released.error } } : {}),
       runStatus,
       ...(runStatus !== "COMPLETE" ? { forced: true } : {}),
     });
@@ -1249,6 +2046,131 @@ interval progress updates during Mode 2 runs (off by default).
   }
 
   const { config, configPath, configSource, projectOverridePath } = loaded;
+
+  if (cmd === "machines" && (positional[1] === "acquire" || positional[1] === "release")) {
+    const verb = positional[1];
+    const provider = boxProvider(config);
+    const runId = typeof flags.run === "string" ? flags.run : null;
+    if (!runId) {
+      out({ ok: false, error: `Usage: swarm.mjs machines ${verb} --run <runId>${verb === "acquire" ? " [--count n] [--needs a,b]" : ""}` }, 1);
+      return;
+    }
+    if (!provider) {
+      out({ ok: false, status: "no_provider", error: "No machines.provider in config: the swarm starts no boxes. It uses the linked machines that answer, if any (Remote machines in SKILL.md)." }, 1);
+      return;
+    }
+    if (verb === "release") {
+      const r = runProvider(provider, "release", ["--run", runId]);
+      if (r.ok) try { fs.unlinkSync(leasePath(runId)); } catch {}
+      out(r.ok ? { ok: true, run: runId, ...r.json } : r, r.ok ? 0 : 1);
+      return;
+    }
+    if (!fs.existsSync(runLedgerPath(runId))) {
+      out({ ok: false, error: `Run ${runId} not found in ${RUNS_DIR}: acquire boxes for a run that init created.` }, 1);
+      return;
+    }
+    const asked = flags.count !== undefined ? parseInt(String(flags.count), 10) : provider.count;
+    if (!Number.isInteger(asked) || asked < 0) {
+      out({ ok: false, error: "--count must be an integer >= 0." }, 1);
+      return;
+    }
+    const count = Math.min(asked, provider.max);
+    if (count === 0) {
+      out({ ok: true, run: runId, asked: 0, machines: [], note: "No boxes asked for: the run stays on this machine." });
+      return;
+    }
+    const needs = [...parseNeeds(flags.needs)];
+    // --count is "make sure this run holds N boxes": asking again tops up, it never adds N more
+    const r = runProvider(provider, "acquire", ["--run", runId, "--count", String(count), ...(needs.length ? ["--needs", needs.join(",")] : [])]);
+    if (!r.ok) {
+      out({ ...r, run: runId, hint: "The run goes on without new boxes: register whatever linked machines answer (or none) and continue." }, 1);
+      return;
+    }
+    const got = (Array.isArray(r.json.machines) ? r.json.machines : [])
+      .filter((m) => m && typeof m.label === "string" && typeof m.environmentId === "string")
+      .map((m) => ({ label: m.label, environmentId: m.environmentId }));
+    atomicWriteJson(leasePath(runId), { at: new Date().toISOString(), machines: got });
+    const shortfall = Number.isInteger(r.json.shortfall) ? r.json.shortfall : Math.max(0, count - got.length);
+    out({
+      ok: true,
+      run: runId,
+      asked: count,
+      ...(asked > count ? { capped: `asked for ${asked}; machines.provider.max is ${provider.max}` } : {}),
+      machines: got,
+      ...(shortfall ? { shortfall } : {}),
+      ...(Array.isArray(r.json.errors) && r.json.errors.length ? { errors: r.json.errors } : {}),
+      next: got.length
+        ? "Register them: t3_environment_links, then for each reachable machine t3_environment_read, orchestrator_capabilities and t3_project_list, then `machines --register` (SKILL.md: Remote machines)."
+        : "No boxes came up: the run goes on here.",
+    });
+    return;
+  }
+
+  // The registry picks read: `--register` adds or refreshes machines (what discovery found reachable), `--drop`
+  // removes ones that stopped answering (never a box a live run holds), `--clear` empties it. Registering never
+  // drops other entries, so two Coordinators discovering at once can't erase each other's boxes.
+  if (cmd === "machines") {
+    const changes = {};
+    if (flags.register !== undefined || flags.drop !== undefined || flags.clear) {
+      let parsed = null;
+      if (flags.register !== undefined) {
+        const raw = flags.register === true || flags.register === "-" ? fs.readFileSync(0, "utf8") : String(flags.register);
+        parsed = parseMachinesInput(raw);
+        if (parsed.error) {
+          out({ ok: false, error: parsed.error }, 1);
+          return;
+        }
+      }
+      const dropAsked = typeof flags.drop === "string" ? flags.drop.split(",").map((x) => x.trim()).filter(Boolean) : [];
+      const held = liveLeases().flatMap((l) => l.machines.map((m) => ({ ...m, run: l.run })));
+      withFileLock(MACHINES_PATH, () => {
+        let list = flags.clear ? [] : readMachinesFile().machines;
+        if (parsed) {
+          const ids = new Set(parsed.machines.map((m) => m.environmentId)), labels = new Set(parsed.machines.map((m) => m.label));
+          list = [...list.filter((m) => !ids.has(m.environmentId) && !labels.has(m.label)), ...parsed.machines];
+          changes.registered = parsed.machines.map((m) => m.label);
+        }
+        if (dropAsked.length) {
+          changes.dropped = [];
+          changes.kept = [];
+          for (const want of dropAsked) {
+            const holder = held.find((h) => h.label === want || h.environmentId === want);
+            if (holder) changes.kept.push({ machine: want, reason: `leased to run ${holder.run}` });
+            else if (list.some((m) => m.label === want || m.environmentId === want)) {
+              list = list.filter((m) => m.label !== want && m.environmentId !== want);
+              changes.dropped.push(want);
+            }
+          }
+        }
+        atomicWriteJson(MACHINES_PATH, { updatedAt: new Date().toISOString(), machines: list });
+      });
+      machinesMemo = undefined;
+    }
+    const file = readMachinesFile();
+    const list = machineList(config);
+    const remote = list.filter((e) => !e.local);
+    const usable = remote.filter((e) => e.projectId);
+    const repo = currentRepoKey();
+    out({
+      ok: true,
+      path: MACHINES_PATH,
+      repo,
+      use: config.machines?.use !== false,
+      provider: Boolean(boxProvider(config)),
+      ...(boxProvider(config) ? { run: currentRun() } : {}),
+      ...changes,
+      updatedAt: file.updatedAt || null,
+      registered: file.machines.length,
+      ...(file.machines.length > remote.length && config.machines?.use !== false
+        ? { stale: file.machines.length - remote.length, staleNote: `Registered more than ${machineMaxAgeMs(config) / 3_600_000}h ago: rediscover before using them.` }
+        : {}),
+      machines: list.map(machineSummary),
+      ...(remote.length && !usable.length
+        ? { warning: repo ? `No registered machine has a project for ${repo}: picks from this checkout stay here.` : "This checkout has no origin remote, so no machine's project matches it: picks from here stay here." }
+        : {}),
+    });
+    return;
+  }
 
   if (cmd === "doctor") {
     const { errors, warnings } = validateConfig(config);
@@ -1304,6 +2226,13 @@ interval progress updates during Mode 2 runs (off by default).
         hooksLoaded: fs.existsSync(HOOKS_PATH),
         selection,
         statusUpdates: resolveStatusUpdates(config),
+        viewer: resolveViewer(config),
+        ...(machineList(config).length
+          ? {
+              placement: { workers: placementMode(config, "workers"), leads: placementMode(config, "leads") },
+              machines: machineList(config).map(machineSummary),
+            }
+          : {}),
         leads: resolvedLeads,
         workers: resolvedWorkers,
         activeCooldowns: healthRes.activeCooldowns,
@@ -1340,7 +2269,7 @@ interval progress updates during Mode 2 runs (off by default).
     if (fs.existsSync(RUNS_DIR)) {
       recentRuns = fs
         .readdirSync(RUNS_DIR)
-        .filter((f) => f.endsWith(".md"))
+        .filter((f) => f.endsWith(".md") && RUN_ID_RE.test(f.slice(0, -3))) // not workstream ledgers or boards
         .sort()
         .reverse()
         .slice(0, 5)
@@ -1353,6 +2282,10 @@ interval progress updates during Mode 2 runs (off by default).
             status: readLedgerStatus(fullPath),
             updatedAt: stat.mtime.toISOString(),
             ageMinutes: Math.max(0, Math.round((Date.now() - stat.mtimeMs) / 60_000)),
+            ...(() => {
+              const streams = runStreams(path.basename(f, ".md"));
+              return streams.length ? { streams: streams.map((st) => ({ name: st, status: readLedgerStatus(streamLedgerPath(path.basename(f, ".md"), st)) })) } : {};
+            })(),
           };
         });
     }
@@ -1368,6 +2301,12 @@ interval progress updates during Mode 2 runs (off by default).
       activeCooldowns: healthRes.activeCooldowns,
       credits: healthRes.credits,
       statusUpdates: resolveStatusUpdates(config),
+      ...(machineList(config).length
+        ? {
+            placement: { workers: placementMode(config, "workers"), leads: placementMode(config, "leads") },
+            machines: machineList(config).map((e) => ({ ...machineSummary(e), cooldown: envCooldown({ cooldowns: healthRes.activeCooldowns }, e) })),
+          }
+        : {}),
       recentRuns,
     });
     return;
@@ -1410,6 +2349,96 @@ interval progress updates during Mode 2 runs (off by default).
 ## Decisions
 - (Append 1-line engineering decisions or resolved blockers here)
 `;
+    if (flags.streams !== undefined) {
+      const parsedStreams = parseStreams(flags.streams, config);
+      if (parsedStreams.error) {
+        out({ ok: false, error: parsedStreams.error }, 1);
+        return;
+      }
+      const { streams } = parsedStreams;
+      // Worker budget is shared: N Leads each running maxParallelWorkers would multiply machine load.
+      const total = config.defaults?.maxParallelWorkersTotal ?? maxParallelWorkers;
+      const perStream = Math.max(1, Math.floor(total / streams.length));
+      const boardPath = boardFilePath(runId);
+      const branchOf = (st) => (integrationBranch ? `${integrationBranch}--${st}` : null); // not swarm/<id>/<st>: git can't nest refs under a branch
+      const runtime = (extra) =>
+        `\`script: ${SCRIPT_PATH}\` | \`leadBrief: ${leadBriefPath}\` | \`workerBrief: ${workerBriefPath}\` | \`worktreeParallel: ${worktreeForParallelEdits}\` | \`maxLoops: ${maxWorkerLoops}\` | \`maxParallel: ${extra.maxParallel}\` | \`board: ${boardPath}\`${extra.stream ? ` | \`stream: ${extra.stream}\`` : ""}`;
+      const gitLine = (branch) =>
+        git.isGitRepo ? `\n- **Git Base:** \`${git.branch}@${git.commit}\` (dirty: ${git.dirty}) | **Integration Branch:** \`${branch}\`` : "";
+      const runContent = `# Swarm Run: ${runId}
+- **Status:** RUNNING
+- **Workstreams:** ${streams.join(", ")} (one Lead each; the integration pass merges them)
+
+## Goal & Boundaries
+- **Goal:** ${goal}
+- **Done criteria:** (tests/checks required before completion)
+- **Verify:** targeted (workers): (narrowest test/lint command per area) | stream gate (each Lead, once, on its stream branch): (command) | full gate (integration pass only, once, on the integration branch): (command)
+- **Boundaries:** (shared by every workstream; split shared limits per workstream, e.g. "1 Android build at a time: android only")
+- **Config:** \`${configPath}\` (${configSource})
+- **Runtime:** ${runtime({ maxParallel: total })}${gitLine(integrationBranch)}
+
+## Workstreams
+${streams.map((st) => `- ${st} | ledger: \`${streamLedgerPath(runId, st)}\` | branch: \`${branchOf(st) ?? "(no git)"}\` | lead: (pending) | thread: (pending) | status: RUNNING`).join("\n")}
+
+## Contracts
+- (Shared interfaces every workstream honours, one owner each: API shapes, data/save formats, string keys, events, flags. Changes go through the board.)
+
+## Tasks
+- [ ] (Integration pass: merge order, conflicts, full gate result)
+
+## Decisions
+- (Append 1-line engineering decisions or resolved blockers here)
+`;
+      const streamContent = (st) => `# Swarm Run: ${runId} (workstream ${st})
+- **Status:** RUNNING
+- **Workstream:** \`${st}\` | others: ${streams.filter((x) => x !== st).join(", ")} | run ledger: \`${statePath}\` | board: \`${boardPath}\`
+
+## Goal & Boundaries
+- **Goal:** (Coordinator: this workstream's slice of the run goal)
+- **Files in scope:** (paths this workstream owns; anything else needs a claim on the board first)
+- **Done criteria:** (tests/checks required before this workstream is done)
+- **Verify:** targeted (workers): (narrowest test/lint command per area) | stream gate (this Lead, once, on the stream branch): (command); the full gate runs once in the integration pass
+- **Boundaries:** the run ledger's boundaries apply here too, plus: (this workstream's share of shared limits)
+- **Config:** \`${configPath}\` (${configSource})
+- **Runtime:** ${runtime({ maxParallel: perStream, stream: st })}${gitLine(branchOf(st))}
+
+## Tasks
+- [ ] (Lead fills concise rows: task | tier:depth | taskId:<id> | branch@sha | loops:0 | pending)
+
+## Decisions
+- (Append 1-line engineering decisions or resolved blockers here)
+`;
+      fs.writeFileSync(statePath, runContent, { encoding: "utf8", flag: "wx" });
+      for (const st of streams) fs.writeFileSync(streamLedgerPath(runId, st), streamContent(st), { encoding: "utf8", flag: "wx" });
+      fs.writeFileSync(
+        boardPath,
+        `# Board: ${runId}\n<!-- Leads post with \`swarm.mjs post\` and read with \`swarm.mjs board\`; don't edit by hand. -->\n`,
+        { encoding: "utf8", flag: "wx" }
+      );
+      out({
+        ok: true,
+        runId,
+        statePath,
+        boardPath,
+        streams: streams.map((st) => ({ name: st, statePath: streamLedgerPath(runId, st), branch: branchOf(st), maxParallel: perStream })),
+        configPath,
+        configSource,
+        scriptPath: SCRIPT_PATH,
+        referencesDir: REFERENCES_DIR,
+        leadBriefPath,
+        workerBriefPath,
+        maxWorkerLoops,
+        maxParallelWorkers: total,
+        worktreeForParallelEdits,
+        statusUpdates: resolveStatusUpdates(config),
+        viewer: resolveViewer(config, runId),
+        ...boxesInfo(config, runId),
+        git,
+        integrationBranch,
+      });
+      return;
+    }
+
     fs.writeFileSync(statePath, content, { encoding: "utf8", flag: "wx" });
     out({
       ok: true,
@@ -1425,6 +2454,8 @@ interval progress updates during Mode 2 runs (off by default).
       maxParallelWorkers,
       worktreeForParallelEdits,
       statusUpdates: resolveStatusUpdates(config),
+      viewer: resolveViewer(config, runId),
+      ...boxesInfo(config, runId),
       git,
       integrationBranch,
     });
@@ -1444,7 +2475,46 @@ interval progress updates during Mode 2 runs (off by default).
       return;
     }
     const runId = typeof flags.run === "string" ? flags.run : null;
+    const stream = typeof flags.stream === "string" ? slugify(flags.stream).slice(0, 24) : null;
+    if (flags.stream !== undefined && (!stream || !runId)) {
+      out({ ok: false, error: "--stream needs a workstream name and --run <run-id>." }, 1);
+      return;
+    }
+    if (runId && !stream && runStreams(runId).length) {
+      // A workstream Lead recovering after compaction must name its workstream, or it would make a fresh
+      // pick under the plain run key (charging credits, maybe a different bucket).
+      out({ ok: false, status: "stream_required", error: `Run ${runId} has workstreams (${runStreams(runId).join(", ")}). Pass --stream <name>: yours is in STATE.md's Runtime line (\`stream: ...\`); the final merge pass uses --stream integrate.` }, 1);
+      return;
+    }
+    if (stream && stream !== "integrate" && !runStreams(runId).includes(stream)) {
+      out({ ok: false, error: `Run ${runId} has no workstream "${stream}". Known: ${runStreams(runId).join(", ") || "none"}.` }, 1);
+      return;
+    }
     const res = await withHealth(async (health) => {
+      // The integration pass merges what the workstreams built, so it waits until the board is settled:
+      // every workstream COMPLETE, every contract owned and acked, no open asks. Checked on the first
+      // pick only; a failover of the integration Lead goes straight through.
+      if (stream === "integrate" && !health.leadPicks[`${runId}#integrate`] && !flags.force) {
+        const names = runStreams(runId);
+        const board = readBoard(runId);
+        const issues = board ? unsettled(boardState(board.posts, names)) : [];
+        for (const st of names) {
+          const s = readLedgerStatus(streamLedgerPath(runId, st));
+          if (s !== "COMPLETE") issues.unshift({ workstream: st, status: s || "unknown" });
+        }
+        if (issues.length) {
+          return {
+            save: false,
+            payload: {
+              ok: false,
+              status: "board_unsettled",
+              error: `Run ${runId} isn't ready for the integration pass.`,
+              issues,
+              hint: "Settle each issue first: a workstream not COMPLETE is still running (or needs its Lead's outcome handled); a contract with missing acks needs its owner's confirmation: check the owner's branch and `post <run> --from coordinator --kind ack \"#<n> verified\"`, or re-dispatch that Lead with the question; a contract with no owner gets a replacement (`post --from coordinator --kind contract --owner <stream> --replaces <n>`); answer open asks with `post --from coordinator --kind answer --to <asker>`. Pass --force to integrate anyway.",
+            },
+          };
+        }
+      }
       const { healthy, skipped } = await rankLeads(config, health, depth, excludeSet);
 
       if (healthy.length === 0) {
@@ -1462,18 +2532,34 @@ interval progress updates during Mode 2 runs (off by default).
         };
       }
 
-      const choice = chooseLead(config, health, healthy, runId);
+      const choice = chooseLead(config, health, healthy, runId, stream);
       const chosen = choice.chosen;
+      // Leads stay on this machine unless config.placement.leads or --place says otherwise.
+      const placed = chooseEnvironment(config, health, {
+        provider: chosen.lead.provider, role: "leads",
+        needs: parseNeeds(flags.needs), place: typeof flags.place === "string" ? flags.place : null,
+      });
+      if (placed.error) return { save: false, payload: { ok: false, status: "no_environment", error: placed.error, ...(placed.skipped ? { skipped: placed.skipped } : {}) } };
       const next = healthy.find((h) => h !== chosen);
       const nextFallback = next
         ? { provider: next.lead.provider, bucket: next.bucket, model: next.lead.model, source: next.source }
         : null;
-      const { target, depthDropped } = buildTarget(config, chosen.lead, depth);
+      const built = buildTarget(config, chosen.lead, depth);
+      const placedPick = applyPlacement({ target: built.target }, placed.env, placed.skipped);
+      const { target } = placedPick;
+      const { depthDropped } = built;
+      const others = runId && stream && stream !== "integrate"
+        ? Object.fromEntries(Object.entries(health.leadPicks).filter(([k]) => k.startsWith(`${runId}#`) && k !== `${runId}#${stream}`).map(([k, v]) => [k.slice(runId.length + 1), v.id]))
+        : null;
 
       return {
         save: choice.changed,
         payload: {
           ok: true,
+          ...(stream ? { stream, statePath: stream === "integrate" ? runLedgerPath(runId) : streamLedgerPath(runId, stream), boardPath: boardFilePath(runId) } : {}),
+          ...(others && Object.keys(others).length ? { otherStreamLeads: others } : {}),
+          ...(choice.sharedWith ? { sharedWith: choice.sharedWith, note: `No free lead; sharing a model with workstream "${choice.sharedWith}".` } : {}),
+          ...(placedPick.placement ? { placement: placedPick.placement } : {}),
           priority: chosen.priority,
           source: chosen.source,
           selection: weightsCfg(config).leadSelection === "weighted" ? "weighted" : "priority",
@@ -1513,21 +2599,17 @@ interval progress updates during Mode 2 runs (off by default).
     const avoidSet = parseCsvSet(flags.avoid);
     const excludeSet = parseCsvSet(flags.exclude);
     const res = await withHealth(async (health) => {
-      const pick = await selectOneWorker(
-        config,
-        health,
-        parsed.tier,
-        parsed.depth,
-        avoidSet,
-        excludeSet,
-        null
-      );
+      const pick = await selectOneWorker(config, health, parsed.tier, parsed.depth, avoidSet, excludeSet, null, {
+        needs: new Set([...parseNeeds(flags.needs), ...parsed.needs]),
+        place: typeof flags.place === "string" ? flags.place : null,
+      });
       return {
         save: pick.ok,
         payload: {
           ...pick,
           configSource,
           workerBriefPath: path.join(REFERENCES_DIR, "worker-brief.md"),
+          ...(pick.ok ? { workerBrief: readWorkerBrief() } : {}),
         },
       };
     });
@@ -1565,19 +2647,16 @@ interval progress updates during Mode 2 runs (off by default).
 
     const res = await withHealth(async (health) => {
       const batchCounts = new Map();
+      const envBatch = new Map(); // spread one wave across machines
       const picks = [];
       for (const spec of specs) {
         const parsed = parseSpec(spec, config.defaults?.workerDepth || "medium");
         if (parsed.error) return { save: false, payload: { ok: false, error: parsed.error } };
-        const pick = await selectOneWorker(
-          config,
-          health,
-          parsed.tier,
-          parsed.depth,
-          avoidSet,
-          excludeSet,
-          batchCounts
-        );
+        const pick = await selectOneWorker(config, health, parsed.tier, parsed.depth, avoidSet, excludeSet, batchCounts, {
+          needs: new Set([...parseNeeds(flags.needs), ...parsed.needs]),
+          place: typeof flags.place === "string" ? flags.place : null,
+          envBatch,
+        });
         if (!pick.ok) return { save: false, payload: pick };
         picks.push(pick);
       }
@@ -1589,6 +2668,7 @@ interval progress updates during Mode 2 runs (off by default).
           configSource,
           picks,
           workerBriefPath: path.join(REFERENCES_DIR, "worker-brief.md"),
+          workerBrief: readWorkerBrief(),
         },
       };
     });

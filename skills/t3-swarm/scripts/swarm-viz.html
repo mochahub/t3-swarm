@@ -1,0 +1,733 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Swarm Live</title>
+<style>
+/* Card graph of a T3 swarm. No dependencies: pan/zoom, edges, minimap and inspector are all here.
+   Visual language follows React Flow's defaults (dotted canvas, 1px cards with side handles,
+   bezier edges, dashed animated edges for live links, stacked zoom controls). */
+:root{
+  --bg:#141414;--dots:#3a3a3a;--panel:#1b1b1b;--panel-line:#2c2c2c;--card:#1e1e1e;--line:#343434;--line-hi:#4b4b4b;
+  --fg:#ededed;--mute:#9b9b9b;--faint:#666;--edge:#3e3e3e;--edge-live:#5c5c5c;--edge-hi:#8a8a8a;--handle:#bebebe;
+  --ctrl:#2b2b2b;--ctrl-hover:#3e3e3e;--ctrl-line:#5b5b5b;
+  --work:#5aa9ff;--deleg:#b48cff;--wait:#f2b84b;--done:#4cc38a;--fail:#ff6b6b;--idle:#6b7684;
+  --brief:#5aa9ff;--msg:#b48cff;--result:#4cc38a;--failure:#ff6b6b;--poll:#6b7684;--prompt:#f2b84b;--reply:#f2b84b;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace;
+  --sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  color-scheme:dark}
+@media (prefers-color-scheme: light){:root{
+  --bg:#fafafa;--dots:#c4c4cc;--panel:#fff;--panel-line:#e6e6ea;--card:#fff;--line:#dcdce2;--line-hi:#b8b8c2;
+  --fg:#1a192b;--mute:#5d6070;--faint:#9a9cab;--edge:#b1b1b7;--edge-live:#8c8c96;--edge-hi:#555;--handle:#1a192b;
+  --ctrl:#fefefe;--ctrl-hover:#f4f4f4;--ctrl-line:#eee;
+  --work:#1f7ae0;--deleg:#7c4dde;--wait:#b7790f;--done:#1f9d63;--fail:#d64545;--idle:#8a94a3;
+  --brief:#1f7ae0;--msg:#7c4dde;--result:#1f9d63;--failure:#d64545;--poll:#9aa3af;--prompt:#b7790f;--reply:#b7790f;
+  color-scheme:light}}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:13px/1.4 var(--sans);-webkit-font-smoothing:antialiased;overflow:hidden}
+#flow{position:fixed;inset:0;overflow:hidden;cursor:grab;touch-action:none;user-select:none;transition:right .25s ease}
+#flow.panning{cursor:grabbing}
+body.inspecting #flow{right:380px}
+#vp{position:absolute;left:0;top:0;transform-origin:0 0}
+#edges{position:absolute;left:0;top:0;width:1px;height:1px;overflow:visible;pointer-events:none}
+.edge{fill:none;stroke:var(--edge);stroke-width:1}
+.edge.live{stroke:var(--edge-live);stroke-dasharray:5;animation:dashdraw .5s linear infinite}
+.edge.hl{stroke:var(--edge-hi);stroke-width:1.5}
+.edge.plan{stroke-dasharray:2 4}
+.edge.peer{stroke:var(--msg);stroke-width:1.25;stroke-dasharray:4 3;opacity:.9}
+@keyframes dashdraw{from{stroke-dashoffset:10}}
+.fx-dot{pointer-events:none}
+
+/* cards */
+.node{position:absolute;left:0;top:0;width:248px;height:64px;background:var(--card);border:1px solid var(--line);border-radius:8px;
+  padding:8px 10px;cursor:pointer;transition:border-color .2s,box-shadow .2s,opacity .3s}
+.node:hover{border-color:var(--line-hi);box-shadow:0 1px 4px 1px rgba(0,0,0,.18)}
+.node.sel{box-shadow:0 0 0 1px var(--edge-hi);border-color:var(--edge-hi)}
+.node:focus-visible{outline:2px solid var(--work);outline-offset:2px}
+.node .h{position:absolute;top:50%;width:6px;height:6px;margin-top:-3px;border-radius:50%;background:var(--handle);border:1px solid var(--card)}
+.node .h.l{left:-4px}.node .h.r{right:-4px}
+.node .top{display:flex;gap:6px;align-items:center;min-width:0}
+.node .dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--idle)}
+.node .name{font-weight:600;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1}
+.node .where{flex:none;font:10px var(--mono);color:var(--mute);border:1px dashed var(--line-hi);border-radius:4px;padding:0 4px}
+.node .meta{font:10.5px/1.5 var(--mono);color:var(--mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px}
+.node .act{font:11px/1.5 var(--mono);color:var(--mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.node .act b{font-weight:500;color:var(--fg)}
+.role{font:9.5px/1.5 var(--mono);text-transform:uppercase;letter-spacing:.04em;padding:0 5px;border-radius:4px;border:1px solid var(--line);color:var(--mute);flex:none}
+.role.lead{color:var(--deleg);border-color:color-mix(in srgb,var(--deleg) 40%,var(--line))}
+.role.coordinator{color:var(--prompt);border-color:color-mix(in srgb,var(--prompt) 40%,var(--line))}
+.role.worker{color:var(--work);border-color:color-mix(in srgb,var(--work) 40%,var(--line))}
+.node.working{border-color:color-mix(in srgb,var(--work) 55%,var(--line))}
+.node.working .dot{background:var(--work);animation:blink 1.4s ease-in-out infinite}
+.node.delegating .dot{background:var(--deleg)}.node.waiting .dot{background:var(--wait)}
+.node.waiting{border-color:color-mix(in srgb,var(--wait) 55%,var(--line))}
+.node.done .dot{background:var(--done)}.node.failed .dot{background:var(--fail)}
+.node.failed{border-color:color-mix(in srgb,var(--fail) 55%,var(--line))}
+.node.done{opacity:.8}
+.node.plan{border-style:dashed;opacity:.6;cursor:default}
+.node.group{border-style:dashed}
+.node.group .stack{display:flex;gap:2px;flex:none}.node.group .stack i{width:6px;height:6px;border-radius:50%;background:var(--done)}
+.node.group.plan .stack i{background:var(--idle)}
+.node.less{height:30px;padding:6px 10px;border-style:dashed;color:var(--mute)}
+.node.you{width:64px;height:32px;border-radius:999px;padding:0;display:grid;place-items:center;font-weight:600}
+.node.future{opacity:.08!important}
+.node.ping{box-shadow:0 0 0 3px color-mix(in srgb,var(--ping,var(--work)) 45%,transparent)}
+.node.dim{opacity:.35}
+@keyframes blink{50%{opacity:.35}}
+/* zoomed far out: cards become status blocks */
+.far .node{display:flex;align-items:center}
+.far .node .meta,.far .node .act,.far .node .role,.far .node .where{display:none}
+.far .node .top{width:100%;gap:10px}
+.far .node .name{font-size:25px;font-weight:600}
+.far .node .dot{width:14px;height:14px}
+.far .node.you{font-size:22px}
+.far .node .name[data-far]{font-size:0}
+.far .node .name[data-far]::after{content:attr(data-far);font-size:25px}
+.far .frame span{font-size:22px;top:-16px;padding:0 10px}
+.far .node.working{background:color-mix(in srgb,var(--work) 18%,var(--card))}
+.far .node.failed{background:color-mix(in srgb,var(--fail) 18%,var(--card))}
+.far .node.waiting{background:color-mix(in srgb,var(--wait) 18%,var(--card))}
+/* machine frames (agents on another machine) */
+#frames{transition:opacity .2s}
+.frame{position:absolute;left:0;top:0;border:1px dashed var(--line-hi);border-radius:12px;background:color-mix(in srgb,var(--fg) 2.5%,transparent);pointer-events:none}
+.frame span{position:absolute;left:10px;top:-9px;font:10.5px var(--mono);color:var(--mute);background:var(--bg);padding:0 6px}
+/* edge label pill */
+.elabel{position:absolute;left:0;top:0;transform:translate(-50%,-50%);font-size:11px;line-height:1.3;color:var(--fg);background:var(--bg);
+  border:1px solid var(--line);border-radius:4px;padding:2px 7px;max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  pointer-events:none;transition:opacity .4s}
+.elabel i{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;vertical-align:1px}
+
+/* panels */
+.panel{position:absolute;z-index:4;background:var(--panel);border:1px solid var(--panel-line);border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.22)}
+#hud{top:12px;left:12px;padding:9px 12px;max-width:calc(100% - 140px);cursor:default}
+#hud .r1{display:flex;align-items:center;gap:8px;min-width:0}
+#hud h1{margin:0;font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#hud .r2{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;margin-top:4px;color:var(--mute);font-size:12px}
+#hud .pill{font:10.5px var(--mono);padding:1px 6px;border-radius:999px;border:1px solid var(--line);color:var(--mute);white-space:nowrap}
+.live{flex:none;width:7px;height:7px;border-radius:50%;background:var(--faint)}
+.live.on{background:var(--done)}
+#legend{display:flex;flex-wrap:wrap;gap:2px 10px;margin-top:6px;color:var(--faint);font-size:10.5px}
+#legend span{display:inline-flex;align-items:center;gap:4px}#legend i{width:7px;height:7px;border-radius:50%}
+#tr{top:12px;right:12px;display:flex;background:none;border:0;box-shadow:none;gap:6px}
+button{font:12px var(--sans);background:var(--ctrl);color:var(--fg);border:1px solid var(--ctrl-line);border-radius:6px;padding:5px 11px;cursor:pointer}
+button:hover{background:var(--ctrl-hover)}
+button:focus-visible{outline:2px solid var(--work);outline-offset:1px}
+#controls{left:12px;bottom:12px;display:flex;flex-direction:column;overflow:hidden;border-radius:6px}
+#controls button{width:26px;height:26px;padding:0;display:grid;place-items:center;border:0;border-bottom:1px solid var(--ctrl-line);border-radius:0;background:var(--ctrl)}
+#controls button:last-child{border-bottom:0}
+#controls button:hover{background:var(--ctrl-hover)}
+#controls svg{width:12px;height:12px;fill:currentColor}
+#minimap{right:12px;bottom:12px;width:184px;height:124px;overflow:hidden;cursor:pointer;display:none}
+#minimap.on{display:block}
+#minimap svg{width:100%;height:100%;display:block}
+#minimap .mm-mask{fill:color-mix(in srgb,var(--bg) 62%,transparent);fill-rule:evenodd}
+#err{left:50%;top:12px;transform:translateX(-50%);padding:8px 12px;color:var(--fail);border-color:var(--fail);font:12px var(--mono);display:none}
+
+/* inspector */
+#inspector{position:fixed;top:0;right:0;bottom:0;width:380px;background:var(--panel);border-left:1px solid var(--panel-line);
+  padding:14px 16px 20px;overflow:auto;transform:translateX(100%);transition:transform .25s ease;z-index:6}
+body.inspecting #inspector{transform:none}
+#inspector .dhead{display:flex;gap:10px;align-items:flex-start}
+#inspector h3{margin:0 0 6px;font-size:13.5px;flex:1;min-width:0;line-height:1.35}
+#inspector .kv{font:11px/1.6 var(--mono);color:var(--mute)}
+#inspector .kv b{font-weight:500;color:var(--fg)}
+#inspector .sec{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--faint);margin:14px 0 6px}
+#inspector pre{white-space:pre-wrap;word-break:break-word;font:11.5px/1.5 var(--mono);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:0;max-height:220px;overflow:auto}
+#inspector .now{font:12px/1.5 var(--mono);background:var(--card);border:1px solid color-mix(in srgb,var(--work) 40%,var(--line));border-radius:8px;padding:8px 10px;white-space:pre-wrap;word-break:break-word}
+#inspector .steps{font:11.5px/1.55 var(--mono);color:var(--mute)}
+#inspector .steps div{display:grid;grid-template-columns:64px minmax(0,1fr);gap:8px;padding:2px 0}
+#inspector .steps span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--fg)}
+@media (max-width:760px){body.inspecting #flow{right:0;bottom:55%}#inspector{top:auto;left:0;width:auto;height:55%;border-left:0;border-top:1px solid var(--panel-line);transform:translateY(100%)}}
+@media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
+</style></head><body>
+<div id="flow">
+  <div id="vp"><svg id="edges"><g id="edge-g"></g><g id="fx"></g></svg><div id="frames"></div><div id="cards"></div><div id="labels"></div></div>
+  <div class="panel" id="hud">
+    <div class="r1"><span class="live" id="live"></span><h1 id="title">Swarm</h1></div>
+    <div class="r2"><span class="pill" id="runstatus"></span><span id="counts"></span><span id="updated"></span></div>
+    <div id="legend">
+      <span><i style="background:var(--brief)"></i>brief ↓</span><span><i style="background:var(--msg)"></i>message ↓</span>
+      <span><i style="background:var(--result)"></i>result ↑</span><span><i style="background:var(--failure)"></i>failed ↑</span>
+      <span><i style="background:var(--prompt)"></i>you ↔ coordinator</span>
+      <span id="legend-peer" hidden><i style="background:var(--msg)"></i>lead ↔ lead</span>
+    </div>
+  </div>
+  <div class="panel" id="tr"><button id="replay" type="button" title="Replay this run's messages from the start">▶ Replay</button></div>
+  <div class="panel" id="controls">
+    <button id="zin" type="button" title="Zoom in" aria-label="Zoom in"><svg viewBox="0 0 32 32"><path d="M32 18.133H18.133V32h-4.266V18.133H0v-4.266h13.867V0h4.266v13.867H32z"/></svg></button>
+    <button id="zout" type="button" title="Zoom out" aria-label="Zoom out"><svg viewBox="0 0 32 5"><path d="M0 0h32v4.2H0z"/></svg></button>
+    <button id="zfit" type="button" title="Fit to view" aria-label="Fit to view"><svg viewBox="0 0 32 30"><path d="M3.692 4.63c0-.53.4-.938.939-.938h5.215V0H4.708C2.13 0 0 2.054 0 4.63v5.216h3.692V4.631zM27.354 0h-5.2v3.692h5.17c.53 0 .984.4.984.939v5.215H32V4.631A4.624 4.624 0 0027.354 0zm.954 24.83c0 .532-.4.94-.939.94h-5.215v3.768h5.215c2.577 0 4.631-2.13 4.631-4.707v-5.139h-3.692v5.139zm-23.677.94c-.531 0-.939-.4-.939-.94v-5.138H0v5.139c0 2.577 2.13 4.707 4.708 4.707h5.138V25.77H4.631z"/></svg></button>
+  </div>
+  <div class="panel" id="minimap" title="Click to move the view"><svg id="mm"></svg></div>
+  <div class="panel" id="err"></div>
+</div>
+<aside id="inspector" aria-label="Agent details"></aside>
+<script>
+"use strict";
+const $ = (q) => document.querySelector(q);
+const NS = "http://www.w3.org/2000/svg";
+const REDUCE = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const COLORS = { brief: "--brief", message: "--msg", steer: "--msg", result: "--result", failure: "--failure", poll: "--poll", cancel: "--failure", prompt: "--prompt", reply: "--reply", board: "--msg" };
+const FLY = new Set(Object.keys(COLORS).filter((k) => k !== "poll" && k !== "cancel"));
+const CARD_W = 248, CARD_H = 64, YOU_W = 64, YOU_H = 32, LESS_H = 30, COL_GAP = 76, ROW_GAP = 12, COLLAPSE_AT = 8;
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+const S = { meta: null, nodes: new Map(), events: [], lastSeq: -1, sel: null, replay: null, connected: false, expanded: new Set() };
+const V = { x: 0, y: 0, k: 1, user: false };
+const cards = new Map(), edges = new Map();
+let G = null, L = null, structKey = "";
+
+// ------------------------------------------------------------ small helpers
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+const setText = (e, t) => { if (e.textContent !== t) e.textContent = t; };
+const fmtT = (iso) => iso ? new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+const fmtHM = (iso) => iso ? new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+function dur(ms) { if (!(ms >= 0)) return ""; const s = Math.floor(ms / 1000); if (s < 60) return s + "s"; const m = Math.floor(s / 60); if (m < 60) return m + "m " + (s % 60) + "s"; return Math.floor(m / 60) + "h " + (m % 60) + "m"; }
+const modelShort = (m) => String(m || "").replace(/^claude-/, "").replace(/-(\d+)-(\d+)$/, " $1.$2");
+const clip = (t, n) => { t = String(t || "").replace(/\s+/g, " ").trim(); return t.length > n ? t.slice(0, n - 1) + "…" : t; };
+function nameOf(id) {
+  if (id === "you") return "You";
+  const n = S.nodes.get(id); if (!n) return "?";
+  if (n.role === "coordinator") return "Coordinator";
+  if (n.role === "lead") return "Lead";
+  return n.ledgerLabel || n.title;
+}
+
+// ------------------------------------------------------------ graph: the tree, with finished work folded away under busy parents
+function buildGraph() {
+  const byId = S.nodes, root = S.meta.root, kids = new Map();
+  const add = (p, c) => { if (!kids.has(p)) kids.set(p, []); kids.get(p).push(c); };
+  const sorted = [...byId.values()].sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  for (const n of sorted) add(n.id === root ? "you" : (n.parentId && byId.has(n.parentId) ? n.parentId : root), n.id);
+  const lead = sorted.find((n) => n.role === "lead");
+  const plans = (S.meta.pending || []).map((g, i) => ({ id: `plan:${g.label}:${i}`, plan: true, ...g }));
+  const leadOfStream = (st) => st && S.meta.streams?.find((x) => x.name === st)?.leadId;
+  for (const g of plans) { const l = leadOfStream(g.stream); add(l && byId.has(l) ? l : lead ? lead.id : root, g.id); }
+  const groups = new Map(), alias = new Map();
+  for (const [p, cs] of [...kids]) {
+    if (cs.length <= COLLAPSE_AT) continue;
+    if (S.expanded.has(p)) { const id = `less:${p}`; groups.set(id, { id, less: true, parent: p }); cs.push(id); continue; }
+    const fold = (pred, kind, label) => {
+      const members = cs.filter(pred);
+      if (members.length < 3) return;
+      const id = `grp:${kind}:${p}`;
+      groups.set(id, { id, group: true, kind, parent: p, members, label });
+      for (const m of members) { alias.set(m, id); cs.splice(cs.indexOf(m), 1); }
+      cs.push(id);
+    };
+    fold((id) => byId.get(id)?.status === "done" && !kids.has(id) && id !== S.sel, "done", "finished");
+    fold((id) => id.startsWith("plan:"), "plan", "not started");
+  }
+  return { kids, plans: new Map(plans.map((g) => [g.id, g])), groups, alias };
+}
+function computeLayout(g) {
+  const pos = new Map(), depth = new Map([["you", 0]]), order = ["you"];
+  for (let i = 0; i < order.length; i++) for (const c of g.kids.get(order[i]) || []) { depth.set(c, depth.get(order[i]) + 1); order.push(c); }
+  const hOf = (id) => id === "you" ? YOU_H : id.startsWith("less:") ? LESS_H : CARD_H;
+  let y = 0;
+  const machineOf = (id) => (id && S.nodes.get(id)?.machine) || null;
+  const framedOn = (id) => { const n = id && S.nodes.get(id); return n?.machine && n.machine !== machineOf(n.parentId) ? n.machine : null; };
+  (function place(id, prev, next) {
+    const ch = g.kids.get(id) || [], h = hOf(id), m = framedOn(id);
+    if (m && framedOn(prev) !== m) y += 26; // a run of siblings on another machine starts: room for its frame label
+    if (!ch.length) { pos.set(id, { y, h }); y += h + ROW_GAP; }
+    else {
+      ch.forEach((c, i) => place(c, ch[i - 1], ch[i + 1]));
+      const a = pos.get(ch[0]), b = pos.get(ch[ch.length - 1]);
+      pos.set(id, { y: (a.y + a.h / 2 + b.y + b.h / 2) / 2 - h / 2, h });
+      y += 6; // a little air between sibling subtrees
+    }
+    if (m && framedOn(next) !== m) y += 26;
+  })("you", null, null);
+  for (const [id, p] of pos) {
+    const d = depth.get(id);
+    p.x = d === 0 ? 0 : YOU_W + COL_GAP + (d - 1) * (CARD_W + COL_GAP);
+    p.w = d === 0 ? YOU_W : CARD_W;
+  }
+  // one frame per run of neighbouring siblings on the same other machine (and everything under them)
+  const frames = [];
+  for (const [parent, ch] of g.kids) {
+    let run = [];
+    const flush = () => {
+      if (!run.length) return;
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      const grow = (cid) => { const q = pos.get(cid); if (q) { x0 = Math.min(x0, q.x); y0 = Math.min(y0, q.y); x1 = Math.max(x1, q.x + q.w); y1 = Math.max(y1, q.y + q.h); } for (const c of g.kids.get(cid) || []) grow(c); };
+      run.forEach(grow);
+      frames.push({ id: `frame:${parent}:${run[0]}`, label: framedOn(run[0]), x: x0 - 14, y: y0 - 16, w: x1 - x0 + 28, h: y1 - y0 + 30 });
+      run = [];
+    };
+    for (const c of ch) {
+      const m = framedOn(c);
+      if (m && run.length && framedOn(run[0]) === m) run.push(c);
+      else { flush(); if (m) run.push(c); }
+    }
+    flush();
+  }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of pos.values()) { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x + p.w); maxY = Math.max(maxY, p.y + p.h); }
+  for (const f of frames) { minX = Math.min(minX, f.x); minY = Math.min(minY, f.y); maxX = Math.max(maxX, f.x + f.w); maxY = Math.max(maxY, f.y + f.h); }
+  return { pos, depth, frames, bounds: { minX, minY, maxX, maxY } };
+}
+
+// ------------------------------------------------------------ cards (created once, updated in place)
+function makeCard(id) {
+  const e = el("div", "node"); e.tabIndex = 0; e.dataset.id = id;
+  e.append(el("i", "h l"), el("i", "h r"));
+  const top = el("div", "top"), dot = el("span", "dot"), role = el("span", "role"), name = el("span", "name"), where = el("span", "where");
+  top.append(dot, role, name, where);
+  const meta = el("div", "meta"), act = el("div", "act");
+  e.append(top, meta, act);
+  e.addEventListener("click", (ev) => { ev.stopPropagation(); onCard(id); });
+  e.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); onCard(id); } });
+  $("#cards").append(e);
+  return { e, top, dot, role, name, where, meta, act, cls: "", x: NaN, y: NaN };
+}
+function onCard(id) {
+  const gr = G.groups.get(id);
+  // expanding is the user steering the view: keep their zoom and bring that parent into view
+  if (gr?.group || gr?.less) {
+    if (gr.group) S.expanded.add(gr.parent); else S.expanded.delete(gr.parent);
+    V.user = true; S.keepView = true; refresh(true); S.keepView = false; centerOn(gr.parent); return;
+  }
+  if (id.startsWith("plan:")) return;
+  select(id);
+}
+function cardContent(id) {
+  if (id === "you") return { cls: "you", name: "You" };
+  const gr = G.groups.get(id);
+  if (gr?.less) return { cls: "less", name: "Hide finished" };
+  if (gr?.group) {
+    const labels = gr.members.map((m) => S.nodes.get(m)?.ledgerLabel || G.plans.get(m)?.label || (S.nodes.get(m)?.title || "").split(" ")[0]).filter(Boolean);
+    return { cls: "group " + gr.kind, name: `${gr.members.length} ${gr.label}`, stack: Math.min(5, gr.members.length), meta: clip(labels.join(", "), 44), act: "click to show them" };
+  }
+  const pl = G.plans.get(id);
+  if (pl) return { cls: "plan", name: `${pl.label} ${pl.desc}`, meta: [(pl.tier || ""), "not started"].filter(Boolean).join(" · "), act: pl.state };
+  const n = S.nodes.get(id);
+  const r = n.run, live = r && (r.status === "running" || r.status === "starting");
+  const since = live ? dur(Date.now() - Date.parse(r.startedAt)) : "";
+  const calls = (n.commands || 0) + (n.toolCalls || 0);
+  const nm = n.role === "worker" && n.ledgerLabel && !n.title.startsWith(n.ledgerLabel) ? n.ledgerLabel + " · " + n.title : n.title;
+  const a = n.activity;
+  return {
+    cls: n.status, role: n.role === "coordinator" ? "coord" : n.role === "lead" && n.stream ? "lead · " + n.stream : n.role, roleCls: n.role, name: nm, where: n.machine ? n.machine : n.remote ? "remote" : "",
+    meta: [modelShort(n.model) || n.provider, n.effort, n.status + (since ? " " + since : ""), calls ? calls + " calls" : ""].filter(Boolean).join(" · "),
+    actMark: a ? (a.kind === "cmd" ? "$ " : a.kind === "tool" ? "⚙ " : a.kind === "say" ? "“ " : "· ") : "", act: a ? a.text : n.remote ? "details live on " + (n.machine || "another machine") : "",
+    far: n.role === "lead" && n.stream ? `${n.stream} lead` : n.role === "coordinator" ? "Coordinator" : "", // zoomed-out label
+  };
+}
+function paintCard(id, c) {
+  const k = cardContent(id);
+  let cls = "node " + k.cls + (S.sel === id ? " sel" : "") + (pingUntil.has(id) ? " ping" : "");
+  if (S.replay) {
+    const n = S.nodes.get(id), gr = G.groups.get(id);
+    const created = n ? n.createdAt : gr?.group ? gr.members.map((m) => S.nodes.get(m)?.createdAt || "").sort()[0] : "";
+    if (created && created > S.replay.iso) cls += " future";
+  }
+  if (c.cls !== cls) { c.e.className = cls; c.cls = cls; }
+  if (k.cls === "you" || k.cls === "less") { setText(c.name, k.name); c.top.hidden = false; c.dot.hidden = c.role.hidden = c.where.hidden = c.meta.hidden = c.act.hidden = true; c.top.style.justifyContent = "center"; return; }
+  c.dot.hidden = c.meta.hidden = c.act.hidden = false;
+  c.role.hidden = !k.role; if (k.role) { setText(c.role, k.role); c.role.className = "role " + k.roleCls; }
+  if (k.stack) { c.dot.className = "stack"; if (c.dot.childElementCount !== k.stack) c.dot.replaceChildren(...Array.from({ length: k.stack }, () => el("i"))); }
+  else if (c.dot.className !== "dot") { c.dot.className = "dot"; c.dot.replaceChildren(); }
+  setText(c.name, k.name); c.e.title = k.name;
+  if ((c.name.dataset.far || "") !== (k.far || "")) { if (k.far) c.name.dataset.far = k.far; else delete c.name.dataset.far; }
+  c.where.hidden = !k.where; setText(c.where, k.where || "");
+  setText(c.meta, k.meta || "");
+  const actText = (k.actMark || "") + "\u0000" + (k.act || "");
+  if (c.actKey !== actText) { c.actKey = actText; c.act.replaceChildren(...(k.actMark ? [el("b", null, k.actMark)] : []), document.createTextNode(k.act || "")); }
+  c.e.setAttribute("aria-label", `${k.name}. ${k.meta || ""}`);
+}
+
+// ------------------------------------------------------------ refresh: rebuild the graph, animate moves, update in place
+function refresh(force) {
+  if (!S.meta) return;
+  G = buildGraph();
+  const key = [...G.kids].map(([p, c]) => p + ":" + c.join(",")).join("|");
+  const changed = force || key !== structKey;
+  if (changed) {
+    structKey = key;
+    const prev = L; L = computeLayout(G);
+    const live = new Set(L.pos.keys());
+    for (const [id, c] of cards) if (!live.has(id)) { c.e.remove(); cards.delete(id); }
+    for (const [id, p] of L.pos) {
+      let c = cards.get(id), fresh = false;
+      if (!c) { c = makeCard(id); cards.set(id, c); fresh = true; }
+      c.e.style.width = p.w + "px"; c.e.style.height = p.h + "px";
+      c.to = { x: p.x, y: p.y };
+      if (fresh || !prev || REDUCE) { c.from = null; c.x = p.x; c.y = p.y; c.e.style.transform = `translate(${p.x}px,${p.y}px)`; if (fresh && prev && !REDUCE) c.e.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 350 }); }
+      else c.from = { x: c.x, y: c.y };
+    }
+    rebuildEdges();
+    paintFrames();
+    tweenLayout();
+    if (!V.user && !S.keepView) fitView(!!prev);
+  }
+  for (const [id, c] of cards) paintCard(id, c);
+  paintEdgeState();
+  paintHud();
+  paintMinimap();
+  if (S.sel) renderInspector();
+}
+let tweenRaf = 0;
+function tweenLayout() {
+  cancelAnimationFrame(tweenRaf);
+  const moving = [...cards.values()].filter((c) => c.from && (c.from.x !== c.to.x || c.from.y !== c.to.y));
+  if (!moving.length) { for (const c of cards.values()) placeCard(c, c.to.x, c.to.y); drawEdges(); $("#frames").style.opacity = 1; return; }
+  $("#frames").style.opacity = 0; // frames are drawn at the final layout; show them once the cards arrive
+  const t0 = performance.now(), ms = 380;
+  (function step(now) {
+    const k = Math.min(1, (now - t0) / ms), e = 1 - Math.pow(1 - k, 3);
+    for (const c of cards.values()) { if (c.from) placeCard(c, c.from.x + (c.to.x - c.from.x) * e, c.from.y + (c.to.y - c.from.y) * e); else placeCard(c, c.to.x, c.to.y); }
+    drawEdges();
+    if (k < 1) tweenRaf = requestAnimationFrame(step); else { for (const c of cards.values()) c.from = null; $("#frames").style.opacity = 1; }
+  })(t0);
+}
+function placeCard(c, x, y) { if (c.x === x && c.y === y) return; c.x = x; c.y = y; c.e.style.transform = `translate(${x}px,${y}px)`; }
+
+// ------------------------------------------------------------ edges
+function rebuildEdges() {
+  const g = $("#edge-g");
+  const want = new Set();
+  for (const [p, cs] of G.kids) for (const c of cs) {
+    const key = p + ">" + c; want.add(key);
+    if (!edges.has(key)) { const path = document.createElementNS(NS, "path"); path.setAttribute("class", "edge"); g.append(path); edges.set(key, { path, p, c }); }
+  }
+  for (const [key, e] of edges) if (!want.has(key)) { e.path.remove(); edges.delete(key); }
+}
+function drawEdges() {
+  for (const e of edges.values()) {
+    const a = cards.get(e.p), b = cards.get(e.c), pa = L.pos.get(e.p), pb = L.pos.get(e.c); if (!a || !b || !pa || !pb) continue;
+    const x1 = a.x + pa.w, y1 = a.y + pa.h / 2, x2 = b.x, y2 = b.y + pb.h / 2, dx = Math.max(24, (x2 - x1) * .5);
+    const d = `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`;
+    if (e.d !== d) { e.d = d; e.path.setAttribute("d", d); }
+  }
+}
+function paintEdgeState() {
+  for (const e of edges.values()) {
+    const child = S.nodes.get(e.c);
+    const live = !S.replay && child && (child.status === "working" || child.status === "delegating" || child.status === "waiting");
+    const cls = "edge" + (live ? " live" : "") + (S.sel && (S.sel === e.c || S.sel === e.p) ? " hl" : "") + (e.c.startsWith("plan:") || G.groups.get(e.c)?.kind === "plan" ? " plan" : "");
+    if (e.cls !== cls) { e.cls = cls; e.path.setAttribute("class", cls); }
+  }
+}
+function paintFrames() {
+  const box = $("#frames");
+  box.replaceChildren(...L.frames.map((f) => { const d = el("div", "frame"); Object.assign(d.style, { transform: `translate(${f.x}px,${f.y}px)`, width: f.w + "px", height: f.h + "px" }); d.append(el("span", null, f.label)); return d; }));
+}
+
+// ------------------------------------------------------------ viewport: pan, zoom, fit
+const flow = $("#flow");
+function applyView() {
+  $("#vp").style.transform = `translate(${V.x}px,${V.y}px) scale(${V.k})`;
+  const gap = 20 * V.k, r = Math.max(0.6, 0.7 * V.k);
+  flow.style.backgroundImage = `radial-gradient(circle, var(--dots) ${r}px, transparent ${r + 0.4}px)`;
+  flow.style.backgroundSize = `${gap}px ${gap}px`;
+  flow.style.backgroundPosition = `${V.x % gap}px ${V.y % gap}px`;
+  flow.classList.toggle("far", V.k < 0.6);
+  paintMinimap();
+}
+let viewRaf = 0;
+function animateView(to, ms = 380) {
+  cancelAnimationFrame(viewRaf);
+  if (REDUCE || !ms) { Object.assign(V, to); applyView(); return; }
+  const from = { x: V.x, y: V.y, k: V.k }, t0 = performance.now();
+  (function step(now) {
+    const t = Math.min(1, (now - t0) / ms), e = 1 - Math.pow(1 - t, 3);
+    V.x = from.x + (to.x - from.x) * e; V.y = from.y + (to.y - from.y) * e; V.k = from.k + (to.k - from.k) * e;
+    applyView();
+    if (t < 1) viewRaf = requestAnimationFrame(step);
+  })(t0);
+}
+function fitView(animate) {
+  if (!L) return;
+  const W = flow.clientWidth, H = flow.clientHeight, b = L.bounds;
+  const padX = 48, padTop = 120, padBottom = 48;
+  const bw = b.maxX - b.minX, bh = b.maxY - b.minY;
+  const k = Math.max(0.2, Math.min(1.1, (W - padX * 2) / bw, (H - padTop - padBottom) / bh));
+  const x = (W - bw * k) / 2 - b.minX * k, y = padTop + (H - padTop - padBottom - bh * k) / 2 - b.minY * k;
+  animateView({ x, y, k }, animate ? 380 : 0);
+}
+function centerOn(id) {
+  const p = L?.pos.get(id); if (!p) return; // target position, so this works mid-animation
+  const W = flow.clientWidth, H = flow.clientHeight, k = Math.max(V.k, 0.85);
+  animateView({ k, x: W / 2 - (p.x + p.w / 2) * k, y: H / 2 - (p.y + p.h / 2) * k }, 380);
+}
+function zoomAt(px, py, factor, ms = 0) {
+  const k = Math.max(0.2, Math.min(2, V.k * factor)), f = k / V.k;
+  const to = { k, x: px - (px - V.x) * f, y: py - (py - V.y) * f };
+  if (ms) animateView(to, ms); else { Object.assign(V, to); applyView(); }
+}
+flow.addEventListener("wheel", (e) => {
+  e.preventDefault(); V.user = true; cancelAnimationFrame(viewRaf);
+  const r = flow.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
+  const mouseWheel = e.deltaMode === 1 || (e.deltaX === 0 && Math.abs(e.deltaY) >= 40 && Number.isInteger(e.deltaY));
+  if (e.ctrlKey) zoomAt(px, py, Math.exp(-e.deltaY * 0.01));          // trackpad pinch
+  else if (mouseWheel) zoomAt(px, py, Math.exp(-e.deltaY * 0.0018));  // mouse wheel zooms (React Flow default)
+  else { V.x -= e.deltaX; V.y -= e.deltaY; applyView(); }               // two-finger scroll pans
+}, { passive: false });
+let drag = null;
+flow.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0 || e.target.closest(".node,.panel")) return;
+  drag = { x: e.clientX, y: e.clientY, vx: V.x, vy: V.y, moved: false }; flow.setPointerCapture(e.pointerId); flow.classList.add("panning");
+});
+flow.addEventListener("pointermove", (e) => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  if (Math.abs(dx) + Math.abs(dy) > 3) { drag.moved = true; V.user = true; cancelAnimationFrame(viewRaf); }
+  if (drag.moved) { V.x = drag.vx + dx; V.y = drag.vy + dy; applyView(); }
+});
+flow.addEventListener("pointerup", () => {
+  if (drag && !drag.moved && S.sel) select(S.sel); // click on empty canvas closes the panel
+  drag = null; flow.classList.remove("panning");
+});
+flow.addEventListener("dblclick", (e) => { if (e.target.closest(".node,.panel")) return; const r = flow.getBoundingClientRect(); V.user = true; zoomAt(e.clientX - r.left, e.clientY - r.top, 1.6, 280); });
+$("#zin").onclick = () => { V.user = true; zoomAt(flow.clientWidth / 2, flow.clientHeight / 2, 1.25, 220); };
+$("#zout").onclick = () => { V.user = true; zoomAt(flow.clientWidth / 2, flow.clientHeight / 2, 0.8, 220); };
+$("#zfit").onclick = () => { V.user = false; fitView(true); };
+addEventListener("resize", () => { if (!V.user) fitView(false); else applyView(); });
+
+// ------------------------------------------------------------ minimap (only when the graph is too big to read at a glance)
+function paintMinimap() {
+  const mm = $("#minimap"), svg = $("#mm");
+  if (!L || cards.size <= 14) { mm.classList.remove("on"); return; }
+  mm.classList.add("on");
+  const b = L.bounds, pad = 40, x0 = b.minX - pad, y0 = b.minY - pad, w = b.maxX - b.minX + pad * 2, h = b.maxY - b.minY + pad * 2;
+  svg.setAttribute("viewBox", `${x0} ${y0} ${w} ${h}`);
+  const vx = -V.x / V.k, vy = -V.y / V.k, vw = flow.clientWidth / V.k, vh = flow.clientHeight / V.k;
+  const sig = structKey + "|" + [...cards.values()].map((c) => c.cls).join(",");
+  if (svg.dataset.sig !== sig) {
+    svg.dataset.sig = sig;
+    const frag = [];
+    for (const [id, p] of L.pos) {
+      const c = cards.get(id), st = (c?.cls || "").split(" ")[1] || "idle";
+      const color = { working: "--work", delegating: "--deleg", waiting: "--wait", done: "--done", failed: "--fail" }[st] || "--idle";
+      const r = document.createElementNS(NS, "rect");
+      Object.entries({ x: p.x, y: p.y, width: p.w, height: p.h, rx: 6, fill: `var(${color})`, "fill-opacity": st === "done" ? .35 : .75 }).forEach(([k, v]) => r.setAttribute(k, v));
+      frag.push(r);
+    }
+    const mask = document.createElementNS(NS, "path"); mask.setAttribute("class", "mm-mask"); frag.push(mask);
+    svg.replaceChildren(...frag);
+  }
+  svg.lastChild.setAttribute("d", `M${x0},${y0}h${w}v${h}h${-w}z M${vx},${vy}v${vh}h${vw}v${-vh}z`);
+}
+function minimapPan(e) {
+  const svg = $("#mm"), pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY;
+  const w = pt.matrixTransform(svg.getScreenCTM().inverse());
+  V.user = true; Object.assign(V, { x: flow.clientWidth / 2 - w.x * V.k, y: flow.clientHeight / 2 - w.y * V.k }); applyView();
+}
+$("#minimap").addEventListener("pointerdown", (e) => { e.stopPropagation(); minimapPan(e); const mv = (ev) => minimapPan(ev); const up = () => { removeEventListener("pointermove", mv); removeEventListener("pointerup", up); }; addEventListener("pointermove", mv); addEventListener("pointerup", up); });
+
+// ------------------------------------------------------------ messages: a dot travels the route, a short label shows on the last edge
+function routeOf(from, to) {
+  const vis = (id) => (id === "you" || cards.has(id) ? id : G.alias.get(id));
+  const up = (id) => { const a = []; for (let c = id; c;) { a.push(c); c = c === "you" ? null : c === S.meta.root ? "you" : S.nodes.get(c)?.parentId || "you"; } return a; };
+  const A = up(from), B = up(to), lca = A.find((x) => B.includes(x)); if (!lca) return null;
+  const hops = [];
+  for (let i = 0; i < A.indexOf(lca); i++) hops.push([A[i + 1], A[i], true]);
+  const down = B.slice(0, B.indexOf(lca) + 1).reverse();
+  for (let i = 0; i < down.length - 1; i++) hops.push([down[i], down[i + 1], false]);
+  const segs = [];
+  for (const [p, c, rev] of hops) {
+    const vp = vis(p), vc = vis(c); if (!vp || !vc || vp === vc) continue;
+    const e = edges.get(vp + ">" + vc); if (e) segs.push({ e, rev });
+  }
+  return segs.length ? segs : null;
+}
+// Leads of one run talk directly (board posts, t3_thread_send): draw a short-lived arc between their
+// cards instead of routing the dot through the Coordinator. "leads" = to every other Lead.
+function isPeer(a, b) {
+  const x = S.nodes.get(a), y = S.nodes.get(b);
+  return x && y && x.role === "lead" && y.role === "lead" && x.id !== y.id;
+}
+function peerPulse(from, to, ev, speed) {
+  const pa = L?.pos.get(from), pb = L?.pos.get(to), ca = cards.get(from), cb = cards.get(to);
+  if (!pa || !pb || !ca || !cb) return;
+  const color = css(COLORS[ev.kind] || "--msg");
+  const ax = ca.x, ay = ca.y + pa.h / 2, bx = cb.x, by = cb.y + pb.h / 2;
+  const bulge = Math.min(90, 28 + Math.abs(by - ay) * 0.3);
+  const arc = document.createElementNS(NS, "path");
+  arc.setAttribute("d", `M${ax},${ay} C${ax - bulge},${ay} ${bx - bulge},${by} ${bx},${by}`);
+  arc.setAttribute("class", "edge peer");
+  $("#edge-g").append(arc);
+  if (!S.replay) {
+    const mid = arc.getPointAtLength(arc.getTotalLength() / 2);
+    const d = el("div", "elabel"); const i = el("i"); i.style.background = color;
+    d.append(i, document.createTextNode(clip(ev.label, 44))); d.style.left = mid.x - 8 + "px"; d.style.top = mid.y + "px"; d.style.transform = "translate(-100%,-50%)";
+    $("#labels").append(d); setTimeout(() => { d.style.opacity = 0; setTimeout(() => d.remove(), 450); }, 2800);
+  }
+  if (REDUCE) { ping(to, color); setTimeout(() => arc.remove(), 1500); return; }
+  const g = document.createElementNS(NS, "g"); g.setAttribute("class", "fx-dot");
+  const halo = document.createElementNS(NS, "circle"); halo.setAttribute("r", 7); halo.setAttribute("fill", color); halo.setAttribute("fill-opacity", .22);
+  const dot = document.createElementNS(NS, "circle"); dot.setAttribute("r", 3.2); dot.setAttribute("fill", color);
+  g.append(halo, dot); $("#fx").append(g);
+  const len = arc.getTotalLength(), ms = 1300 / speed, t0 = performance.now();
+  (function step(now) {
+    const k = Math.min(1, (now - t0) / ms), e = k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+    const p = arc.getPointAtLength(e * len); g.setAttribute("transform", `translate(${p.x.toFixed(1)},${p.y.toFixed(1)})`);
+    if (k < 1) requestAnimationFrame(step);
+    else { g.remove(); ping(to, color); arc.style.transition = "opacity .6s"; arc.style.opacity = 0; setTimeout(() => arc.remove(), 650); }
+  })(t0);
+}
+function pulse(ev, speed = 1) {
+  if (!FLY.has(ev.kind) || !ev.to) return;
+  if (ev.to === "leads") { for (const n of S.nodes.values()) if (isPeer(ev.from, n.id)) peerPulse(ev.from, n.id, ev, speed); return; }
+  if (isPeer(ev.from, ev.to)) { peerPulse(ev.from, ev.to, ev, speed); return; }
+  const segs = routeOf(ev.from, ev.to);
+  const target = ev.to === "you" || cards.has(ev.to) ? ev.to : G.alias.get(ev.to);
+  const color = css(COLORS[ev.kind] || "--msg");
+  if (!segs || REDUCE) { ping(target, color); return; }
+  const g = document.createElementNS(NS, "g"); g.setAttribute("class", "fx-dot");
+  const halo = document.createElementNS(NS, "circle"); halo.setAttribute("r", 7); halo.setAttribute("fill", color); halo.setAttribute("fill-opacity", .22);
+  const dot = document.createElementNS(NS, "circle"); dot.setAttribute("r", 3.2); dot.setAttribute("fill", color);
+  g.append(halo, dot); $("#fx").append(g);
+  const lens = segs.map((s) => s.e.path.getTotalLength()), total = lens.reduce((a, b) => a + b, 0);
+  const ms = Math.min(2200, Math.max(900, total * 2.2)) / speed, t0 = performance.now();
+  const at = (u) => { let d = u * total; for (let i = 0; i < segs.length; i++) { if (d <= lens[i] || i === segs.length - 1) { const L2 = lens[i], dd = Math.min(d, L2); return segs[i].e.path.getPointAtLength(segs[i].rev ? L2 - dd : dd); } d -= lens[i]; } };
+  (function step(now) {
+    if (segs.some((s) => !s.e.path.isConnected)) { g.remove(); return; }
+    const k = Math.min(1, (now - t0) / ms), e = k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+    const p = at(e); g.setAttribute("transform", `translate(${p.x.toFixed(1)},${p.y.toFixed(1)})`);
+    if (k < 1) requestAnimationFrame(step); else { g.remove(); ping(target, color); }
+  })(t0);
+  if (!S.replay) edgeLabel(segs[segs.length - 1], ev, color);
+}
+function edgeLabel(seg, ev, color) {
+  const path = seg.e.path, L2 = path.getTotalLength(), p = path.getPointAtLength(L2 / 2);
+  const d = el("div", "elabel"); const i = el("i"); i.style.background = color;
+  const text = ev.kind === "brief" ? "brief: " + clip(ev.label, 40) : ev.kind === "result" ? "result: " + clip(String(ev.label).replace(/^STATUS:\s*\w+\s*[—:-]?\s*/i, ""), 40) : ev.kind + ": " + clip(ev.label, 40);
+  d.append(i, document.createTextNode(text)); d.style.left = p.x + "px"; d.style.top = p.y + "px";
+  $("#labels").append(d);
+  setTimeout(() => { d.style.opacity = 0; setTimeout(() => d.remove(), 450); }, 2800);
+}
+const pingUntil = new Map();
+function ping(id, color) {
+  const c = cards.get(id); if (!c) return;
+  pingUntil.set(id, performance.now() + 700); c.e.style.setProperty("--ping", color); paintCard(id, c);
+  setTimeout(() => { if ((pingUntil.get(id) || 0) <= performance.now()) { pingUntil.delete(id); const c2 = cards.get(id); if (c2) paintCard(id, c2); } }, 720);
+}
+
+// ------------------------------------------------------------ header panel
+function paintHud() {
+  const m = S.meta, nodes = [...S.nodes.values()], root = S.nodes.get(m.root);
+  setText($("#title"), root ? root.title : "Swarm");
+  document.title = (root ? root.title + " · " : "") + "Swarm Live";
+  setText($("#runstatus"), m.ledger ? "ledger: " + (m.ledger.status || "?") : "no ledger");
+  const c = (s) => nodes.filter((n) => n.status === s).length;
+  const machines = new Set(nodes.map((n) => n.machine).filter(Boolean));
+  setText($("#counts"), [`${nodes.length} agents`, `${c("working")} working`, `${c("done")} done`, c("failed") && `${c("failed")} failed`, c("waiting") && `${c("waiting")} need you`, m.pending?.length && `${m.pending.length} pending`, machines.size && `${machines.size + 1} machines`].filter(Boolean).join(" · "));
+  let last = "";
+  for (const n of nodes) for (const t of [n.activity?.ts, n.run?.startedAt, n.run?.completedAt]) if (t && t > last) last = t;
+  const lastEv = S.events[S.events.length - 1]; if (lastEv?.ts > last) last = lastEv.ts;
+  setText($("#updated"), S.replay ? "replaying " + fmtHM(S.replay.iso) : last ? "Last update " + fmtHM(last) : "");
+  $("#live").classList.toggle("on", S.connected && !m.lastError);
+  $("#legend-peer").hidden = nodes.filter((n) => n.role === "lead").length < 2;
+  const err = $("#err"); err.style.display = m.lastError ? "block" : "none"; setText(err, m.lastError || "");
+}
+
+// ------------------------------------------------------------ inspector (tap a card)
+let detail = { id: null, data: null, at: 0 };
+async function loadDetail(id) {
+  try {
+    const d = window.__DETAIL ? window.__DETAIL(id) : await (await fetch("/api/node?id=" + encodeURIComponent(id), { cache: "no-store" })).json();
+    if (S.sel === id) { detail = { id, data: d, at: Date.now() }; renderInspector(); }
+  } catch {}
+}
+function select(id) {
+  S.sel = S.sel === id ? null : id;
+  document.body.classList.toggle("inspecting", !!S.sel);
+  detail = { id: null, data: null, at: 0 };
+  if (S.sel && S.sel !== "you") loadDetail(S.sel);
+  S.keepView = true; refresh(true); S.keepView = false;
+  // after the panel slides in: keep the zoom and glide the chosen card into view; on close, fit again
+  setTimeout(() => { if (S.sel) centerOn(S.sel); else if (!V.user) fitView(true); }, 270);
+}
+function renderInspector() {
+  const box = $("#inspector");
+  const head = el("div", "dhead"), close = el("button", null, "✕"); close.setAttribute("aria-label", "Close"); close.onclick = () => select(S.sel);
+  if (S.sel === "you") {
+    head.append(el("h3", null, "You"), close);
+    const evs = S.events.filter((e) => e.kind === "prompt" || e.kind === "reply").slice(-8).reverse();
+    const steps = el("div", "steps"); for (const e of evs) { const r = el("div"); r.append(el("time", null, fmtHM(e.ts)), el("span", null, (e.kind === "prompt" ? "you: " : "coordinator: ") + e.label)); steps.append(r); }
+    box.replaceChildren(head, el("div", "sec", "Your messages with the Coordinator"), steps);
+    return;
+  }
+  const n = S.nodes.get(S.sel); if (!n) { select(S.sel); return; }
+  if (detail.id === n.id && Date.now() - detail.at > 2000) loadDetail(n.id); // keep it live while open
+  const d = detail.id === n.id ? detail.data : null;
+  head.append(el("h3", null, (n.ledgerLabel && !n.title.startsWith(n.ledgerLabel) ? n.ledgerLabel + " · " : "") + n.title), close);
+  const kvs = el("div", "kv");
+  const kv = (k, v) => { if (!v) return; const r = el("div"); r.append(document.createTextNode(k + ": "), el("b", null, v)); kvs.append(r); };
+  const r = n.run;
+  kv("status", n.status + (r?.status === "running" ? " for " + dur(Date.now() - Date.parse(r.startedAt)) : r?.completedAt ? " · finished " + fmtHM(r.completedAt) : ""));
+  kv("model", [n.provider, n.model, n.effort].filter(Boolean).join(" · ")); kv("machine", n.machine || (n.remote ? "another machine" : "this machine"));
+  kv("role", n.role); kv("tier", n.tier); kv("ledger", n.ledgerState); kv("calls", (n.commands || 0) + " commands · " + (n.toolCalls || 0) + " tool calls");
+  const parts = [head, kvs];
+  if (n.activity) { parts.push(el("div", "sec", n.status === "working" ? "Right now" : "Last step")); parts.push(el("div", "now", (n.activity.kind === "cmd" ? "$ " : "") + n.activity.text)); }
+  if (d?.recent?.length) { const steps = el("div", "steps"); for (const a of d.recent.slice().reverse()) { const row = el("div"); row.append(el("time", null, fmtHM(a.ts)), el("span", null, a.text)); steps.append(row); } parts.push(el("div", "sec", "Recent steps"), steps); }
+  const ws = n.stream && S.meta.streams?.find((x) => x.name === n.stream);
+  if (ws) {
+    const lines = [`workstream: ${ws.name}${ws.status ? " (" + ws.status.toLowerCase() + ")" : ""}`, `claims: ${ws.claims?.length ? ws.claims.join(", ") : "none"}`];
+    for (const c of S.meta.contracts || []) {
+      const rel = [c.owner === ws.name || c.owner === "all" ? "builds it" : null, c.by === ws.name ? "proposed" : null, c.acks.includes(ws.name) ? "acked" : null].filter(Boolean);
+      if (rel.length) lines.push(`contract #${c.n} (${rel.join(", ")}): ${c.text}`);
+    }
+    parts.push(el("div", "sec", "Coordination"), el("pre", null, lines.join("\n")));
+  }
+  if (d?.lastText) parts.push(el("div", "sec", "Latest message"), el("pre", null, d.lastText));
+  if (d?.brief) parts.push(el("div", "sec", n.role === "coordinator" ? "Your first message" : "Brief"), el("pre", null, d.brief));
+  if (n.remote) parts.push(el("div", "sec", "Another machine"), el("div", "kv", "This agent runs on " + (n.machine || "another machine") + ". Its steps and messages live in that machine's T3."));
+  const scroll = box.scrollTop; box.replaceChildren(...parts); box.scrollTop = scroll;
+}
+addEventListener("keydown", (e) => { if (e.key === "Escape" && S.sel) select(S.sel); });
+
+// ------------------------------------------------------------ replay
+$("#replay").onclick = () => {
+  if (S.replay) { S.replay.stop = true; return; }
+  const evs = S.events.filter((e) => FLY.has(e.kind) && e.to);
+  if (!evs.length) return;
+  const start = [...S.nodes.values()].reduce((m, n) => (n.createdAt && n.createdAt < m ? n.createdAt : m), evs[0].ts);
+  const t0 = Date.parse(start), t1 = Date.parse(evs[evs.length - 1].ts);
+  const playMs = Math.min(40000, Math.max(8000, evs.length * 300)), rate = Math.max(1, t1 - t0) / playMs;
+  S.replay = { iso: start, stop: false }; setText($("#replay"), "■ Stop");
+  const began = performance.now(); let i = 0, lastPaint = 0;
+  (function step(now) {
+    const sim = t0 + (now - began) * rate; S.replay.iso = new Date(sim).toISOString();
+    while (i < evs.length && Date.parse(evs[i].ts) <= sim) pulse(evs[i++], 1.6);
+    if (now - lastPaint > 150) { lastPaint = now; for (const [id, c] of cards) paintCard(id, c); paintEdgeState(); paintHud(); }
+    if (i < evs.length && !S.replay.stop) requestAnimationFrame(step);
+    else { S.replay = null; setText($("#replay"), "▶ Replay"); refresh(false); }
+  })(began);
+};
+
+// ------------------------------------------------------------ data in (v2: summaries once, then only what changed)
+function applyInit(d) {
+  S.meta = d.meta; S.nodes = new Map(d.nodes.map((n) => [n.id, n]));
+  S.events = d.events.slice().sort((a, b) => a.seq - b.seq); S.lastSeq = S.events.length ? S.events[S.events.length - 1].seq : -1;
+  S.connected = true; refresh(false);
+}
+function applyTick(d) {
+  S.meta = d.meta; S.connected = true;
+  for (const u of d.upserts || []) S.nodes.set(u.id, u);
+  for (const id of d.removed || []) S.nodes.delete(id);
+  refresh(false);
+  for (const ev of d.events || []) { if (ev.seq <= S.lastSeq) continue; S.lastSeq = ev.seq; S.events.push(ev); if (!S.replay) pulse(ev); }
+}
+function connect() {
+  let polling = false, got = false;
+  const poll = async () => {
+    try {
+      const d = await (await fetch("/v2/state?since=" + S.lastSeq, { cache: "no-store" })).json();
+      if (!S.meta) applyInit(d); else applyTick({ meta: d.meta, upserts: d.nodes, removed: [...S.nodes.keys()].filter((id) => !d.nodes.some((n) => n.id === id)), events: d.events });
+    } catch { S.connected = false; if (S.meta) paintHud(); }
+    setTimeout(poll, 1000);
+  };
+  try {
+    const es = new EventSource("/v2/events");
+    es.addEventListener("init", (m) => { got = true; if (!polling) applyInit(JSON.parse(m.data)); });
+    es.addEventListener("tick", (m) => { got = true; if (!polling) applyTick(JSON.parse(m.data)); });
+    es.onerror = () => { if (!polling && S.meta) { S.connected = false; paintHud(); } };
+    setTimeout(() => { if (!got) { es.close(); polling = true; poll(); } }, 5000);
+  } catch { polling = true; poll(); }
+}
+applyView();
+if (window.__INIT) applyInit(window.__INIT); else connect();
+setInterval(() => { if (!S.meta || S.replay) return; for (const [id, c] of cards) if (c.cls.includes("working")) paintCard(id, c); paintHud(); if (S.sel) renderInspector(); }, 1000);
+</script></body></html>

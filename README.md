@@ -130,6 +130,47 @@ For long Mode 2 runs, you can have the Coordinator post automatic progress updat
 - **Zero extra process on the Lead or workers:** On each tick, the Coordinator reads `STATE.md` and `t3_thread_read` on the active Lead thread (plus `t3_thread_list` for worker running/completed counts when needed) without interrupting a busy Lead or burning flagship Lead quota. Short runs that finish before the first interval never trigger an update at all.
 - Never used in Mode 1, and ignored in repo `.t3-swarm.json` overrides.
 
+### Several Leads in one run (workstreams)
+
+One feature often has independent tracks, such as iOS, Android and web. `init --streams ios,android,web` gives each its own Lead, ledger and branch (`swarm/<run>--ios`), and the run's worker budget is split between them. `pick-lead --run <run> --stream ios` picks each Lead and prefers a different model for each workstream.
+
+The Leads coordinate on the run's **board** so their work never overlaps:
+
+- **Claims:** a Lead claims the paths it will edit (`post <run> --from ios --kind claim --paths "app/ios,shared/api"`). A claim that overlaps another workstream's is refused and names the owner, so the two Leads settle it first: by asking on the board, and with `t3_thread_send` when it blocks.
+- **Contracts:** shared interfaces (API shapes, save formats, string keys, events) are posted as contracts that name the workstream that builds them (`--owner android`), and nobody builds on one until its owner has acked it.
+- **Merging:** when every workstream is done, one integration pass merges the branches and runs the full gate once. `pick-lead --stream integrate` refuses while a contract lacks its owner's ack or a question is unanswered, so nothing is merged on an agreement only one side made.
+
+A single-Lead run is unchanged.
+
+### Remote machines (optional)
+
+The swarm doesn't assume boxes exist: each run asks for its own. Starting a box is the job of your own box skill (boat.dev, e2b, a spare computer), through a small **provider command** it ships: `acquire --run <id> --count <n>` brings boxes up and returns once T3 can reach them, and `release --run <id>` lets them go. The swarm decides when and how many. Right after `init` the Coordinator runs `swarm.mjs machines acquire --run <id>`, then asks T3 which linked machines answer, what's signed in there and which projects they have, and registers them with `swarm.mjs machines --register`. A box's project for this repo is matched by the repo's `origin`. A run places work only on the boxes it leased, and `finish` releases them. The Coordinator and Leads stay on this machine, so one router keeps every quota in one place. Workers spread across the boxes by weight; ask for a machine with a tag from your config (`balanced:high@<tag>`) or `--place box-1`.
+
+- Remote picks carry `target.environmentId` and `projectId`, so `delegate_task` runs them there. `placement.skipped` says why a box was passed over.
+- T3 runs a task on a box in that box's own checkout (no worktree isolation there), so each remote worker makes its own worktree from `origin`, pushes its branch back, and the Lead fetches it before merging.
+- Gates run on a box.
+- A box that stops answering is skipped with `cooldown env:box-1 30m`.
+
+Config names the provider (global config only: a repo's `.t3-swarm.json` can't) and holds policy, all optional: tags and weights by box label, this machine's label, or `use: false` to keep everything here. Each machine's OS adds a tag (`mac`, `linux`) on its own. Project rules, such as which work must stay on this machine, belong in the repo's `AGENTS.md`, which every agent reads. Without a provider nothing is started, and a run uses the linked machines that answer, if any.
+
+```json
+"machines": {
+  "provider": { "command": "~/.agents/skills/<your box skill>/swarm-provider", "count": 1, "max": 2 },
+  "local": { "label": "mac" },
+  "match": { "box-*": { "tags": ["godot"], "weight": 2 } }
+}
+```
+
+### Live view
+
+Off by default. With `"viewer": { "enabled": true }` in config, the Coordinator starts a live graph of each Mode 2 run at `http://127.0.0.1:4777` (the next free port if that one is taken) and opens it in a T3 preview tab; `finish` stops it. It reads T3's local state read-only and shows:
+
+- each agent's status and current command;
+- messages moving between agents, including between Leads;
+- agents on other machines, inside labelled frames.
+
+Tap an agent to see what it's doing. To open one by hand: `node skills/t3-swarm/scripts/swarm-viz.mjs --root <any thread of the run>`.
+
 ### Can my Coordinator's provider ALSO be a Lead or Worker?
 
 **Yes!** Installing `t3-swarm` on Antigravity (or Claude Code, Codex, or OMP) does **not** lock that harness into Tier 0 only.
@@ -209,11 +250,27 @@ node "$SCRIPT" init "billing-webhooks" --goal "Add Stripe webhook handler + test
 # Pick the Lead for a run (sticks to the run; falls back to the heavy worker pool if every lead is out)
 node "$SCRIPT" pick-lead --depth high --run <run-id>
 
+# Several Leads: one workstream each, coordinating on the run's board
+node "$SCRIPT" init "feature-x" --goal "Ship feature X" --streams ios,android,web
+node "$SCRIPT" pick-lead --depth high --run <run-id> --stream ios
+node "$SCRIPT" post <run-id> --from ios --kind claim --paths "app/ios,shared/api" "iOS screens + API model"
+node "$SCRIPT" post <run-id> --from ios --kind contract --owner android "GET /items returns {id,name,offline}"
+node "$SCRIPT" post <run-id> --from android --kind ack "#2 ok"
+node "$SCRIPT" board <run-id> --for android
+node "$SCRIPT" pick-lead --run <run-id> --stream integrate    # final merge + full gate
+
 # Pick one worker by quota weight (Mode 1)
 node "$SCRIPT" pick-worker balanced:medium
 
 # Pick a parallel wave of workers in one call, weighting the active Lead's bucket down (Mode 2)
 node "$SCRIPT" pick-workers heavy:high balanced:medium fast:low --avoid codex
+
+# Machines: register the linked ones that answer now, then tags pick the machine and a wave spreads
+node "$SCRIPT" machines acquire --run <run-id>          # the box provider brings the run's boxes up
+node "$SCRIPT" machines --register '[{"environmentId":"<id>","label":"box-1","os":"linux","providers":["claudeAgent","codex"],"projects":{"github.com/owner/my-app":"<project id>"}}]'
+node "$SCRIPT" pick-workers balanced:high@godot fast
+node "$SCRIPT" pick-worker fast --place local            # work that must run on this machine
+node "$SCRIPT" cooldown env:box-1 30m      # skip a box that stopped answering
 
 # Mark a cooldown (1 minute to 7 days), scoped to what actually ran out
 node "$SCRIPT" cooldown codex --until 2026-11-24T08:00:00Z --reason "plan limit"   # whole bucket
@@ -230,7 +287,7 @@ node "$SCRIPT" finish <run-id>
 ## Requirements
 
 - [T3 Code](https://t3.codes) with one or more enabled providers supporting `canRunChildTask: true` (multi-provider setups also need `canRunCrossProviderChildTask: true`)
-- **Auto** or **Full-access** runtime mode **required for Mode 2** (Leads must be able to read/write `~/.t3/swarm/` and run `swarm.mjs`; linked remote machines need the skill/config installed on that host)
+- **Auto** or **Full-access** runtime mode **required for Mode 2** (Leads must be able to read/write `~/.t3/swarm/` and run `swarm.mjs`; workers placed on remote machines need the providers signed in and the repo cloned there, plus a token that can push to `origin`)
 - Node.js 18+
 
 ## License
