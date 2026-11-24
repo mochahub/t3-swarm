@@ -48,7 +48,7 @@ const KNOWN_COMMANDS = new Set([
   "board",
   "cooldown",
   "clear-cooldown",
-  "machines",
+  "boxes",
 ]);
 const DEFAULT_BUCKET_ALIASES = {
   "openai-codex": "codex",
@@ -838,59 +838,27 @@ function validateConfig(config) {
 
   validateWeights(config, errors, warnings);
   validateStatusUpdates(config, errors, warnings);
-  validateMachines(config, errors, warnings);
+  validateBoxes(config, errors, warnings);
   validateViewer(config, errors);
   return { errors, warnings };
 }
 
-function validateMachines(config, errors, warnings) {
-  if (config.environments !== undefined) {
-    warnings.push("`environments` is ignored: boxes aren't listed in config. The Coordinator registers the linked machines that answer each run (`machines --register`); `machines` in config holds only policy (local label/tags, tags and weights by label).");
+function validateBoxes(config, errors, warnings) {
+  for (const k of ["environments", "machines", "placement"]) {
+    if (config[k] !== undefined) warnings.push(`\`${k}\` is ignored: the swarm holds no box routing. Only \`boxes\` (the box skill's provider command, count, max) is read.`);
   }
-  const mc = config.machines;
-  if (mc !== undefined) {
-    if (!mc || typeof mc !== "object" || Array.isArray(mc)) {
-      errors.push("`machines` must be an object: { use, local: { label, tags, weight }, match: { \"<label glob>\": { tags, weight } }, maxAgeHours }.");
-    } else {
-      if (mc.use !== undefined && typeof mc.use !== "boolean") errors.push("machines.use must be true or false.");
-      if (mc.maxAgeHours !== undefined && !(typeof mc.maxAgeHours === "number" && mc.maxAgeHours > 0)) errors.push("machines.maxAgeHours must be a number > 0.");
-      const rule = (r, where) => {
-        if (!r || typeof r !== "object" || Array.isArray(r)) return errors.push(`${where} must be an object.`);
-        if (r.tags !== undefined && !(Array.isArray(r.tags) && r.tags.every((t) => typeof t === "string"))) errors.push(`${where}.tags must be an array of strings.`);
-        if (r.weight !== undefined && !(typeof r.weight === "number" && r.weight >= 0)) errors.push(`${where}.weight must be a number >= 0.`);
-      };
-      if (mc.local !== undefined) {
-        rule(mc.local, "machines.local");
-        if (mc.local?.label !== undefined && (typeof mc.local.label !== "string" || !mc.local.label)) errors.push("machines.local.label must be a non-empty string.");
-      }
-      if (mc.match !== undefined) {
-        if (!mc.match || typeof mc.match !== "object" || Array.isArray(mc.match)) errors.push("machines.match must map a label glob (\"box-*\") to { tags, weight }.");
-        else for (const [g, r] of Object.entries(mc.match)) rule(r, `machines.match["${g}"]`);
-      }
-      if (mc.provider !== undefined) {
-        const p = mc.provider;
-        if (!p || typeof p !== "object" || Array.isArray(p)) errors.push("machines.provider must be { command, count, max }.");
-        else {
-          const cmdOk = (typeof p.command === "string" && p.command.trim()) || (Array.isArray(p.command) && p.command.length && p.command.every((x) => typeof x === "string"));
-          if (!cmdOk) errors.push("machines.provider.command must be the box skill's provider command: a path, or an argv array.");
-          else {
-            const exe = (Array.isArray(p.command) ? p.command[0] : p.command.trim()).replace(/^~(?=$|\/)/, os.homedir());
-            if (exe.includes("/") && !fs.existsSync(exe)) warnings.push(`machines.provider.command ${exe} doesn't exist (yet): runs will go without boxes until it does.`);
-          }
-          if (p.count !== undefined && !(Number.isInteger(p.count) && p.count >= 0)) errors.push("machines.provider.count must be an integer >= 0 (0 = start none unless asked).");
-          if (p.max !== undefined && !(Number.isInteger(p.max) && p.max >= 1)) errors.push("machines.provider.max must be an integer >= 1.");
-          if (Number.isInteger(p.count) && Number.isInteger(p.max) && p.count > p.max) warnings.push("machines.provider.count is above max; runs ask for max.");
-        }
-      }
-    }
+  const b = config.boxes;
+  if (b === undefined) return;
+  if (!b || typeof b !== "object" || Array.isArray(b)) return errors.push("`boxes` must be { command, count, max }.");
+  const cmdOk = (typeof b.command === "string" && b.command.trim()) || (Array.isArray(b.command) && b.command.length && b.command.every((x) => typeof x === "string"));
+  if (!cmdOk) errors.push("boxes.command must be the box skill's provider command: a path, or an argv array.");
+  else {
+    const exe = (Array.isArray(b.command) ? b.command[0] : b.command.trim()).replace(/^~(?=$|\/)/, os.homedir());
+    if (exe.includes("/") && !fs.existsSync(exe)) warnings.push(`boxes.command ${exe} doesn't exist (yet): runs go without boxes until it does.`);
   }
-  for (const role of ["workers", "leads"]) {
-    const m = config.placement?.[role];
-    if (m !== undefined && !["local", "spread", "remote"].includes(m)) errors.push(`placement.${role} must be "local", "spread" or "remote".`);
-  }
-  if (config.placement?.leads && config.placement.leads !== "local") {
-    warnings.push("Leads placed off this machine run swarm.mjs there, with that machine's health.json: cooldowns and quota shares won't be shared. Keep placement.leads \"local\" unless the box has the same config and you accept that.");
-  }
+  if (b.count !== undefined && !(Number.isInteger(b.count) && b.count >= 0)) errors.push("boxes.count must be an integer >= 0 (0 = none unless the Coordinator asks).");
+  if (b.max !== undefined && !(Number.isInteger(b.max) && b.max >= 1)) errors.push("boxes.max must be an integer >= 1.");
+  if (Number.isInteger(b.count) && Number.isInteger(b.max) && b.count > b.max) warnings.push("boxes.count is above max; runs ask for max.");
 }
 
 // Live viewer (scripts/swarm-viz.mjs): off unless config turns it on with `viewer: { enabled: true }`.
@@ -1030,8 +998,7 @@ function validateWeights(config, errors, warnings) {
 }
 
 async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet, batchCounts, where = {}) {
-  const envs = machineList(config);
-  const needs = where.needs || new Set();
+  const { envs, note: placeNote } = runPlaces(config);
   const pool = config.workers?.[tier] || [];
   if (pool.length === 0) {
     return { ok: false, error: `No workers configured for tier "${tier}".` };
@@ -1065,12 +1032,11 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
       skipped.push({ model: entry.model, bucket, reason: quota.reason || "quota_hook" });
       continue;
     }
-    if (envs.length) {
-      const ok = where.place
-        ? envs.some((e) => (e.label === where.place || e.id === where.place || (where.place === "local" && e.local)) && !envMisfit(health, e, { provider: entry.provider, needs }))
-        : envs.some((e) => !envMisfit(health, e, { provider: entry.provider, needs }));
+    if (envs.length && where.place) {
+      const fitsPlace = (e) => (where.place === "local" ? e.local : where.place === "box" ? !e.local : e.label === where.place || e.id === where.place);
+      const ok = envs.some((e) => fitsPlace(e) && !envMisfit(health, e, { provider: entry.provider }));
       if (!ok) {
-        skipped.push({ model: entry.model, bucket, reason: `no_environment(${[...needs].join("+") || where.place || "any"})` });
+        skipped.push({ model: entry.model, bucket, reason: `can't run on --place ${where.place}` });
         continue;
       }
     }
@@ -1137,9 +1103,13 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
     ...(capRelaxed ? { capRelaxed: true } : {}),
   };
   if (envs.length) {
-    const placed = chooseEnvironment(config, health, { provider: chosen.entry.provider, needs, place: where.place, role: "workers", batch: where.envBatch });
+    const placed = chooseEnvironment(config, health, { provider: chosen.entry.provider, place: where.place, batch: where.envBatch });
     if (placed.error) return { ok: false, error: placed.error, ...(placed.skipped ? { skipped: placed.skipped } : {}) };
     applyPlacement(pick, placed.env, placed.skipped);
+  } else if (where.place && where.place !== "local") {
+    return { ok: false, error: placeNote || "This run has no boxes (boxes acquire)." };
+  } else if (placeNote) {
+    pick.placementNote = placeNote;
   }
   return pick;
 }
@@ -1293,18 +1263,13 @@ function workstreamRows(runId) {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Machines: which machine a delegate runs on. Boxes come and go, so config never lists them. Each run,
-// the Coordinator asks T3 which linked environments answer now and registers them with `machines --register`
-// (machines.json, a cache next to health.json). A box's project for this repo is found by the repo's
-// origin URL, which T3 also keys projects by (repositoryIdentity.canonicalKey). Config holds policy only:
-// `machines` { use, local: {label, tags, weight}, match: {"<label glob>": {tags, weight}}, maxAgeHours }
-// and `placement`. Workers spread across machines by weight; Leads stay local by default so one router
-// and one health.json keep routing every quota.
+// Boxes: other machines a run's workers may use. The swarm never assumes one exists and holds no routing
+// policy. The user's own box skill ships a provider command (config `boxes`); the Coordinator acquires the
+// run's boxes after init, registers what T3 says about each (providers signed in, projects there), and
+// finish releases them. A worker goes to this machine or one of the run's boxes, spread evenly, unless the
+// Lead pins it with --place. A box is skipped only for correctness: the picked provider isn't signed in
+// there, this repo's project isn't there, or it is cooled down. Leads always stay on this machine.
 // ---------------------------------------------------------------------------------------------------
-const MACHINES_PATH = path.join(SWARM_HOME, "machines.json");
-const DEFAULT_MACHINE_MAX_AGE_HOURS = 12;
-const OS_TAGS = { darwin: "mac", macos: "mac", linux: "linux", win32: "windows", windows: "windows" };
-const osTag = (o) => OS_TAGS[String(o || "").toLowerCase()] || null;
 
 // "git@github.com:Owner/Repo.git", "https://user:token@github.com/owner/repo", "ssh://git@host:22/o/r.git"
 // -> "github.com/owner/repo", the form T3 gives as a project's repositoryIdentity.canonicalKey.
@@ -1338,173 +1303,26 @@ function currentRepoKey() {
   return repoKeyMemo;
 }
 
-function readMachinesFile() {
-  try {
-    const j = JSON.parse(fs.readFileSync(MACHINES_PATH, "utf8"));
-    return Array.isArray(j?.machines) ? j : { machines: [] };
-  } catch {
-    return { machines: [] };
-  }
-}
-const globRe = (g) => new RegExp(`^${String(g).split("*").map((x) => x.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`, "i");
-function matchRules(config, label) {
-  const rules = config.machines?.match;
-  if (!rules || typeof rules !== "object" || Array.isArray(rules)) return [];
-  return Object.entries(rules).filter(([g]) => globRe(g).test(label)).map(([, r]) => (r && typeof r === "object" ? r : {}));
-}
-const ruleTags = (r) => (Array.isArray(r?.tags) ? r.tags.map(String) : []);
-const machineMaxAgeMs = (config) => {
-  const h = config.machines?.maxAgeHours;
-  return (typeof h === "number" && h > 0 ? h : DEFAULT_MACHINE_MAX_AGE_HOURS) * 3_600_000;
-};
-// This machine's own tags: its OS plus machines.local.tags.
-function localMachine(config, repo) {
-  const lc = config.machines?.local || {};
-  return {
-    id: null, label: String(lc.label || "local"), local: true,
-    tags: new Set([osTag(os.platform()), ...ruleTags(lc)].filter(Boolean)),
-    weight: typeof lc.weight === "number" && lc.weight >= 0 ? lc.weight : 1,
-    providers: null, projectId: null, repo,
-  };
-}
-function remoteMachine(config, m, repo, lease) {
-  const rules = matchRules(config, String(m.label));
-  const projects = Object.fromEntries(Object.entries(m.projects || {}).map(([k, v]) => [String(k).toLowerCase(), String(v)]));
-  return {
-    id: String(m.environmentId), label: String(m.label), local: false,
-    tags: new Set([osTag(m.os), ...rules.flatMap(ruleTags)].filter(Boolean)),
-    weight: rules.map((r) => r.weight).find((w) => typeof w === "number" && w >= 0) ?? 1,
-    providers: Array.isArray(m.providers) ? new Set(m.providers.map(String)) : null,
-    projectId: repo ? projects[repo] || null : null,
-    repo,
-    seenAt: m.seenAt || null,
-    // with a box provider: null = no lease needed; else whether this pick's run holds the box
-    held: lease ? lease.machines.some((x) => x.environmentId === m.environmentId || x.label === m.label) : null,
-    run: lease?.run ?? null,
-  };
-}
-// Leases: `machines acquire` records the boxes the provider gave a run (<runId>.boxes.json). With a provider,
-// a run places work only on boxes it holds, so another run's release can't stop a box under its workers.
-let cliFlags = {};
-const leasePath = (runId) => path.join(RUNS_DIR, `${path.basename(String(runId))}.boxes.json`);
-function readLease(runId) {
-  try {
-    const j = JSON.parse(fs.readFileSync(leasePath(runId), "utf8"));
-    return Array.isArray(j?.machines) ? j : null;
-  } catch {
-    return null;
-  }
-}
-// Leases of runs still in runs/ (finish archives a run's lease with its ledger).
-function liveLeases() {
-  let files = [];
-  try { files = fs.readdirSync(RUNS_DIR).filter((f) => f.endsWith(".boxes.json")); } catch {}
-  return files.map((f) => ({ run: f.slice(0, -".boxes.json".length), ...(readLease(f.slice(0, -".boxes.json".length)) || { machines: [] }) }));
-}
-// The run a pick belongs to: --run, else the swarm/<runId>[--<stream>] branch this checkout is on.
-let runMemo;
-function currentRun() {
-  if (typeof cliFlags.run === "string") return cliFlags.run;
-  if (runMemo !== undefined) return runMemo;
-  runMemo = null;
-  try {
-    const branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-    const rest = /^swarm\/(.+)$/.exec(branch)?.[1];
-    if (rest) {
-      const cands = [rest, rest.includes("--") ? rest.slice(0, rest.lastIndexOf("--")) : null].filter(Boolean);
-      runMemo = cands.find((c) => fs.existsSync(runLedgerPath(c))) || null;
-    }
-  } catch {}
-  return runMemo;
-}
-
-// The machines a pick may use: this one plus each box registered within maxAgeHours. Empty when no box
-// is registered (or machines.use is false): picks then carry no placement and run here.
-let machinesMemo;
-function machineList(config) {
-  if (machinesMemo) return machinesMemo;
-  if (config.machines?.use === false) return (machinesMemo = []);
-  const repo = currentRepoKey();
-  const now = Date.now();
-  // With a box provider, boxes belong to runs: look up this pick's run and what it holds.
-  const run = boxProvider(config) ? currentRun() : null;
-  const lease = boxProvider(config) ? { run, machines: run ? readLease(run)?.machines || [] : [] } : null;
-  const remote = readMachinesFile().machines
-    .filter((m) => m?.environmentId && m?.label && now - Date.parse(m.seenAt || 0) <= machineMaxAgeMs(config))
-    .map((m) => remoteMachine(config, m, repo, lease));
-  return (machinesMemo = remote.length ? [localMachine(config, repo), ...remote] : []);
-}
-// One machine as status, doctor and `machines` show it.
-function machineSummary(e) {
-  return {
-    label: e.label,
-    local: e.local,
-    ...(e.id ? { environmentId: e.id } : {}),
-    tags: [...e.tags],
-    weight: e.weight,
-    ...(e.local ? {} : { providers: e.providers ? [...e.providers] : "any", projectHere: e.projectId || null, seenAt: e.seenAt, ...(e.held !== null ? { leasedToThisRun: e.held } : {}) }),
-  };
-}
-// Check a `machines --register` payload: what an agent builds from t3_environment_links, t3_environment_read,
-// orchestrator_capabilities and t3_project_list for each reachable box.
-function parseMachinesInput(raw) {
-  let list;
-  try {
-    list = JSON.parse(raw);
-  } catch (err) {
-    return { error: `--register needs a JSON array: ${err.message}` };
-  }
-  if (!Array.isArray(list)) return { error: "--register needs a JSON array of { environmentId, label, os, providers, projects }." };
-  const errors = [], ids = new Set(), labels = new Set();
-  const seenAt = new Date().toISOString();
-  const machines = list.map((m, i) => {
-    const where = `machine ${i}`;
-    if (!m || typeof m !== "object") return errors.push(`${where} must be an object.`), null;
-    if (typeof m.environmentId !== "string" || !m.environmentId) errors.push(`${where} needs the linked environment's \`environmentId\`.`);
-    if (typeof m.label !== "string" || !m.label) errors.push(`${where} needs its T3 \`label\`.`);
-    if (ids.has(m.environmentId)) errors.push(`${where}: environmentId listed twice.`);
-    if (labels.has(m.label)) errors.push(`${where}: label "${m.label}" listed twice.`);
-    ids.add(m.environmentId);
-    labels.add(m.label);
-    if (m.providers !== undefined && !(Array.isArray(m.providers) && m.providers.every((p) => typeof p === "string"))) errors.push(`${where}.providers must be an array of provider ids.`);
-    const projects = m.projects ?? {};
-    if (typeof projects !== "object" || Array.isArray(projects) || !Object.values(projects).every((v) => typeof v === "string")) {
-      errors.push(`${where}.projects must map each project's canonicalKey (e.g. "github.com/owner/repo") to its project id there.`);
-    }
-    return {
-      environmentId: m.environmentId,
-      label: m.label,
-      ...(m.os ? { os: String(m.os) } : {}),
-      ...(Array.isArray(m.providers) ? { providers: m.providers } : {}),
-      projects,
-      seenAt,
-    };
-  });
-  return errors.length ? { error: errors.join(" ") } : { machines };
-}
-
-// Box provider: the user's own box skill ships a command that brings boxes up and lets them go
-// (boat.dev, e2b, anything). The swarm decides when and how many; the provider decides how.
-//   <command> acquire --run <id> --count <n> [--needs a,b] -> {"ok", "machines": [{label, environmentId}], "errors"}
-//   <command> release --run <id>                           -> {"ok", ...}
-// It must print one JSON object on stdout (progress on stderr) and return acquire only once each box answers
-// in T3. Read from the global config only: a repo's .t3-swarm.json can't name a command for the router to run.
+// Box provider: <command> acquire --run <id> --count <n> -> {"ok", "machines": [{label, environmentId}], "errors", "shortfall"}
+//               <command> release --run <id>              -> {"ok", ...}
+// One JSON object on stdout (progress on stderr); acquire returns once each box answers in T3. Read from the
+// global config only: a repo's .t3-swarm.json can't name a command for the router to run.
 const PROVIDER_TIMEOUT_MS = { acquire: 10 * 60_000, release: 5 * 60_000 };
 function boxProvider(config) {
-  const p = config.machines?.provider;
-  if (!p || typeof p !== "object" || config.machines?.use === false) return null;
-  const argv = (Array.isArray(p.command) ? p.command.map(String) : typeof p.command === "string" && p.command.trim() ? [p.command.trim()] : null);
+  const b = config.boxes;
+  if (!b || typeof b !== "object") return null;
+  const argv = Array.isArray(b.command) ? b.command.map(String) : typeof b.command === "string" && b.command.trim() ? [b.command.trim()] : null;
   if (!argv) return null;
   argv[0] = argv[0].replace(/^~(?=$|\/)/, os.homedir());
-  const max = Number.isInteger(p.max) && p.max >= 1 ? p.max : 2;
-  const count = Math.min(Number.isInteger(p.count) && p.count >= 0 ? p.count : 1, max);
+  const max = Number.isInteger(b.max) && b.max >= 1 ? b.max : 2;
+  const count = Math.min(Number.isInteger(b.count) && b.count >= 0 ? b.count : 1, max);
   return { argv, count, max };
 }
 // What init tells the Coordinator about boxes: only when a provider is configured.
 function boxesInfo(config, runId) {
   const p = boxProvider(config);
   if (!p) return {};
-  return { boxes: { count: p.count, max: p.max, acquire: `node "${SCRIPT_PATH}" machines acquire --run ${runId}` } };
+  return { boxes: { count: p.count, max: p.max, acquire: `node "${SCRIPT_PATH}" boxes acquire --run ${runId}` } };
 }
 function runProvider(provider, verb, args) {
   const r = spawnSync(provider.argv[0], [...provider.argv.slice(1), verb, ...args], {
@@ -1523,16 +1341,87 @@ function runProvider(provider, verb, args) {
     try { json = JSON.parse(text.split("\n").filter(Boolean).pop()); } catch {}
   }
   if (!json || typeof json !== "object") return { ok: false, error: `${verb}: the provider printed no JSON object (exit ${r.status}).`, stderr: tail(r.stderr) };
-  if (json.ok === false || r.status !== 0) return { ok: false, error: `${verb}: ${json.error || `exit ${r.status}`}`, ...(json.errors ? { errors: json.errors } : {}), stderr: tail(r.stderr) };
+  if (json.ok === false || r.status !== 0) return { ok: false, error: `${verb}: ${json.error || `exit ${r.status}`}`, ...(json.errors ? { errors: json.errors } : {}), stderr: tail(r.stderr), json };
   return { ok: true, json };
 }
 
-function placementMode(config, role) {
-  const envs = machineList(config);
-  const set = config.placement?.[role];
-  if (set) return set;
-  return role === "workers" && envs.some((e) => !e.local) ? "spread" : "local";
+// A run's boxes live in its lease file, <runId>.boxes.json: what acquire returned, plus what the Coordinator
+// registered from T3 for each (providers, projects). finish archives it with the ledger.
+let cliFlags = {};
+const leasePath = (runId) => path.join(RUNS_DIR, `${path.basename(String(runId))}.boxes.json`);
+function readLease(runId) {
+  try {
+    const j = JSON.parse(fs.readFileSync(leasePath(runId), "utf8"));
+    return Array.isArray(j?.machines) ? j : null;
+  } catch {
+    return null;
+  }
 }
+// The run a pick belongs to: --run, else the swarm/<runId>[--<stream>] branch this checkout is on.
+let runMemo;
+function currentRun() {
+  if (typeof cliFlags.run === "string") return cliFlags.run;
+  if (runMemo !== undefined) return runMemo;
+  runMemo = null;
+  try {
+    const branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const rest = /^swarm\/(.+)$/.exec(branch)?.[1];
+    if (rest) {
+      const cands = [rest, rest.includes("--") ? rest.slice(0, rest.lastIndexOf("--")) : null].filter(Boolean);
+      runMemo = cands.find((c) => fs.existsSync(runLedgerPath(c))) || null;
+    }
+  } catch {}
+  return runMemo;
+}
+// Check a `boxes register` payload: what the Coordinator read from T3 for each acquired box.
+function parseRegisterInput(raw) {
+  let list;
+  try {
+    list = JSON.parse(raw);
+  } catch (err) {
+    return { error: `register needs a JSON array: ${err.message}` };
+  }
+  if (!Array.isArray(list)) return { error: "register needs a JSON array of { label, providers, projects }." };
+  const errors = [];
+  list.forEach((m, i) => {
+    if (!m || typeof m !== "object" || !(m.label || m.environmentId)) return errors.push(`entry ${i} needs the box's label or environmentId.`);
+    if (m.providers !== undefined && !(Array.isArray(m.providers) && m.providers.every((p) => typeof p === "string"))) errors.push(`entry ${i}: providers must be an array of provider ids.`);
+    const projects = m.projects ?? {};
+    if (typeof projects !== "object" || Array.isArray(projects) || !Object.values(projects).every((v) => typeof v === "string")) {
+      errors.push(`entry ${i}: projects must map each project's canonicalKey (e.g. "github.com/owner/repo") to its project id there.`);
+    }
+  });
+  return errors.length ? { error: errors.join(" ") } : { list };
+}
+
+// Where a pick may go: this machine plus the run's boxes. Empty (no placement, runs here) without a provider
+// or without boxes; `note` says why when a run with a provider can't be found.
+let placesMemo;
+function runPlaces(config) {
+  if (placesMemo) return placesMemo;
+  if (!boxProvider(config)) return (placesMemo = { envs: [] });
+  const run = currentRun();
+  if (!run) return (placesMemo = { envs: [], note: "Boxes are leased per run: pass --run <runId>, or pick from the run's swarm/ branch." });
+  const repo = currentRepoKey();
+  const boxes = (readLease(run)?.machines || []).filter((m) => m?.label && m?.environmentId).map((m) => {
+    const projects = Object.fromEntries(Object.entries(m.projects || {}).map(([k, v]) => [String(k).toLowerCase(), String(v)]));
+    return {
+      id: String(m.environmentId), label: String(m.label), local: false,
+      registered: Boolean(m.registeredAt),
+      providers: Array.isArray(m.providers) ? new Set(m.providers.map(String)) : null,
+      projectId: repo ? projects[repo] || null : null,
+      repo,
+    };
+  });
+  return (placesMemo = { run, envs: boxes.length ? [{ id: null, label: "local", local: true }, ...boxes] : [] });
+}
+function boxSummary(e) {
+  return {
+    label: e.label,
+    ...(e.local ? { local: true } : { environmentId: e.id, registered: e.registered, providers: e.providers ? [...e.providers] : "any", projectHere: e.projectId || null }),
+  };
+}
+
 const envKey = (env) => `env:${env.label}`;
 function envCooldown(health, env) {
   for (const k of [envKey(env), env.id && `env:${env.id}`].filter(Boolean)) {
@@ -1541,66 +1430,56 @@ function envCooldown(health, env) {
   }
   return null;
 }
-function parseNeeds(raw) {
-  return new Set(String(raw || "").split(/[,+]/).map((s) => s.trim()).filter(Boolean));
-}
-// Why a machine can't take this delegate, or null when it can. Pure (no credits touched).
-function envMisfit(health, e, { provider, needs = new Set() }) {
-  if (![...needs].every((t) => e.tags.has(t))) return `missing tags ${[...needs].filter((t) => !e.tags.has(t)).join("+")}`;
+// Why a box can't take this delegate, or null when it can. Correctness only, no policy.
+function envMisfit(health, e, { provider }) {
+  if (e.local) return envCooldown(health, e) ? `cooldown:${envKey(e)}` : null;
+  if (!e.registered) return "not registered yet (boxes register)";
   if (e.providers && provider && !e.providers.has(provider)) return `provider ${provider} not signed in there`;
-  if (!e.local && e.held === false) {
-    return e.run ? `not leased to run ${e.run} (machines acquire --run ${e.run})` : "boxes are leased per run: pass --run <runId>, or pick from the run's swarm/ branch";
-  }
-  if (!e.local && !e.projectId) return e.repo ? `no project for ${e.repo} there` : "this checkout has no origin remote, so no project there matches it";
+  if (!e.projectId) return e.repo ? `no project for ${e.repo} there` : "this checkout has no origin remote, so no project there matches it";
   const cd = envCooldown(health, e);
   return cd ? `cooldown:${cd}` : null;
 }
 /**
- * Choose where one delegate runs. `needs` = tags the machine must have; `place` = a label/id or "local"
- * to force it. Returns { env, skipped? } (env null when no box is registered: it runs here) or { error }.
+ * Choose where one worker runs: spread evenly over this machine and the run's boxes that can take it.
+ * `place`: "local", "box" (any of the run's boxes) or a box label. Returns { env, skipped? } (env null
+ * without boxes: it runs here) or { error, skipped? }.
  */
-function chooseEnvironment(config, health, { provider, needs = new Set(), place = null, role = "workers", batch = null }) {
-  const envs = machineList(config);
+function chooseEnvironment(config, health, { provider, place = null, batch = null }) {
+  const { envs, note } = runPlaces(config);
   if (envs.length === 0) {
-    return place && place !== "local"
-      ? { error: `No machine "${place}" is registered. The Coordinator registers the boxes that answer now with \`machines --register\`.` }
-      : { env: null };
+    return place && place !== "local" ? { error: note || "This run has no boxes (boxes acquire)." } : { env: null, ...(note ? { note } : {}) };
   }
   const skipped = [];
-  const fits = (e) => envMisfit(health, e, { provider, needs });
-  if (place) {
-    const e = envs.find((x) => x.label === place || x.id === place || (place === "local" && x.local));
-    if (!e) return { error: `Unknown machine "${place}". Registered: ${envs.map((x) => x.label).join(", ")}.` };
-    const why = fits(e);
-    return why ? { error: `Can't place on ${e.label}: ${why}.` } : { env: e };
-  }
   const eligible = [];
   for (const e of envs) {
-    const why = fits(e);
+    const why = envMisfit(health, e, { provider });
     if (why) skipped.push({ environment: e.label, reason: why });
     else eligible.push(e);
   }
-  if (!eligible.length) return { error: `No machine can run this (${[...needs].join("+") || "no tags"}, ${provider}).`, skipped };
-  const mode = placementMode(config, role);
   let pool = eligible;
-  if (mode === "local" && needs.size === 0) pool = eligible.filter((e) => e.local).length ? eligible.filter((e) => e.local) : eligible;
-  if (mode === "remote") pool = eligible.filter((e) => !e.local).length ? eligible.filter((e) => !e.local) : eligible;
-  const positive = pool.filter((e) => e.weight > 0);
-  if (positive.length) pool = positive; // weight 0 = only when nothing else fits
+  if (place === "local") pool = eligible.filter((e) => e.local);
+  else if (place === "box") pool = eligible.filter((e) => !e.local);
+  else if (place) {
+    const e = envs.find((x) => x.label === place || x.id === place);
+    if (!e) return { error: `Unknown box "${place}". This run has: ${envs.filter((x) => !x.local).map((x) => x.label).join(", ")}.` };
+    pool = eligible.filter((x) => x === e);
+    if (!pool.length) return { error: `Can't place on ${e.label}: ${skipped.find((s) => s.environment === e.label)?.reason}.` };
+  }
+  if (!pool.length) return { error: `Nowhere to run this (${place || "any"}, ${provider}).`, skipped };
   const { chosen } = swrrPick(
     health.credits.envs,
-    pool.map((e) => ({ e, id: e.label, weight: e.weight || 1 })),
+    pool.map((e) => ({ e, id: e.label, weight: 1 })),
     (c) => batch?.get(c.id) || 0
   );
   if (batch) batch.set(chosen.id, (batch.get(chosen.id) || 0) + 1);
   return { env: chosen.e, ...(skipped.length ? { skipped } : {}) };
 }
-// Fold a placement into a pick: remote machines get target.environmentId + projectId. `skipped` says why
-// any box was passed over, so work that silently stays here (wrong checkout, project not on the box) shows.
+// Fold a placement into a pick: a box gets target.environmentId + projectId. `skipped` says why a box was
+// passed over, so work that stays here (not registered, project not on the box) shows.
 function applyPlacement(pick, env, skipped) {
   if (!env) return pick;
   if (!env.local) pick.target = { ...pick.target, environmentId: env.id, projectId: env.projectId };
-  pick.placement = { environment: env.label, remote: !env.local, ...(env.id ? { environmentId: env.id, projectId: env.projectId } : {}), tags: [...env.tags] };
+  pick.placement = { environment: env.label, remote: !env.local, ...(env.id ? { environmentId: env.id, projectId: env.projectId } : {}) };
   // T3 runs a task on a linked machine in that machine's checkout and refuses isolation "worktree" there.
   if (!env.local) pick.placement.note = `Runs in ${env.label}'s own checkout: leave isolation out (T3 refuses "worktree" there) and have the worker start in its own worktree from origin/<branch> (lead-brief: Machines).`;
   if (skipped?.length) pick.placement.skipped = skipped;
@@ -1614,8 +1493,10 @@ function readWorkerBrief() {
 }
 
 function parseSpec(spec, defaultDepth) {
-  const [specCore, needsRaw] = String(spec || "").split("@");
-  const [rawTier, rawDepth] = specCore.split(":");
+  if (String(spec || "").includes("@")) {
+    return { error: `"${spec}": tags are gone. Pick by tier:depth, and use --place local (or --place box / <label>) when the work must run somewhere in particular.` };
+  }
+  const [rawTier, rawDepth] = String(spec || "").split(":");
   const tier = rawTier?.trim().toLowerCase();
   const depth = rawDepth?.trim().toLowerCase() || defaultDepth || "medium";
   if (!VALID_TIERS.includes(tier)) {
@@ -1624,7 +1505,7 @@ function parseSpec(spec, defaultDepth) {
   if (!DEPTH_ORDER.includes(depth)) {
     return { error: `Invalid depth "${depth}". Expected one of: ${DEPTH_ORDER.join(", ")}` };
   }
-  return { tier, depth, needs: parseNeeds(needsRaw) }; // "balanced:high@android+linux" -> needs {android, linux}
+  return { tier, depth };
 }
 
 async function main() {
@@ -1644,8 +1525,8 @@ Commands:
   pick-lead [--run id] [--stream s] [--depth high]
                                            Pick the Lead (heavy pool as fallback); --run makes it stick to a run,
                                            --stream to one workstream of it (prefers a model no other stream uses)
-  pick-worker <tier[:depth][@tags]> [--avoid b]   Pick one worker by quota weight (and a machine for it)
-  pick-workers <spec>... [--avoid b]       Pick a wave of workers in one call, spread across machines
+  pick-worker <tier[:depth]> [--avoid b]   Pick one worker by quota weight (and, with boxes, where it runs)
+  pick-workers <spec>... [--avoid b]       Pick a wave of workers in one call (spread over the run's boxes, if any)
   post <run-id> --from <stream> [--to s|all] [--kind k] [--paths "a,b"] "text"
                                            Post to the run's board: claim|release|contract|ack|ask|answer|note|done.
                                            A claim overlapping another stream's claim is refused until they agree.
@@ -1654,8 +1535,7 @@ Commands:
   board <run-id> [--since n] [--for s]     Read the board: posts, who holds which paths, open asks, contracts
   cooldown <key> [duration] [--until t]    Put a key in cooldown (default: defaults.cooldownMinutes)
   clear-cooldown <key|all>                 Clear cooldown(s)
-  machines [--register '<json>'|-] [--drop a,b] [--clear]  Show, add or remove the machines picks may use
-  machines acquire|release --run <id> [--count n]  Have the box provider bring a run's boxes up / let them go
+  boxes acquire|register|release|show --run <id>  A run's boxes: bring up, record T3 facts, let go, show
 
 Cooldown keys (scope the cooldown to what actually ran out):
   <provider>:<model>   one model only, e.g. claudeAgent:claude-fable-5-2
@@ -1676,21 +1556,15 @@ Options:
   --run <run-id>     pick-lead: reuse this run's Lead while healthy; otherwise fail over and record it
   --stream <name>    pick-lead: the workstream this Lead owns (or "integrate" for the final merge pass,
                      refused until every workstream is COMPLETE and the board is settled; --force skips that)
-  --needs <t1,t2>    pick-*: only machines with these tags (also "spec@tag+tag" per worker)
-  --place <label>    pick-*: force a machine by label/id, or "local" for this one
+  --place <where>    pick-worker(s): "local" (this machine), "box" (any of the run's boxes) or a box label
 
-Machines: boxes come and go, so config doesn't list them. With a box provider (config machines.provider:
-{ command, count: 1, max: 2 }, the user's own box skill's command), the Coordinator runs \`machines acquire
---run <id>\` after init: the provider brings the run's boxes up and the run leases them; finish releases them.
-Then it registers the linked machines that answer: machines --register '[{ "environmentId": "<id>", "label":
-"box-1", "os": "linux", "providers": ["claudeAgent","codex"], "projects": { "github.com/owner/repo": "<id>" } }]'
-(from t3_environment_links, t3_environment_read, orchestrator_capabilities, t3_project_list); --drop removes
-one that stopped answering. A pick uses a box's project for this checkout's origin, and with a provider only
-the boxes its run leases (--run, or the swarm/<runId> branch). Registrations last machines.maxAgeHours (12).
-Config "machines" also holds policy: { use: false to never leave this machine, local: { label, tags, weight },
-match: { "box-*": { tags: ["godot"], weight: 2 } } }. Each machine's OS adds a tag (mac, linux).
-placement { workers: "spread" (default with boxes) | "local" | "remote", leads: "local" (default) }. Cool down
-a box that stops answering with \`cooldown env:box-1 30m\`.
+Boxes (config "boxes": { command, count: 1, max: 2 }, the user's own box skill's provider command): the
+swarm never assumes a box exists. After init the Coordinator runs \`boxes acquire --run <id>\`; the provider
+brings the run's boxes up. Then \`boxes register --run <id> '[{ "label": "box-1", "providers": ["claudeAgent"],
+"projects": { "github.com/owner/repo": "<project id>" } }]'\` records what T3 says about each
+(orchestrator_capabilities, t3_project_list). Workers spread evenly over this machine and the run's boxes;
+--place local | box | <label> pins one. A box is skipped when the picked provider isn't signed in there, this
+repo's project isn't there, or it is cooled down (\`cooldown env:box-1 30m\`). finish releases the boxes.
 
 Viewer (config "viewer"): { enabled: true, port: 4777 } makes init return the command that starts the
 live view (scripts/swarm-viz.mjs) for the run; finish stops it. Off by default.
@@ -1758,7 +1632,7 @@ interval progress updates during Mode 2 runs (off by default).
     }
 
     const envMatches = loaded.ok && key.startsWith("env:")
-      ? machineList(loaded.config).filter((e) => key === envKey(e) || (e.id && key === `env:${e.id}`)).map((e) => ({ environment: e.label, remote: !e.local }))
+      ? runPlaces(loaded.config).envs.filter((e) => key === envKey(e) || (e.id && key === `env:${e.id}`)).map((e) => ({ environment: e.label, remote: !e.local }))
       : [];
     const affects = envMatches.length ? envMatches : loaded.ok ? entriesMatchingKey(loaded.config, key) : [];
     if (loaded.ok && affects.length === 0) {
@@ -2047,16 +1921,21 @@ interval progress updates during Mode 2 runs (off by default).
 
   const { config, configPath, configSource, projectOverridePath } = loaded;
 
-  if (cmd === "machines" && (positional[1] === "acquire" || positional[1] === "release")) {
-    const verb = positional[1];
+  // A run's boxes: acquire them from the provider, register what T3 says about each, release them, or show them.
+  if (cmd === "boxes") {
+    const verb = positional[1] || "show";
     const provider = boxProvider(config);
-    const runId = typeof flags.run === "string" ? flags.run : null;
-    if (!runId) {
-      out({ ok: false, error: `Usage: swarm.mjs machines ${verb} --run <runId>${verb === "acquire" ? " [--count n] [--needs a,b]" : ""}` }, 1);
+    const runId = typeof flags.run === "string" ? flags.run : verb === "show" ? currentRun() : null;
+    if (!["acquire", "register", "release", "show"].includes(verb)) {
+      out({ ok: false, error: "Usage: swarm.mjs boxes acquire|register|release|show --run <runId>" }, 1);
       return;
     }
     if (!provider) {
-      out({ ok: false, status: "no_provider", error: "No machines.provider in config: the swarm starts no boxes. It uses the linked machines that answer, if any (Remote machines in SKILL.md)." }, 1);
+      out({ ok: false, status: "no_provider", error: "No `boxes` in config: the swarm uses no boxes and every worker runs on this machine." }, verb === "show" ? 0 : 1);
+      return;
+    }
+    if (!runId) {
+      out({ ok: false, error: `Pass --run <runId>${verb === "show" ? " (or run this from the run's swarm/ branch)" : ""}.` }, 1);
       return;
     }
     if (verb === "release") {
@@ -2066,107 +1945,94 @@ interval progress updates during Mode 2 runs (off by default).
       return;
     }
     if (!fs.existsSync(runLedgerPath(runId))) {
-      out({ ok: false, error: `Run ${runId} not found in ${RUNS_DIR}: acquire boxes for a run that init created.` }, 1);
+      out({ ok: false, error: `Run ${runId} not found in ${RUNS_DIR}: boxes belong to a run that init created.` }, 1);
       return;
     }
-    const asked = flags.count !== undefined ? parseInt(String(flags.count), 10) : provider.count;
-    if (!Number.isInteger(asked) || asked < 0) {
-      out({ ok: false, error: "--count must be an integer >= 0." }, 1);
-      return;
-    }
-    const count = Math.min(asked, provider.max);
-    if (count === 0) {
-      out({ ok: true, run: runId, asked: 0, machines: [], note: "No boxes asked for: the run stays on this machine." });
-      return;
-    }
-    const needs = [...parseNeeds(flags.needs)];
-    // --count is "make sure this run holds N boxes": asking again tops up, it never adds N more
-    const r = runProvider(provider, "acquire", ["--run", runId, "--count", String(count), ...(needs.length ? ["--needs", needs.join(",")] : [])]);
-    if (!r.ok) {
-      out({ ...r, run: runId, hint: "The run goes on without new boxes: register whatever linked machines answer (or none) and continue." }, 1);
-      return;
-    }
-    const got = (Array.isArray(r.json.machines) ? r.json.machines : [])
-      .filter((m) => m && typeof m.label === "string" && typeof m.environmentId === "string")
-      .map((m) => ({ label: m.label, environmentId: m.environmentId }));
-    atomicWriteJson(leasePath(runId), { at: new Date().toISOString(), machines: got });
-    const shortfall = Number.isInteger(r.json.shortfall) ? r.json.shortfall : Math.max(0, count - got.length);
-    out({
-      ok: true,
-      run: runId,
-      asked: count,
-      ...(asked > count ? { capped: `asked for ${asked}; machines.provider.max is ${provider.max}` } : {}),
-      machines: got,
-      ...(shortfall ? { shortfall } : {}),
-      ...(Array.isArray(r.json.errors) && r.json.errors.length ? { errors: r.json.errors } : {}),
-      next: got.length
-        ? "Register them: t3_environment_links, then for each reachable machine t3_environment_read, orchestrator_capabilities and t3_project_list, then `machines --register` (SKILL.md: Remote machines)."
-        : "No boxes came up: the run goes on here.",
-    });
-    return;
-  }
-
-  // The registry picks read: `--register` adds or refreshes machines (what discovery found reachable), `--drop`
-  // removes ones that stopped answering (never a box a live run holds), `--clear` empties it. Registering never
-  // drops other entries, so two Coordinators discovering at once can't erase each other's boxes.
-  if (cmd === "machines") {
-    const changes = {};
-    if (flags.register !== undefined || flags.drop !== undefined || flags.clear) {
-      let parsed = null;
-      if (flags.register !== undefined) {
-        const raw = flags.register === true || flags.register === "-" ? fs.readFileSync(0, "utf8") : String(flags.register);
-        parsed = parseMachinesInput(raw);
-        if (parsed.error) {
-          out({ ok: false, error: parsed.error }, 1);
-          return;
-        }
+    if (verb === "acquire") {
+      const asked = flags.count !== undefined ? parseInt(String(flags.count), 10) : provider.count;
+      if (!Number.isInteger(asked) || asked < 0) {
+        out({ ok: false, error: "--count must be an integer >= 0." }, 1);
+        return;
       }
-      const dropAsked = typeof flags.drop === "string" ? flags.drop.split(",").map((x) => x.trim()).filter(Boolean) : [];
-      const held = liveLeases().flatMap((l) => l.machines.map((m) => ({ ...m, run: l.run })));
-      withFileLock(MACHINES_PATH, () => {
-        let list = flags.clear ? [] : readMachinesFile().machines;
-        if (parsed) {
-          const ids = new Set(parsed.machines.map((m) => m.environmentId)), labels = new Set(parsed.machines.map((m) => m.label));
-          list = [...list.filter((m) => !ids.has(m.environmentId) && !labels.has(m.label)), ...parsed.machines];
-          changes.registered = parsed.machines.map((m) => m.label);
-        }
-        if (dropAsked.length) {
-          changes.dropped = [];
-          changes.kept = [];
-          for (const want of dropAsked) {
-            const holder = held.find((h) => h.label === want || h.environmentId === want);
-            if (holder) changes.kept.push({ machine: want, reason: `leased to run ${holder.run}` });
-            else if (list.some((m) => m.label === want || m.environmentId === want)) {
-              list = list.filter((m) => m.label !== want && m.environmentId !== want);
-              changes.dropped.push(want);
-            }
-          }
-        }
-        atomicWriteJson(MACHINES_PATH, { updatedAt: new Date().toISOString(), machines: list });
+      const count = Math.min(asked, provider.max);
+      if (count === 0) {
+        out({ ok: true, run: runId, asked: 0, machines: [], note: "No boxes asked for: the run stays on this machine." });
+        return;
+      }
+      // --count is "make sure this run holds N boxes": asking again tops up, it never adds N more
+      const r = runProvider(provider, "acquire", ["--run", runId, "--count", String(count)]);
+      // a provider may answer a shortfall with ok:false plus the boxes it did get: the run keeps those
+      const partial = !r.ok && Array.isArray(r.json?.machines) && r.json.machines.length > 0;
+      if (!r.ok && !partial) {
+        const { json, ...failure } = r;
+        out({ ...failure, run: runId, ...(json?.shortfall ? { shortfall: json.shortfall } : {}), hint: "The run goes on without new boxes, on this machine." }, 1);
+        return;
+      }
+      const got = (Array.isArray(r.json.machines) ? r.json.machines : [])
+        .filter((m) => m && typeof m.label === "string" && typeof m.environmentId === "string")
+        .map((m) => ({ label: m.label, environmentId: m.environmentId }));
+      // the provider's answer is the run's whole set; keep what was registered for boxes it still holds
+      withFileLock(leasePath(runId), () => {
+        const old = readLease(runId)?.machines || [];
+        atomicWriteJson(leasePath(runId), { at: new Date().toISOString(), machines: got.map((m) => ({ ...(old.find((o) => o.environmentId === m.environmentId) || {}), ...m })) });
       });
-      machinesMemo = undefined;
+      const lease = readLease(runId);
+      const shortfall = Number.isInteger(r.json.shortfall) ? r.json.shortfall : Math.max(0, count - got.length);
+      const unregistered = lease.machines.filter((m) => !m.registeredAt).map((m) => m.label);
+      out({
+        ok: true,
+        run: runId,
+        asked: count,
+        ...(asked > count ? { capped: `asked for ${asked}; boxes.max is ${provider.max}` } : {}),
+        machines: lease.machines.map((m) => ({ label: m.label, environmentId: m.environmentId, registered: Boolean(m.registeredAt) })),
+        ...(shortfall ? { shortfall } : {}),
+        ...(Array.isArray(r.json.errors) && r.json.errors.length ? { errors: r.json.errors } : partial ? { errors: [r.error] } : {}),
+        next: unregistered.length
+          ? `Register ${unregistered.join(", ")}: for each, orchestrator_capabilities and t3_project_list with its environmentId, then \`boxes register --run ${runId}\` (SKILL.md: Boxes).`
+          : got.length ? "Every box is registered." : "No boxes came up: the run goes on here.",
+      });
+      return;
     }
-    const file = readMachinesFile();
-    const list = machineList(config);
-    const remote = list.filter((e) => !e.local);
-    const usable = remote.filter((e) => e.projectId);
+    if (verb === "register") {
+      const raw = positional[2] !== undefined && positional[2] !== "-" ? positional[2] : fs.readFileSync(0, "utf8");
+      const parsed = parseRegisterInput(raw);
+      if (parsed.error) {
+        out({ ok: false, error: parsed.error }, 1);
+        return;
+      }
+      const unknown = [];
+      withFileLock(leasePath(runId), () => {
+        const lease = readLease(runId) || { machines: [] };
+        const at = new Date().toISOString();
+        for (const f of parsed.list) {
+          const m = lease.machines.find((x) => (f.environmentId && x.environmentId === f.environmentId) || (f.label && x.label === f.label));
+          if (!m) {
+            unknown.push(f.label || f.environmentId);
+            continue;
+          }
+          if (Array.isArray(f.providers)) m.providers = f.providers;
+          m.projects = f.projects || {};
+          m.registeredAt = at;
+        }
+        atomicWriteJson(leasePath(runId), lease);
+      });
+      if (unknown.length) {
+        out({ ok: false, error: `Not this run's boxes: ${unknown.join(", ")}. Register only what \`boxes acquire\` returned.` }, 1);
+        return;
+      }
+    }
+    placesMemo = undefined;
+    cliFlags = { ...cliFlags, run: runId };
+    const { envs } = runPlaces(config);
+    const boxes = envs.filter((e) => !e.local);
     const repo = currentRepoKey();
     out({
       ok: true,
-      path: MACHINES_PATH,
+      run: runId,
       repo,
-      use: config.machines?.use !== false,
-      provider: Boolean(boxProvider(config)),
-      ...(boxProvider(config) ? { run: currentRun() } : {}),
-      ...changes,
-      updatedAt: file.updatedAt || null,
-      registered: file.machines.length,
-      ...(file.machines.length > remote.length && config.machines?.use !== false
-        ? { stale: file.machines.length - remote.length, staleNote: `Registered more than ${machineMaxAgeMs(config) / 3_600_000}h ago: rediscover before using them.` }
-        : {}),
-      machines: list.map(machineSummary),
-      ...(remote.length && !usable.length
-        ? { warning: repo ? `No registered machine has a project for ${repo}: picks from this checkout stay here.` : "This checkout has no origin remote, so no machine's project matches it: picks from here stay here." }
+      machines: boxes.map(boxSummary),
+      ...(boxes.length && !boxes.some((e) => e.projectId)
+        ? { warning: repo ? `No box of this run has a project for ${repo}: picks from this checkout stay here.` : "This checkout has no origin remote, so no box's project matches it: picks stay here." }
         : {}),
     });
     return;
@@ -2227,12 +2093,7 @@ interval progress updates during Mode 2 runs (off by default).
         selection,
         statusUpdates: resolveStatusUpdates(config),
         viewer: resolveViewer(config),
-        ...(machineList(config).length
-          ? {
-              placement: { workers: placementMode(config, "workers"), leads: placementMode(config, "leads") },
-              machines: machineList(config).map(machineSummary),
-            }
-          : {}),
+        ...(boxProvider(config) ? { boxes: { command: boxProvider(config).argv.join(" "), count: boxProvider(config).count, max: boxProvider(config).max } } : {}),
         leads: resolvedLeads,
         workers: resolvedWorkers,
         activeCooldowns: healthRes.activeCooldowns,
@@ -2301,11 +2162,8 @@ interval progress updates during Mode 2 runs (off by default).
       activeCooldowns: healthRes.activeCooldowns,
       credits: healthRes.credits,
       statusUpdates: resolveStatusUpdates(config),
-      ...(machineList(config).length
-        ? {
-            placement: { workers: placementMode(config, "workers"), leads: placementMode(config, "leads") },
-            machines: machineList(config).map((e) => ({ ...machineSummary(e), cooldown: envCooldown({ cooldowns: healthRes.activeCooldowns }, e) })),
-          }
+      ...(runPlaces(config).envs.length
+        ? { boxes: { run: runPlaces(config).run, machines: runPlaces(config).envs.map((e) => ({ ...boxSummary(e), cooldown: envCooldown({ cooldowns: healthRes.activeCooldowns }, e) })) } }
         : {}),
       recentRuns,
     });
@@ -2534,19 +2392,13 @@ ${streams.map((st) => `- ${st} | ledger: \`${streamLedgerPath(runId, st)}\` | br
 
       const choice = chooseLead(config, health, healthy, runId, stream);
       const chosen = choice.chosen;
-      // Leads stay on this machine unless config.placement.leads or --place says otherwise.
-      const placed = chooseEnvironment(config, health, {
-        provider: chosen.lead.provider, role: "leads",
-        needs: parseNeeds(flags.needs), place: typeof flags.place === "string" ? flags.place : null,
-      });
-      if (placed.error) return { save: false, payload: { ok: false, status: "no_environment", error: placed.error, ...(placed.skipped ? { skipped: placed.skipped } : {}) } };
+      // Leads always stay on this machine: one router and one health.json route every quota.
       const next = healthy.find((h) => h !== chosen);
       const nextFallback = next
         ? { provider: next.lead.provider, bucket: next.bucket, model: next.lead.model, source: next.source }
         : null;
       const built = buildTarget(config, chosen.lead, depth);
-      const placedPick = applyPlacement({ target: built.target }, placed.env, placed.skipped);
-      const { target } = placedPick;
+      const { target } = built;
       const { depthDropped } = built;
       const others = runId && stream && stream !== "integrate"
         ? Object.fromEntries(Object.entries(health.leadPicks).filter(([k]) => k.startsWith(`${runId}#`) && k !== `${runId}#${stream}`).map(([k, v]) => [k.slice(runId.length + 1), v.id]))
@@ -2559,7 +2411,6 @@ ${streams.map((st) => `- ${st} | ledger: \`${streamLedgerPath(runId, st)}\` | br
           ...(stream ? { stream, statePath: stream === "integrate" ? runLedgerPath(runId) : streamLedgerPath(runId, stream), boardPath: boardFilePath(runId) } : {}),
           ...(others && Object.keys(others).length ? { otherStreamLeads: others } : {}),
           ...(choice.sharedWith ? { sharedWith: choice.sharedWith, note: `No free lead; sharing a model with workstream "${choice.sharedWith}".` } : {}),
-          ...(placedPick.placement ? { placement: placedPick.placement } : {}),
           priority: chosen.priority,
           source: chosen.source,
           selection: weightsCfg(config).leadSelection === "weighted" ? "weighted" : "priority",
@@ -2600,7 +2451,6 @@ ${streams.map((st) => `- ${st} | ledger: \`${streamLedgerPath(runId, st)}\` | br
     const excludeSet = parseCsvSet(flags.exclude);
     const res = await withHealth(async (health) => {
       const pick = await selectOneWorker(config, health, parsed.tier, parsed.depth, avoidSet, excludeSet, null, {
-        needs: new Set([...parseNeeds(flags.needs), ...parsed.needs]),
         place: typeof flags.place === "string" ? flags.place : null,
       });
       return {
@@ -2653,7 +2503,6 @@ ${streams.map((st) => `- ${st} | ledger: \`${streamLedgerPath(runId, st)}\` | br
         const parsed = parseSpec(spec, config.defaults?.workerDepth || "medium");
         if (parsed.error) return { save: false, payload: { ok: false, error: parsed.error } };
         const pick = await selectOneWorker(config, health, parsed.tier, parsed.depth, avoidSet, excludeSet, batchCounts, {
-          needs: new Set([...parseNeeds(flags.needs), ...parsed.needs]),
           place: typeof flags.place === "string" ? flags.place : null,
           envBatch,
         });

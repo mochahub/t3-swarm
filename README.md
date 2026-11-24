@@ -142,23 +142,20 @@ The Leads coordinate on the run's **board** so their work never overlaps:
 
 A single-Lead run is unchanged.
 
-### Remote machines (optional)
+### Boxes (optional)
 
-The swarm doesn't assume boxes exist: each run asks for its own. Starting a box is the job of your own box skill (boat.dev, e2b, a spare computer), through a small **provider command** it ships: `acquire --run <id> --count <n>` brings boxes up and returns once T3 can reach them, and `release --run <id>` lets them go. The swarm decides when and how many. Right after `init` the Coordinator runs `swarm.mjs machines acquire --run <id>`, then asks T3 which linked machines answer, what's signed in there and which projects they have, and registers them with `swarm.mjs machines --register`. A box's project for this repo is matched by the repo's `origin`. A run places work only on the boxes it leased, and `finish` releases them. The Coordinator and Leads stay on this machine, so one router keeps every quota in one place. Workers spread across the boxes by weight; ask for a machine with a tag from your config (`balanced:high@<tag>`) or `--place box-1`.
+The swarm never assumes a box exists and holds no routing policy. Starting and stopping boxes is the job of your own box skill (boat.dev, e2b, a spare computer), through a small **provider command** it ships: `acquire --run <id> --count <n>` brings boxes up and returns once T3 can reach them, and `release --run <id>` lets them go. Right after `init` the Coordinator runs `swarm.mjs boxes acquire --run <id>`, asks T3 what's signed in on each box and which projects it has, and records that with `swarm.mjs boxes register`. A box's project for this repo is matched by the repo's `origin`.
 
-- Remote picks carry `target.environmentId` and `projectId`, so `delegate_task` runs them there. `placement.skipped` says why a box was passed over.
-- T3 runs a task on a box in that box's own checkout (no worktree isolation there), so each remote worker makes its own worktree from `origin`, pushes its branch back, and the Lead fetches it before merging.
-- Gates run on a box.
-- A box that stops answering is skipped with `cooldown env:box-1 30m`.
+- Workers spread evenly over this machine and the run's boxes; a Lead pins one with `--place local`, `--place box` or `--place box-1`. Leads stay on this machine.
+- A box is skipped only when the picked provider isn't signed in there, this repo's project isn't there, or it is cooled down (`cooldown env:box-1 30m`). `placement.skipped` says which.
+- A run uses only its own boxes, and `finish` releases them.
+- T3 runs a task on a box in that box's own checkout (no worktree isolation there), so each box worker makes its own worktree from `origin`, pushes its branch back, and the Lead fetches it before merging.
+- Project rules, such as which work must stay on this machine, belong in the repo's `AGENTS.md`, which every agent reads.
 
-Config names the provider (global config only: a repo's `.t3-swarm.json` can't) and holds policy, all optional: tags and weights by box label, this machine's label, or `use: false` to keep everything here. Each machine's OS adds a tag (`mac`, `linux`) on its own. Project rules, such as which work must stay on this machine, belong in the repo's `AGENTS.md`, which every agent reads. Without a provider nothing is started, and a run uses the linked machines that answer, if any.
+Config names the provider, from your global config only (a repo's `.t3-swarm.json` can't). Without it there are no boxes.
 
 ```json
-"machines": {
-  "provider": { "command": "~/.agents/skills/<your box skill>/swarm-provider", "count": 1, "max": 2 },
-  "local": { "label": "mac" },
-  "match": { "box-*": { "tags": ["godot"], "weight": 2 } }
-}
+"boxes": { "command": "~/.agents/skills/<your box skill>/swarm-provider", "count": 1, "max": 2 }
 ```
 
 ### Live view
@@ -265,12 +262,11 @@ node "$SCRIPT" pick-worker balanced:medium
 # Pick a parallel wave of workers in one call, weighting the active Lead's bucket down (Mode 2)
 node "$SCRIPT" pick-workers heavy:high balanced:medium fast:low --avoid codex
 
-# Machines: register the linked ones that answer now, then tags pick the machine and a wave spreads
-node "$SCRIPT" machines acquire --run <run-id>          # the box provider brings the run's boxes up
-node "$SCRIPT" machines --register '[{"environmentId":"<id>","label":"box-1","os":"linux","providers":["claudeAgent","codex"],"projects":{"github.com/owner/my-app":"<project id>"}}]'
-node "$SCRIPT" pick-workers balanced:high@godot fast
+# Boxes: the box provider brings the run's boxes up; record what T3 says about each; workers spread over them
+node "$SCRIPT" boxes acquire --run <run-id>
+node "$SCRIPT" boxes register --run <run-id> '[{"label":"box-1","providers":["claudeAgent","codex"],"projects":{"github.com/owner/my-app":"<project id>"}}]'
 node "$SCRIPT" pick-worker fast --place local            # work that must run on this machine
-node "$SCRIPT" cooldown env:box-1 30m      # skip a box that stopped answering
+node "$SCRIPT" cooldown env:box-1 30m                    # skip a box that stopped answering
 
 # Mark a cooldown (1 minute to 7 days), scoped to what actually ran out
 node "$SCRIPT" cooldown codex --until 2026-11-24T08:00:00Z --reason "plan limit"   # whole bucket
