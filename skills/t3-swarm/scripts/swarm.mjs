@@ -15,7 +15,7 @@
  */
 
 import crypto from "node:crypto";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -844,21 +844,9 @@ function validateConfig(config) {
 }
 
 function validateBoxes(config, errors, warnings) {
-  for (const k of ["environments", "machines", "placement"]) {
-    if (config[k] !== undefined) warnings.push(`\`${k}\` is ignored: the swarm holds no box routing. Only \`boxes\` (the box skill's provider command, count, max) is read.`);
+  for (const k of ["environments", "machines", "placement", "boxes"]) {
+    if (config[k] !== undefined) warnings.push(`\`${k}\` is ignored: boxes aren't configured in the swarm. The Coordinator gets a run's boxes from the user's box skill and registers them (\`boxes register\`).`);
   }
-  const b = config.boxes;
-  if (b === undefined) return;
-  if (!b || typeof b !== "object" || Array.isArray(b)) return errors.push("`boxes` must be { command, count, max }.");
-  const cmdOk = (typeof b.command === "string" && b.command.trim()) || (Array.isArray(b.command) && b.command.length && b.command.every((x) => typeof x === "string"));
-  if (!cmdOk) errors.push("boxes.command must be the box skill's provider command: a path, or an argv array.");
-  else {
-    const exe = (Array.isArray(b.command) ? b.command[0] : b.command.trim()).replace(/^~(?=$|\/)/, os.homedir());
-    if (exe.includes("/") && !fs.existsSync(exe)) warnings.push(`boxes.command ${exe} doesn't exist (yet): runs go without boxes until it does.`);
-  }
-  if (b.count !== undefined && !(Number.isInteger(b.count) && b.count >= 0)) errors.push("boxes.count must be an integer >= 0 (0 = none unless the Coordinator asks).");
-  if (b.max !== undefined && !(Number.isInteger(b.max) && b.max >= 1)) errors.push("boxes.max must be an integer >= 1.");
-  if (Number.isInteger(b.count) && Number.isInteger(b.max) && b.count > b.max) warnings.push("boxes.count is above max; runs ask for max.");
 }
 
 // Live viewer (scripts/swarm-viz.mjs): off unless config turns it on with `viewer: { enabled: true }`.
@@ -998,7 +986,7 @@ function validateWeights(config, errors, warnings) {
 }
 
 async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet, batchCounts, where = {}) {
-  const { envs, note: placeNote } = runPlaces(config);
+  const { envs, run: placeRun } = runPlaces();
   const pool = config.workers?.[tier] || [];
   if (pool.length === 0) {
     return { ok: false, error: `No workers configured for tier "${tier}".` };
@@ -1107,9 +1095,7 @@ async function selectOneWorker(config, health, tier, depth, avoidSet, excludeSet
     if (placed.error) return { ok: false, error: placed.error, ...(placed.skipped ? { skipped: placed.skipped } : {}) };
     applyPlacement(pick, placed.env, placed.skipped);
   } else if (where.place && where.place !== "local") {
-    return { ok: false, error: placeNote || "This run has no boxes (boxes acquire)." };
-  } else if (placeNote) {
-    pick.placementNote = placeNote;
+    return { ok: false, error: placeRun ? `Run ${placeRun} has no boxes registered (boxes register).` : "No run found for this pick: pass --run <runId>, or pick from the run's swarm/ branch." };
   }
   return pick;
 }
@@ -1263,12 +1249,12 @@ function workstreamRows(runId) {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Boxes: other machines a run's workers may use. The swarm never assumes one exists and holds no routing
-// policy. The user's own box skill ships a provider command (config `boxes`); the Coordinator acquires the
-// run's boxes after init, registers what T3 says about each (providers signed in, projects there), and
-// finish releases them. A worker goes to this machine or one of the run's boxes, spread evenly, unless the
-// Lead pins it with --place. A box is skipped only for correctness: the picked provider isn't signed in
-// there, this repo's project isn't there, or it is cooled down. Leads always stay on this machine.
+// Boxes: other machines a run's workers may use. The swarm doesn't start, stop or configure them: the
+// Coordinator gets a run's boxes from the user's own box skill, asks T3 what each can run (providers signed
+// in, projects there) and registers that list with `boxes register`. Workers then spread evenly over this
+// machine and the run's boxes, unless the Lead pins one with --place. A box is skipped only for
+// correctness: the picked provider isn't signed in there, this repo's project isn't there, or it is cooled
+// down. Leads always stay on this machine. finish lists the run's boxes so the Coordinator releases them.
 // ---------------------------------------------------------------------------------------------------
 
 // "git@github.com:Owner/Repo.git", "https://user:token@github.com/owner/repo", "ssh://git@host:22/o/r.git"
@@ -1303,50 +1289,7 @@ function currentRepoKey() {
   return repoKeyMemo;
 }
 
-// Box provider: <command> acquire --run <id> --count <n> -> {"ok", "machines": [{label, environmentId}], "errors", "shortfall"}
-//               <command> release --run <id>              -> {"ok", ...}
-// One JSON object on stdout (progress on stderr); acquire returns once each box answers in T3. Read from the
-// global config only: a repo's .t3-swarm.json can't name a command for the router to run.
-const PROVIDER_TIMEOUT_MS = { acquire: 10 * 60_000, release: 5 * 60_000 };
-function boxProvider(config) {
-  const b = config.boxes;
-  if (!b || typeof b !== "object") return null;
-  const argv = Array.isArray(b.command) ? b.command.map(String) : typeof b.command === "string" && b.command.trim() ? [b.command.trim()] : null;
-  if (!argv) return null;
-  argv[0] = argv[0].replace(/^~(?=$|\/)/, os.homedir());
-  const max = Number.isInteger(b.max) && b.max >= 1 ? b.max : 2;
-  const count = Math.min(Number.isInteger(b.count) && b.count >= 0 ? b.count : 1, max);
-  return { argv, count, max };
-}
-// What init tells the Coordinator about boxes: only when a provider is configured.
-function boxesInfo(config, runId) {
-  const p = boxProvider(config);
-  if (!p) return {};
-  return { boxes: { count: p.count, max: p.max, acquire: `node "${SCRIPT_PATH}" boxes acquire --run ${runId}` } };
-}
-function runProvider(provider, verb, args) {
-  const r = spawnSync(provider.argv[0], [...provider.argv.slice(1), verb, ...args], {
-    encoding: "utf8",
-    timeout: PROVIDER_TIMEOUT_MS[verb] || 60_000,
-    stdio: ["ignore", "pipe", "pipe"],
-    maxBuffer: 4 * 1024 * 1024,
-  });
-  const tail = (t) => String(t || "").trim().split("\n").slice(-8).join("\n");
-  if (r.error) return { ok: false, error: `${verb}: ${r.error.code === "ETIMEDOUT" ? `no answer within ${PROVIDER_TIMEOUT_MS[verb] / 60_000} min` : r.error.message}`, stderr: tail(r.stderr) };
-  const text = String(r.stdout || "").trim();
-  let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    try { json = JSON.parse(text.split("\n").filter(Boolean).pop()); } catch {}
-  }
-  if (!json || typeof json !== "object") return { ok: false, error: `${verb}: the provider printed no JSON object (exit ${r.status}).`, stderr: tail(r.stderr) };
-  if (json.ok === false || r.status !== 0) return { ok: false, error: `${verb}: ${json.error || `exit ${r.status}`}`, ...(json.errors ? { errors: json.errors } : {}), stderr: tail(r.stderr), json };
-  return { ok: true, json };
-}
-
-// A run's boxes live in its lease file, <runId>.boxes.json: what acquire returned, plus what the Coordinator
-// registered from T3 for each (providers, projects). finish archives it with the ledger.
+// A run's boxes live in <runId>.boxes.json, as the Coordinator registered them. finish archives it.
 let cliFlags = {};
 const leasePath = (runId) => path.join(RUNS_DIR, `${path.basename(String(runId))}.boxes.json`);
 function readLease(runId) {
@@ -1373,7 +1316,7 @@ function currentRun() {
   } catch {}
   return runMemo;
 }
-// Check a `boxes register` payload: what the Coordinator read from T3 for each acquired box.
+// Check a `boxes register` payload: the run's boxes from the box skill, with what T3 says each can run.
 function parseRegisterInput(raw) {
   let list;
   try {
@@ -1381,33 +1324,36 @@ function parseRegisterInput(raw) {
   } catch (err) {
     return { error: `register needs a JSON array: ${err.message}` };
   }
-  if (!Array.isArray(list)) return { error: "register needs a JSON array of { label, providers, projects }." };
-  const errors = [];
+  if (!Array.isArray(list)) return { error: "register needs a JSON array of { label, environmentId, providers, projects }." };
+  const errors = [], labels = new Set(), ids = new Set();
   list.forEach((m, i) => {
-    if (!m || typeof m !== "object" || !(m.label || m.environmentId)) return errors.push(`entry ${i} needs the box's label or environmentId.`);
+    if (!m || typeof m !== "object" || typeof m.label !== "string" || !m.label || typeof m.environmentId !== "string" || !m.environmentId) {
+      return errors.push(`entry ${i} needs the box's label and T3 environmentId.`);
+    }
+    if (labels.has(m.label) || ids.has(m.environmentId)) errors.push(`entry ${i}: ${m.label} is listed twice.`);
+    labels.add(m.label);
+    ids.add(m.environmentId);
     if (m.providers !== undefined && !(Array.isArray(m.providers) && m.providers.every((p) => typeof p === "string"))) errors.push(`entry ${i}: providers must be an array of provider ids.`);
     const projects = m.projects ?? {};
     if (typeof projects !== "object" || Array.isArray(projects) || !Object.values(projects).every((v) => typeof v === "string")) {
       errors.push(`entry ${i}: projects must map each project's canonicalKey (e.g. "github.com/owner/repo") to its project id there.`);
     }
   });
-  return errors.length ? { error: errors.join(" ") } : { list };
+  if (errors.length) return { error: errors.join(" ") };
+  return { machines: list.map((m) => ({ label: m.label, environmentId: m.environmentId, ...(Array.isArray(m.providers) ? { providers: m.providers } : {}), projects: m.projects || {} })) };
 }
 
-// Where a pick may go: this machine plus the run's boxes. Empty (no placement, runs here) without a provider
-// or without boxes; `note` says why when a run with a provider can't be found.
+// Where a pick may go: this machine plus the run's registered boxes. Empty (no placement: it runs here)
+// when the pick's run is unknown or has no boxes.
 let placesMemo;
-function runPlaces(config) {
+function runPlaces() {
   if (placesMemo) return placesMemo;
-  if (!boxProvider(config)) return (placesMemo = { envs: [] });
   const run = currentRun();
-  if (!run) return (placesMemo = { envs: [], note: "Boxes are leased per run: pass --run <runId>, or pick from the run's swarm/ branch." });
   const repo = currentRepoKey();
-  const boxes = (readLease(run)?.machines || []).filter((m) => m?.label && m?.environmentId).map((m) => {
+  const boxes = (run ? readLease(run)?.machines || [] : []).map((m) => {
     const projects = Object.fromEntries(Object.entries(m.projects || {}).map(([k, v]) => [String(k).toLowerCase(), String(v)]));
     return {
       id: String(m.environmentId), label: String(m.label), local: false,
-      registered: Boolean(m.registeredAt),
       providers: Array.isArray(m.providers) ? new Set(m.providers.map(String)) : null,
       projectId: repo ? projects[repo] || null : null,
       repo,
@@ -1418,7 +1364,7 @@ function runPlaces(config) {
 function boxSummary(e) {
   return {
     label: e.label,
-    ...(e.local ? { local: true } : { environmentId: e.id, registered: e.registered, providers: e.providers ? [...e.providers] : "any", projectHere: e.projectId || null }),
+    ...(e.local ? { local: true } : { environmentId: e.id, providers: e.providers ? [...e.providers] : "any", projectHere: e.projectId || null }),
   };
 }
 
@@ -1433,7 +1379,6 @@ function envCooldown(health, env) {
 // Why a box can't take this delegate, or null when it can. Correctness only, no policy.
 function envMisfit(health, e, { provider }) {
   if (e.local) return envCooldown(health, e) ? `cooldown:${envKey(e)}` : null;
-  if (!e.registered) return "not registered yet (boxes register)";
   if (e.providers && provider && !e.providers.has(provider)) return `provider ${provider} not signed in there`;
   if (!e.projectId) return e.repo ? `no project for ${e.repo} there` : "this checkout has no origin remote, so no project there matches it";
   const cd = envCooldown(health, e);
@@ -1445,9 +1390,11 @@ function envMisfit(health, e, { provider }) {
  * without boxes: it runs here) or { error, skipped? }.
  */
 function chooseEnvironment(config, health, { provider, place = null, batch = null }) {
-  const { envs, note } = runPlaces(config);
+  const { envs, run } = runPlaces();
   if (envs.length === 0) {
-    return place && place !== "local" ? { error: note || "This run has no boxes (boxes acquire)." } : { env: null, ...(note ? { note } : {}) };
+    return place && place !== "local"
+      ? { error: run ? `Run ${run} has no boxes registered (boxes register).` : "No run found for this pick: pass --run <runId>, or pick from the run's swarm/ branch." }
+      : { env: null };
   }
   const skipped = [];
   const eligible = [];
@@ -1475,7 +1422,7 @@ function chooseEnvironment(config, health, { provider, place = null, batch = nul
   return { env: chosen.e, ...(skipped.length ? { skipped } : {}) };
 }
 // Fold a placement into a pick: a box gets target.environmentId + projectId. `skipped` says why a box was
-// passed over, so work that stays here (not registered, project not on the box) shows.
+// passed over, so work that stays here (provider not signed in, project not on the box) shows.
 function applyPlacement(pick, env, skipped) {
   if (!env) return pick;
   if (!env.local) pick.target = { ...pick.target, environmentId: env.id, projectId: env.projectId };
@@ -1535,7 +1482,7 @@ Commands:
   board <run-id> [--since n] [--for s]     Read the board: posts, who holds which paths, open asks, contracts
   cooldown <key> [duration] [--until t]    Put a key in cooldown (default: defaults.cooldownMinutes)
   clear-cooldown <key|all>                 Clear cooldown(s)
-  boxes acquire|register|release|show --run <id>  A run's boxes: bring up, record T3 facts, let go, show
+  boxes register|show --run <id> ['<json>']  Record or show a run's boxes (from the user's box skill + T3)
 
 Cooldown keys (scope the cooldown to what actually ran out):
   <provider>:<model>   one model only, e.g. claudeAgent:claude-fable-5-2
@@ -1558,13 +1505,13 @@ Options:
                      refused until every workstream is COMPLETE and the board is settled; --force skips that)
   --place <where>    pick-worker(s): "local" (this machine), "box" (any of the run's boxes) or a box label
 
-Boxes (config "boxes": { command, count: 1, max: 2 }, the user's own box skill's provider command): the
-swarm never assumes a box exists. After init the Coordinator runs \`boxes acquire --run <id>\`; the provider
-brings the run's boxes up. Then \`boxes register --run <id> '[{ "label": "box-1", "providers": ["claudeAgent"],
-"projects": { "github.com/owner/repo": "<project id>" } }]'\` records what T3 says about each
-(orchestrator_capabilities, t3_project_list). Workers spread evenly over this machine and the run's boxes;
---place local | box | <label> pins one. A box is skipped when the picked provider isn't signed in there, this
-repo's project isn't there, or it is cooled down (\`cooldown env:box-1 30m\`). finish releases the boxes.
+Boxes: the swarm doesn't start, stop or configure them. The Coordinator gets a run's boxes from the user's own
+box skill, asks T3 what each can run (orchestrator_capabilities, t3_project_list), and registers them:
+\`boxes register --run <id> '[{ "label": "box-1", "environmentId": "<id>", "providers": ["claudeAgent"],
+"projects": { "github.com/owner/repo": "<project id>" } }]'\` (replaces the run's list). Workers spread evenly
+over this machine and the run's boxes; --place local | box | <label> pins one. A box is skipped when the
+picked provider isn't signed in there, this repo's project isn't there, or it is cooled down
+(\`cooldown env:box-1 30m\`). finish lists the run's boxes so the Coordinator releases them.
 
 Viewer (config "viewer"): { enabled: true, port: 4777 } makes init return the command that starts the
 live view (scripts/swarm-viz.mjs) for the run; finish stops it. Off by default.
@@ -1632,7 +1579,7 @@ interval progress updates during Mode 2 runs (off by default).
     }
 
     const envMatches = loaded.ok && key.startsWith("env:")
-      ? runPlaces(loaded.config).envs.filter((e) => key === envKey(e) || (e.id && key === `env:${e.id}`)).map((e) => ({ environment: e.label, remote: !e.local }))
+      ? runPlaces().envs.filter((e) => key === envKey(e) || (e.id && key === `env:${e.id}`)).map((e) => ({ environment: e.label, remote: !e.local }))
       : [];
     const affects = envMatches.length ? envMatches : loaded.ok ? entriesMatchingKey(loaded.config, key) : [];
     if (loaded.ok && affects.length === 0) {
@@ -1870,10 +1817,8 @@ interval progress updates during Mode 2 runs (off by default).
       return;
     }
     const viewerStopped = stopViewer(path.basename(fileName, ".md"));
-    // Let the run's boxes go: the provider stops what no other run still holds (unknown runs are a no-op).
-    const finishCfg = loadConfig(flags.config);
-    const provider = finishCfg.ok ? boxProvider(finishCfg.config) : null;
-    const released = provider ? runProvider(provider, "release", ["--run", path.basename(fileName, ".md")]) : null;
+    // The run's boxes, so the Coordinator lets them go through the box skill that brought them up.
+    const runBoxes = readLease(path.basename(fileName, ".md"))?.machines || [];
     ensureDir(ARCHIVE_DIR);
     const dest = path.join(ARCHIVE_DIR, path.basename(fileName));
     fs.renameSync(src, dest);
@@ -1893,7 +1838,9 @@ interval progress updates during Mode 2 runs (off by default).
       ...(companions.length ? { companions } : {}),
       ...(streamStatuses.length ? { streams: streamStatuses } : {}),
       ...(viewerStopped !== null ? { viewerStopped } : {}),
-      ...(released ? { boxesReleased: released.ok ? released.json : { ok: false, error: released.error } } : {}),
+      ...(runBoxes.length
+        ? { boxes: runBoxes.map((m) => ({ label: m.label, environmentId: m.environmentId })), next: `Release these boxes through the box skill that brought them up, for run ${path.basename(fileName, ".md")}.` }
+        : {}),
       runStatus,
       ...(runStatus !== "COMPLETE" ? { forced: true } : {}),
     });
@@ -1921,76 +1868,21 @@ interval progress updates during Mode 2 runs (off by default).
 
   const { config, configPath, configSource, projectOverridePath } = loaded;
 
-  // A run's boxes: acquire them from the provider, register what T3 says about each, release them, or show them.
+  // A run's boxes: `register` records the list the Coordinator got from the box skill and T3 (it replaces the
+  // run's list; [] clears it), `show` prints it. Starting and stopping boxes is the box skill's job.
   if (cmd === "boxes") {
     const verb = positional[1] || "show";
-    const provider = boxProvider(config);
-    const runId = typeof flags.run === "string" ? flags.run : verb === "show" ? currentRun() : null;
-    if (!["acquire", "register", "release", "show"].includes(verb)) {
-      out({ ok: false, error: "Usage: swarm.mjs boxes acquire|register|release|show --run <runId>" }, 1);
+    if (!["register", "show"].includes(verb)) {
+      out({ ok: false, error: "Usage: swarm.mjs boxes register|show --run <runId> ['<json>']. Boxes are started and stopped by the user's box skill, not the swarm." }, 1);
       return;
     }
-    if (!provider) {
-      out({ ok: false, status: "no_provider", error: "No `boxes` in config: the swarm uses no boxes and every worker runs on this machine." }, verb === "show" ? 0 : 1);
-      return;
-    }
+    const runId = typeof flags.run === "string" ? flags.run : currentRun();
     if (!runId) {
-      out({ ok: false, error: `Pass --run <runId>${verb === "show" ? " (or run this from the run's swarm/ branch)" : ""}.` }, 1);
-      return;
-    }
-    if (verb === "release") {
-      const r = runProvider(provider, "release", ["--run", runId]);
-      if (r.ok) try { fs.unlinkSync(leasePath(runId)); } catch {}
-      out(r.ok ? { ok: true, run: runId, ...r.json } : r, r.ok ? 0 : 1);
+      out({ ok: false, error: "Pass --run <runId> (or run this from the run's swarm/ branch)." }, 1);
       return;
     }
     if (!fs.existsSync(runLedgerPath(runId))) {
       out({ ok: false, error: `Run ${runId} not found in ${RUNS_DIR}: boxes belong to a run that init created.` }, 1);
-      return;
-    }
-    if (verb === "acquire") {
-      const asked = flags.count !== undefined ? parseInt(String(flags.count), 10) : provider.count;
-      if (!Number.isInteger(asked) || asked < 0) {
-        out({ ok: false, error: "--count must be an integer >= 0." }, 1);
-        return;
-      }
-      const count = Math.min(asked, provider.max);
-      if (count === 0) {
-        out({ ok: true, run: runId, asked: 0, machines: [], note: "No boxes asked for: the run stays on this machine." });
-        return;
-      }
-      // --count is "make sure this run holds N boxes": asking again tops up, it never adds N more
-      const r = runProvider(provider, "acquire", ["--run", runId, "--count", String(count)]);
-      // a provider may answer a shortfall with ok:false plus the boxes it did get: the run keeps those
-      const partial = !r.ok && Array.isArray(r.json?.machines) && r.json.machines.length > 0;
-      if (!r.ok && !partial) {
-        const { json, ...failure } = r;
-        out({ ...failure, run: runId, ...(json?.shortfall ? { shortfall: json.shortfall } : {}), hint: "The run goes on without new boxes, on this machine." }, 1);
-        return;
-      }
-      const got = (Array.isArray(r.json.machines) ? r.json.machines : [])
-        .filter((m) => m && typeof m.label === "string" && typeof m.environmentId === "string")
-        .map((m) => ({ label: m.label, environmentId: m.environmentId }));
-      // the provider's answer is the run's whole set; keep what was registered for boxes it still holds
-      withFileLock(leasePath(runId), () => {
-        const old = readLease(runId)?.machines || [];
-        atomicWriteJson(leasePath(runId), { at: new Date().toISOString(), machines: got.map((m) => ({ ...(old.find((o) => o.environmentId === m.environmentId) || {}), ...m })) });
-      });
-      const lease = readLease(runId);
-      const shortfall = Number.isInteger(r.json.shortfall) ? r.json.shortfall : Math.max(0, count - got.length);
-      const unregistered = lease.machines.filter((m) => !m.registeredAt).map((m) => m.label);
-      out({
-        ok: true,
-        run: runId,
-        asked: count,
-        ...(asked > count ? { capped: `asked for ${asked}; boxes.max is ${provider.max}` } : {}),
-        machines: lease.machines.map((m) => ({ label: m.label, environmentId: m.environmentId, registered: Boolean(m.registeredAt) })),
-        ...(shortfall ? { shortfall } : {}),
-        ...(Array.isArray(r.json.errors) && r.json.errors.length ? { errors: r.json.errors } : partial ? { errors: [r.error] } : {}),
-        next: unregistered.length
-          ? `Register ${unregistered.join(", ")}: for each, orchestrator_capabilities and t3_project_list with its environmentId, then \`boxes register --run ${runId}\` (SKILL.md: Boxes).`
-          : got.length ? "Every box is registered." : "No boxes came up: the run goes on here.",
-      });
       return;
     }
     if (verb === "register") {
@@ -2000,31 +1892,14 @@ interval progress updates during Mode 2 runs (off by default).
         out({ ok: false, error: parsed.error }, 1);
         return;
       }
-      const unknown = [];
       withFileLock(leasePath(runId), () => {
-        const lease = readLease(runId) || { machines: [] };
-        const at = new Date().toISOString();
-        for (const f of parsed.list) {
-          const m = lease.machines.find((x) => (f.environmentId && x.environmentId === f.environmentId) || (f.label && x.label === f.label));
-          if (!m) {
-            unknown.push(f.label || f.environmentId);
-            continue;
-          }
-          if (Array.isArray(f.providers)) m.providers = f.providers;
-          m.projects = f.projects || {};
-          m.registeredAt = at;
-        }
-        atomicWriteJson(leasePath(runId), lease);
+        if (parsed.machines.length) atomicWriteJson(leasePath(runId), { at: new Date().toISOString(), machines: parsed.machines });
+        else try { fs.unlinkSync(leasePath(runId)); } catch {}
       });
-      if (unknown.length) {
-        out({ ok: false, error: `Not this run's boxes: ${unknown.join(", ")}. Register only what \`boxes acquire\` returned.` }, 1);
-        return;
-      }
     }
     placesMemo = undefined;
     cliFlags = { ...cliFlags, run: runId };
-    const { envs } = runPlaces(config);
-    const boxes = envs.filter((e) => !e.local);
+    const boxes = runPlaces().envs.filter((e) => !e.local);
     const repo = currentRepoKey();
     out({
       ok: true,
@@ -2093,7 +1968,6 @@ interval progress updates during Mode 2 runs (off by default).
         selection,
         statusUpdates: resolveStatusUpdates(config),
         viewer: resolveViewer(config),
-        ...(boxProvider(config) ? { boxes: { command: boxProvider(config).argv.join(" "), count: boxProvider(config).count, max: boxProvider(config).max } } : {}),
         leads: resolvedLeads,
         workers: resolvedWorkers,
         activeCooldowns: healthRes.activeCooldowns,
@@ -2162,8 +2036,8 @@ interval progress updates during Mode 2 runs (off by default).
       activeCooldowns: healthRes.activeCooldowns,
       credits: healthRes.credits,
       statusUpdates: resolveStatusUpdates(config),
-      ...(runPlaces(config).envs.length
-        ? { boxes: { run: runPlaces(config).run, machines: runPlaces(config).envs.map((e) => ({ ...boxSummary(e), cooldown: envCooldown({ cooldowns: healthRes.activeCooldowns }, e) })) } }
+      ...(runPlaces().envs.length
+        ? { boxes: { run: runPlaces().run, machines: runPlaces().envs.map((e) => ({ ...boxSummary(e), cooldown: envCooldown({ cooldowns: healthRes.activeCooldowns }, e) })) } }
         : {}),
       recentRuns,
     });
@@ -2290,7 +2164,6 @@ ${streams.map((st) => `- ${st} | ledger: \`${streamLedgerPath(runId, st)}\` | br
         worktreeForParallelEdits,
         statusUpdates: resolveStatusUpdates(config),
         viewer: resolveViewer(config, runId),
-        ...boxesInfo(config, runId),
         git,
         integrationBranch,
       });
@@ -2313,7 +2186,6 @@ ${streams.map((st) => `- ${st} | ledger: \`${streamLedgerPath(runId, st)}\` | br
       worktreeForParallelEdits,
       statusUpdates: resolveStatusUpdates(config),
       viewer: resolveViewer(config, runId),
-      ...boxesInfo(config, runId),
       git,
       integrationBranch,
     });

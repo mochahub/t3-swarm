@@ -144,19 +144,13 @@ A single-Lead run is unchanged.
 
 ### Boxes (optional)
 
-The swarm never assumes a box exists and holds no routing policy. Starting and stopping boxes is the job of your own box skill (boat.dev, e2b, a spare computer), through a small **provider command** it ships: `acquire --run <id> --count <n>` brings boxes up and returns once T3 can reach them, and `release --run <id>` lets them go. Right after `init` the Coordinator runs `swarm.mjs boxes acquire --run <id>`, asks T3 what's signed in on each box and which projects it has, and records that with `swarm.mjs boxes register`. A box's project for this repo is matched by the repo's `origin`.
+The swarm never starts, stops or configures a box, and holds no routing policy. Boxes come from your own box skill (boat.dev, e2b, a spare computer). When a run has work for them, the Coordinator asks that skill for the run's boxes, asks T3 what's signed in on each and which projects it has, and records that with `swarm.mjs boxes register`. A box's project for this repo is matched by the repo's `origin`. There's nothing to configure.
 
 - Workers spread evenly over this machine and the run's boxes; a Lead pins one with `--place local`, `--place box` or `--place box-1`. Leads stay on this machine.
 - A box is skipped only when the picked provider isn't signed in there, this repo's project isn't there, or it is cooled down (`cooldown env:box-1 30m`). `placement.skipped` says which.
-- A run uses only its own boxes, and `finish` releases them.
+- A run uses only its own boxes. `finish` lists them, and the Coordinator releases them through the box skill.
 - T3 runs a task on a box in that box's own checkout (no worktree isolation there), so each box worker makes its own worktree from `origin`, pushes its branch back, and the Lead fetches it before merging.
 - Project rules, such as which work must stay on this machine, belong in the repo's `AGENTS.md`, which every agent reads.
-
-Config names the provider, from your global config only (a repo's `.t3-swarm.json` can't). Without it there are no boxes.
-
-```json
-"boxes": { "command": "~/.agents/skills/<your box skill>/swarm-provider", "count": 1, "max": 2 }
-```
 
 ### Live view
 
@@ -262,9 +256,9 @@ node "$SCRIPT" pick-worker balanced:medium
 # Pick a parallel wave of workers in one call, weighting the active Lead's bucket down (Mode 2)
 node "$SCRIPT" pick-workers heavy:high balanced:medium fast:low --avoid codex
 
-# Boxes: the box provider brings the run's boxes up; record what T3 says about each; workers spread over them
-node "$SCRIPT" boxes acquire --run <run-id>
-node "$SCRIPT" boxes register --run <run-id> '[{"label":"box-1","providers":["claudeAgent","codex"],"projects":{"github.com/owner/my-app":"<project id>"}}]'
+# Boxes: record the boxes your box skill brought up for this run, with what T3 says about each
+node "$SCRIPT" boxes register --run <run-id> '[{"label":"box-1","environmentId":"<id>","providers":["claudeAgent","codex"],"projects":{"github.com/owner/my-app":"<project id>"}}]'
+node "$SCRIPT" boxes show --run <run-id>
 node "$SCRIPT" pick-worker fast --place local            # work that must run on this machine
 node "$SCRIPT" cooldown env:box-1 30m                    # skip a box that stopped answering
 

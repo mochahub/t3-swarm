@@ -48,7 +48,7 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
    - **Optional periodic status updates (`statusUpdates`):** Off by default (`{ "enabled": false, "intervalMinutes": 15 }`). Ask if the user wants automatic T3 interval check-ins during long Mode 2 runs (e.g. every 15 minutes); if yes, set `enabled: true` and their chosen `intervalMinutes` (10–15m recommended).
    - **Optional `scriptPath`:** Record the resolved path to `t3-swarm/scripts/swarm.mjs` in `config.json` if helpful for non-Antigravity harnesses.
    - **Optional live view (`viewer`):** off by default. Ask whether Mode 2 runs should start the live graph (`scripts/swarm-viz.mjs`, a local web page); if yes, `{ "enabled": true, "port": 4777 }`.
-   - **Optional boxes (`boxes`):** only if the user has a box skill that ships a t3-swarm provider command (its docs say so): `{ "command": "<that path>", "count": 1, "max": 2 }`. `count` is boxes per run (`0` = none unless the Coordinator asks), `max` the most one run may hold. Ask the user; boxes may be billed. Don't list boxes or routing rules: each run gets its own boxes from the provider.
+   - **No boxes here.** Remote machines aren't configured in the swarm: a run's boxes come from the user's own box skill, which the Coordinator uses at run time.
 
 3. **Confirm with the user in 1 turn:**
    Show a compact table with:
@@ -57,7 +57,7 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
    - Quota weights per bucket and the lead selection mode
    - Key defaults (`leadDepth: high`, `workerDepth: medium`, `cooldownMinutes: 60`, `maxWorkerLoops: 2`, `maxParallelWorkers: 4`, `antiCannibalization: true`, `leadFallbackToHeavy: true`, `allowProjectOverride: false`, `statusUpdates: off`)
    - Any billing-bucket or `serviceTier` question for multi-provider harnesses.
-   - The live view (on/off) and the box provider (command, count, max), if any.
+   - The live view (on/off).
 
 4. **Write & verify:**
    - Write `~/.t3/swarm/config.json` (creating `~/.t3/swarm/` if needed).
@@ -67,5 +67,4 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
      node "<path-to-swarm.mjs>" pick-lead
      node "<path-to-swarm.mjs>" pick-workers heavy:high balanced:medium fast:low
      ```
-   - With a box provider, check it once on a throwaway run: `init`, `boxes acquire --run <id> --count 1`, then `finish <id> --force` (it releases the box).
    - Verify `doctor` reports `"ok": true`, `"writable": true`, zero errors, and the expected resolved `bucket` for every entry. Fix any warning that every lead shares one bucket, and any `weights` error (a misspelled bucket key would silently leave that bucket at weight 1).
