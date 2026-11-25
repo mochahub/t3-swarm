@@ -860,6 +860,9 @@ function resolveViewer(config, runId = null) {
     enabled: true,
     port,
     start: `node "${VIZ_PATH}" --detach --root "<first Lead's childThreadId>" --port ${port}${runId ? ` --run ${runId}` : ""}`,
+    ...(runId
+      ? { next: "Run `start` after dispatching the first Lead, automatically open the returned port in a T3 preview tab (`preview_open`), and always show the returned `url` to the user in your reply." }
+      : {}),
   };
 }
 function validateViewer(config, errors) {

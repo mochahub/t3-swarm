@@ -154,7 +154,7 @@ The swarm never starts, stops or configures a box, and holds no routing policy. 
 
 ### Live view
 
-Off by default. With `"viewer": { "enabled": true }` in config, the Coordinator starts a live graph of each Mode 2 run at `http://127.0.0.1:4777` (the next free port if that one is taken) and opens it in a T3 preview tab; `finish` stops it. It reads T3's local state read-only and shows:
+Off by default. With `"viewer": { "enabled": true }` in config, the Coordinator starts a live graph of each Mode 2 run at `http://127.0.0.1:4777` (the next free port if that one is taken), automatically opens it in a T3 preview tab, and always shows the URL in its reply; `finish` stops it. It reads T3's local state read-only and shows:
 
 - each agent's status and current command;
 - messages moving between agents, including between Leads;

@@ -14,7 +14,7 @@
  *   --port    first port to try; the next free one (up to +10) is used when it is taken.
  *   --run     the swarm run: writes runs/<runId>.viz.pid so `swarm.mjs finish` stops this viewer, and exits
  *             on its own once the run's ledger is archived.
- *   --detach  start in the background, print {"ok","url","pid"} once it is listening, and return.
+ *   --detach  start in the background, print {"ok","url","port","pid"} once it is listening, and return.
  * Machines are named by their T3 link labels.
  *
  * The DB schema is T3-internal and unversioned: every query lives in the "T3 adapter"
@@ -66,7 +66,15 @@ if (argv.includes("--detach")) {
   while (Date.now() < deadline && child.exitCode === null) {
     const m = /swarm-viz: (http:\/\/\S+)/.exec(fs.readFileSync(logPath, "utf8"));
     if (m) {
-      console.log(JSON.stringify({ ok: true, url: m[1], pid: child.pid, log: logPath }));
+      const port = Number(new URL(m[1]).port);
+      console.log(JSON.stringify({
+        ok: true,
+        url: m[1],
+        port,
+        pid: child.pid,
+        log: logPath,
+        next: `Open in a T3 preview tab with preview_open({ target: { kind: "environment-port", port: ${port} } }) (leave it open for the user; skip if unavailable) and always show ${m[1]} to the user in your reply.`,
+      }));
       process.exit(0);
     }
     await new Promise((r) => setTimeout(r, 150));
