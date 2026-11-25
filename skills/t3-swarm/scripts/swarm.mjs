@@ -851,15 +851,14 @@ function validateBoxes(config, errors, warnings) {
 
 // Live viewer (scripts/swarm-viz.mjs): off unless config turns it on with `viewer: { enabled: true }`.
 const VIZ_PATH = path.join(path.dirname(SCRIPT_PATH), "swarm-viz.mjs");
-const DEFAULT_VIEWER_PORT = 4777;
 function resolveViewer(config, runId = null) {
   const v = config.viewer;
   if (!v || typeof v !== "object" || v.enabled !== true) return { enabled: false };
-  const port = Number.isInteger(v.port) ? v.port : DEFAULT_VIEWER_PORT;
+  const port = Number.isInteger(v.port) ? v.port : null;
   return {
     enabled: true,
-    port,
-    start: `node "${VIZ_PATH}" --detach --root "<first Lead's childThreadId>" --port ${port}${runId ? ` --run ${runId}` : ""}`,
+    ...(port !== null ? { port } : {}),
+    start: `node "${VIZ_PATH}" --detach --root "<first Lead's childThreadId>"${port !== null ? ` --port ${port}` : ""}${runId ? ` --run ${runId}` : ""}`,
     ...(runId
       ? { next: "Run `start` after dispatching the first Lead, automatically open the returned port in a T3 preview tab (`preview_open`), and always show the returned `url` to the user in your reply." }
       : {}),
@@ -868,9 +867,9 @@ function resolveViewer(config, runId = null) {
 function validateViewer(config, errors) {
   const v = config.viewer;
   if (v === undefined) return;
-  if (!v || typeof v !== "object" || Array.isArray(v)) return errors.push("`viewer` must be an object: { enabled: true, port: 4777 }.");
+  if (!v || typeof v !== "object" || Array.isArray(v)) return errors.push("`viewer` must be an object: { enabled: true }.");
   if (v.enabled !== undefined && typeof v.enabled !== "boolean") errors.push("viewer.enabled must be true or false.");
-  if (v.port !== undefined && !(Number.isInteger(v.port) && v.port >= 1024 && v.port <= 65535)) errors.push("viewer.port must be an integer from 1024 to 65535.");
+  if (v.port !== undefined && !(Number.isInteger(v.port) && (v.port === 0 || (v.port >= 1024 && v.port <= 65535)))) errors.push("viewer.port must be 0 or an integer from 1024 to 65535.");
 }
 // Stop a run's viewer (finish): its pidfile names the process; check it is ours before signalling.
 function stopViewer(runId) {
@@ -1516,8 +1515,8 @@ over this machine and the run's boxes; --place local | box | <label> pins one. A
 picked provider isn't signed in there, this repo's project isn't there, or it is cooled down
 (\`cooldown env:box-1 30m\`). finish lists the run's boxes so the Coordinator releases them.
 
-Viewer (config "viewer"): { enabled: true, port: 4777 } makes init return the command that starts the
-live view (scripts/swarm-viz.mjs) for the run; finish stops it. Off by default.
+Viewer (config "viewer"): { enabled: true } (optional "port" for starting port; 0 = OS-assigned) makes init
+return the command that starts the live view (scripts/swarm-viz.mjs) for the run; finish stops it. Off by default.
 
 Weights (config "weights"): buckets {bucket: n} sets each quota bucket's share of work (default 1; 0 =
 only when nothing else is available); a per-entry "weight" overrides one model in one tier.

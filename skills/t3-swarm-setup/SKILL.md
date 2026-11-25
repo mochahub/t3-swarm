@@ -47,7 +47,7 @@ Generate (or update) `~/.t3/swarm/config.json` tailored to the user's **actually
      - When one model in a provider supports deeper thinking than siblings (e.g. `gemini-4-neon` supports `xhigh` while `gemini-4-argon` stops at `high`), put the safe lower cap in `providers.<id>.depthMap` and add a per-model `"depthMap"` override.
    - **Optional periodic status updates (`statusUpdates`):** Off by default (`{ "enabled": false, "intervalMinutes": 15 }`). Ask if the user wants automatic T3 interval check-ins during long Mode 2 runs (e.g. every 15 minutes); if yes, set `enabled: true` and their chosen `intervalMinutes` (10–15m recommended).
    - **Optional `scriptPath`:** Record the resolved path to `t3-swarm/scripts/swarm.mjs` in `config.json` if helpful for non-Antigravity harnesses.
-   - **Optional live view (`viewer`):** off by default. Ask whether Mode 2 runs should start the live graph (`scripts/swarm-viz.mjs`, a local web page); if yes, `{ "enabled": true, "port": 4777 }`.
+   - **Optional live view (`viewer`):** off by default. Ask whether Mode 2 runs should start the live graph (`scripts/swarm-viz.mjs`, a local web page); if yes, `{ "enabled": true }` (each concurrent swarm automatically picks the next free port; optional `"port"` overrides the starting port).
    - **No boxes here.** Remote machines aren't configured in the swarm: a run's boxes come from the user's own box skill, which the Coordinator uses at run time.
 
 3. **Confirm with the user in 1 turn:**

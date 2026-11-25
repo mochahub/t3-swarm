@@ -11,7 +11,7 @@
  * Usage: node swarm-viz.mjs [--root <threadId>] [--port 4777] [--run <runId>] [--detach] [--db <path>] [--interval 1000]
  *   --root    any thread of the run (the Coordinator's, or a Lead's childThreadId); the view starts at its
  *             root. Defaults to the root of the most recently updated subagent thread.
- *   --port    first port to try; the next free one (up to +10) is used when it is taken.
+ *   --port    first port to try (default 4777; 0 for OS-assigned); picks the next free port when taken.
  *   --run     the swarm run: writes runs/<runId>.viz.pid so `swarm.mjs finish` stops this viewer, and exits
  *             on its own once the run's ledger is archived.
  *   --detach  start in the background, print {"ok","url","port","pid"} once it is listening, and return.
@@ -742,14 +742,21 @@ events.sort((a, b) => (a.ts || "").localeCompare(b.ts || "")).forEach((e, i) => 
 setInterval(loop, INTERVAL);
 let port = FIRST_PORT;
 server.on("error", (err) => {
-  if (err.code === "EADDRINUSE" && port < FIRST_PORT + 10) return server.listen(++port, "127.0.0.1");
+  if (err.code === "EADDRINUSE") {
+    if (port > 0 && port < FIRST_PORT + 50) return server.listen(++port, "127.0.0.1");
+    if (port !== 0) {
+      port = 0;
+      return server.listen(0, "127.0.0.1");
+    }
+  }
   console.error(`swarm-viz: ${err.message}`);
   process.exit(1);
 });
 server.on("listening", () => {
-  const url = `http://127.0.0.1:${port}`;
+  const boundPort = server.address().port;
+  const url = `http://127.0.0.1:${boundPort}`;
   if (PID_FILE) {
-    try { fs.writeFileSync(PID_FILE, JSON.stringify({ pid: process.pid, port, url, root: ROOT }) + "\n"); } catch {}
+    try { fs.writeFileSync(PID_FILE, JSON.stringify({ pid: process.pid, port: boundPort, url, root: ROOT }) + "\n"); } catch {}
   }
   console.log(`swarm-viz: ${url}  root=${ROOT}  nodes=${nodes.size}  events=${events.length}`);
 });
