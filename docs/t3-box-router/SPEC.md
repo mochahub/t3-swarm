@@ -65,7 +65,7 @@ capacity. The findings surfaced no file return tool.
 
 | Fact or operation | Owner | Interface for other components |
 | --- | --- | --- |
-| Inventory, tags, priority, weight and policy caps | Router `config.json` | Read through `list`. |
+| Inventory, tags, priority and capacity | Router `config.json` | Read through `list`. |
 | Link state and access, eligible providers and project IDs | T3 | Router caches observations. Swarm consumes a run snapshot through `register-payload`. |
 | Derived machine health and machine cooldowns | Router `state.json` | Callers report health events. Level 0 has the temporary duplication described below. |
 | Slots and run leases | Router `state.json` | Router commands acquire, expire and release them. |
@@ -78,7 +78,7 @@ capacity. The findings surfaced no file return tool.
 
 | Existing location | Level 0 | Level 1 with a router configured |
 | --- | --- | --- |
-| `<runId>.boxes.json` | Same swarm file and schema. Write the router-generated snapshot through `boxes register`. Keep it replaceable, without hand edits. | Keep the compatibility snapshot, including for swarm without a router. Router owns any placement weights. |
+| `<runId>.boxes.json` | Same swarm file and schema. Write the router-generated snapshot through `boxes register`. Keep it replaceable, without hand edits. | Keep the compatibility snapshot, including for swarm without a router. Router owns placement policy. |
 | `health.cooldowns["env:<label>"]` | Swarm reads its environment cooldowns, including exact IDs. The Lead mirrors an outage to the router. | Forward machine cooldown operations. Read machine health from the router. |
 | `health.credits.envs` | Every pick is pinned, so the credits have no say in which machine wins. | Remove these credits from the configured path. Keep legacy selection when no router is configured. |
 
@@ -116,7 +116,7 @@ box-router policy-line --run "$run_id"
 ```
 
 Take `run_id` from init. On a cold cache, `acquire` nominates candidates in `needsObservation` before it leases
-them. For each candidate the Coordinator uses `orchestrator_capabilities` and `t3_project_list` with its
+them. That first call answers `ok: false` and exits nonzero, which is expected. For each candidate the Coordinator uses `orchestrator_capabilities` and `t3_project_list` with its
 `environmentId`. Follow `nextCursor` and feed each complete project list and the provider reply to `observe`. Use
 fresh CLI or agent-supplied link data as well. Retry acquisition after the reads. On a warm cache, the first
 acquisition can succeed and fresh replies can go directly to registration. This preserves the per-box reads and
@@ -130,9 +130,38 @@ instruct. If registration fails, resolve it or run locally. The proposed `regist
 success to fit swarm's stdin interface, and a JSON error object on failure. The separate commands above let the
 Coordinator check the generator's exit code before registering.
 
-Put the generated policy in the run ledger's Boundaries before dispatching Leads. It includes the script path, the
-run ID, task tags, the wave and slot rules below, the health mirror, and the requirement to release unused slots.
-Leads always run on the Coordinator's machine (S:2269).
+Put the generated policy in the run ledger's Boundaries (and in each workstream ledger) before dispatching Leads.
+Leads always run on the Coordinator's machine (S:2269). `policy-line` renders text like this from config, with the
+script path, run ID and cap filled in:
+
+```text
+Box routing (t3-box-router). Where this differs from the Lead brief, this wins.
+- Place first, then pick. For every worker and every gate:
+  node <router-script> place --run <runId> --count <n> [--needs <tags>]
+  Pass each returned label to swarm as --place <label> (--place local for a local placement).
+  No unpinned picks and no --place box in this run: they bypass the router and book no slot.
+- The wave cap of <maxParallel> covers local placements. Box placements are bounded by the router's slots: pick
+  them in their own call per label, with --force-wave when a box's share is larger than the cap.
+- Append each placement's briefAddendum to that worker's task. When the worker returns, or the dispatch fails:
+  node <router-script> done --slot <slotId> --outcome ok|failed|unreachable
+- Box lost: task_cancel first. Then swarm.mjs cooldown env:<label> 30m AND done --outcome unreachable
+  (or report <label> unreachable when you hold no slot there). Clearing a cooldown also needs both stores.
+- place answers needsObservation: if it asks only for t3_environment_links, make that read-only call and pipe
+  the reply to observe. For anything else, place on another machine or locally and note it for the Coordinator.
+- Needs that keep work on this machine in this repo: <tags from config, e.g. ios-sim, xcode>.
+```
+
+Two lines of the Lead brief are overridden on purpose, and the spec does not hide that. The brief tells a Lead to
+pick without a pin (`lead-brief.md` line 22) and to send gates with `--place box` (line 30). Both let swarm choose
+the box from its own credits (S:1418–1422) and book no router slot. The brief also caps a wave at one number for
+all machines (lines 11 and 21) and never mentions `--force-wave`. The Lead runs under the unchanged brief, so the
+policy text has to say in so many words that it wins. The surveyed hand-built setup already works this way: its
+Coordinator writes a "box first" paragraph into Boundaries that tells Leads to pick box workers in their own
+`--place box` calls with `--force-wave`.
+
+**Known Level 0 gap.** Swarm cannot enforce a pin. A Lead that loses the Boundaries text after a compaction, or
+skips it, can make an unpinned pick. That pick lands on a box through swarm's even spread and the router never
+counts it. Slots are advisory, so nothing breaks, but the box can exceed its cap. Only Level 1 closes this.
 
 **Lead.** Group a wave by needs, then group returned slots by label for picking. The example assumes six tasks with
 the same needs, six available remote slots, and a swarm cap of four.
@@ -151,7 +180,8 @@ swarm pick-worker balanced:low --config "$swarm_config" --run "$run_id" --place 
 Call router `place` without `--provider` here. Swarm normally picks a model before a machine (S:1074, S:1096). With
 a pin, swarm already filters models whose providers cannot run on the pinned machine (S:1025–1032). Its target
 carries the chosen model and, for a box, the observed environment and project IDs. Dispatch with that target and
-append the router's worktree instructions to the worker's task. Use one slot per dispatch, including gates. If a
+append the router's worktree instructions to the worker's task. Use one slot per dispatch, including gates: where
+the brief says `pick-worker balanced:low --place box`, run `place --place box` first and pin the label it returns. If a
 whole `pick-workers` group fails, release each undispatched slot from that group with `done --outcome failed`. This
 outcome frees accounting without blaming the machine. Re-place only after resolving the eligibility or policy
 issue.
@@ -159,7 +189,8 @@ issue.
 `pick-workers` has one `--place` flag for the call. All specs, including box specs, count toward the per-call
 `defaults.maxParallelWorkers` cap (default 4). Single `pick-worker` has no cap. Group picks by label and use
 `--force-wave` only for box groups that exceed the cap. Keep local work within the Lead's ledger wave allowance as
-well as the router's local slots. This lets remote shares add to the Coordinator's local allowance. The per-stream
+well as the router's local slots. This lets remote shares add to the Coordinator's local allowance, which is the
+decision here: the wave cap exists to protect the Coordinator's machine, and a box has its own cap. The per-stream
 shares in the ledger are advisory. Swarm applies its per-bucket soft cap within each pick call. Global router slots
 bound parallel placements even when several Leads or runs route to the same box from this installation.
 
@@ -178,6 +209,11 @@ longer cooldown, release the undispatched slot, read the effective duration from
 the router before placing again. Two stores hold the same outage fact in Level 0. The router never reads swarm's
 private health file.
 
+Clearing is the other half of the seam. A manual clear in one store leaves the other cooling, and the mirror rule
+above would then copy the stale cooldown back. So at Level 0 a manual clear goes to both: `box-router
+clear-cooldown home-box`, and `swarm clear-cooldown` for `env:home-box` and for `env:<environmentId>` if that key
+was used (swarm matches either, S:1374–1380). Level 1 removes both halves of the seam.
+
 **Coordinator cleanup.** After the run reaches its terminal state, archive it and release using the saved run ID.
 `finish` returns `boxes` and `next` when boxes were registered. Release also applies when swarm had no snapshot but
 the router acquired a lease.
@@ -192,8 +228,9 @@ box-router release --run "$run_id"
 Add a swarm config key `boxRouter` naming the script. Swarm validates the pick request and asks the router for the
 wave's placements before entering `withHealth`. It passes `--count`, the run ID, and the caller's `--place` and
 `--needs` when supplied. Feed each result into the existing pick path as that spec's pin. Retain the target and
-placement shape and carry router reasons in `placement.skipped`. Continue to use `tier[:depth]` for the model spec.
-`parseSpec` explicitly removed tags from that syntax.
+placement shape and carry router reasons in `placement.skipped`. Swarm names the machine `environment` there
+(`placement.environment`, `skipped[].environment`); the router's `label` maps to it. Continue to use `tier[:depth]`
+for the model spec. `parseSpec` explicitly removed tags from that syntax.
 
 The existing lock waits 3 seconds and treats an older-than-10-second lock as stale. An external call under the lock
 could time out another pick or allow two writers. Keep router calls, including slot rollback, outside it. Apply the
@@ -212,7 +249,7 @@ module.
 | Swarm change area | Functions, paths and references |
 | --- | --- |
 | Discover and validate the router | `loadConfig`, `validateConfig` and `validateBoxes` (S:273–365, S:759–850). The existing ignored keys are `environments`, `machines`, `placement` and `boxes`. |
-| Place before the health lock | The `pick-worker` and `pick-workers` handlers (S:2314–2398), `withHealth` (S:220–234) and `selectOneWorker` (S:990–1103). Keep the existing provider pre-filter and per-spec pin. |
+| Place before the health lock | The `pick-worker` and `pick-workers` handlers (S:2316–2400), `withHealth` (S:220–234) and `selectOneWorker` (S:990–1103). Keep the existing provider pre-filter and per-spec pin. |
 | Keep placement compatible | `runPlaces`, `chooseEnvironment` and `applyPlacement` (S:1351–1365, S:1394–1436). Preserve registration, pass through reasons, and bypass unpinned environment ranking in the configured path. |
 | Move environment health | `envCooldown`, `envMisfit`, cooldown and clear handlers, health initialization and expiry, and status display (S:161, S:188–216, S:1374–1388, S:1536–1647, S:2041–2043). |
 | Document setup and selection | Swarm `SKILL.md` lines 150, 154, 157 and 162, `references/lead-brief.md` lines 21, 25 and 30, setup `SKILL.md` line 51, docs README lines 152–158 and 272, and CLI help S:1510–1516. |
@@ -235,7 +272,26 @@ Run `box-router place --needs linux --provider '<providerInstanceId>'`. Omit `--
 provider. In that case choose a supported provider from the result before dispatch, or return the unused slot and
 retry with a specific provider. The router computes the repo key from `git remote get-url origin`, matching swarm's
 `canonicalRepoKey`. If the base is already pushed, pass `--base <branch>` and `--branch <worker-branch>` to fill in
-the handoff. A remote result looks like this.
+the handoff.
+
+| `place` flag | Phase | Meaning |
+| --- | --- | --- |
+| `--needs a,b` | 1 | Hard tags. A machine without all of them is filtered. |
+| `--prefers a,b` | 1 | Soft tags. A tie-break inside the winning priority tier. |
+| `--provider <providerInstanceId>` | 1 | Only machines where this provider can run a child task. |
+| `--place local\|box\|<label>` | 1 | Restrict to this machine, to any remote box, or to one label. |
+| `--run <runId>` | 1 | Restrict remote candidates to that run's lease, and renew the lease. |
+| `--count <n>` | 1 | Book up to `n` placements in one call. |
+| `--base <branch>`, `--branch <worker-branch>` | 1 | Fill the branch names into `briefAddendum`. |
+| `--affinity <key>` | 2 | Prefer the machine that last served this key, to reuse a worktree and caches. |
+| `--kind <name>`, `--read-only` | 2 | Task kind for repo `localOnlyKinds`; allow a `read-only` link for work that writes nothing. |
+
+`--base`, `--branch` and the configured `worktreeRoot` end up inside a shell line that the worker runs on the box.
+The router therefore rejects, before booking anything, a branch that fails `git check-ref-format --branch` or
+contains a character outside `A-Z a-z 0-9 . _ / -`, and a `worktreeRoot` outside that set plus a leading `~`.
+`worktreeRoot` comes from the user's config only, never from a repo file.
+
+A remote result looks like this.
 
 ```json
 {
@@ -275,8 +331,9 @@ the handoff. A remote result looks like this.
 | `placement.skipped[].reason` | Reason the machine was skipped. |
 | `briefAddendum` | Text to append to the worker brief, including the base and worktree instructions. |
 
-A local result keeps the caller's T3 target unchanged. Local inherits the current project context, so a registered
-remote project and link are unnecessary. The router still accounts for a local slot.
+A local result keeps the caller's T3 target unchanged. Local inherits the current project context, so it needs no
+link, no project and no provider observation: the caller is already running there, and it never answers
+`needsObservation`. `placement.providers` is omitted for local. The router still accounts for a local slot.
 
 ```json
 {
@@ -285,7 +342,6 @@ remote project and link are unnecessary. The router still accounts for a local s
   "placement": {
     "label": "local",
     "remote": false,
-    "providers": ["<providerInstanceId>"],
     "slot": { "id": "<slotId>", "expiresAt": "2030-01-01T13:00:00Z" },
     "why": "Local provides ios-sim and has a free slot.",
     "skipped": [{ "label": "home-box", "reason": "Missing required tag ios-sim." }]
@@ -301,7 +357,6 @@ remote project and link are unnecessary. The router still accounts for a local s
 | `placement` | Local placement metadata. |
 | `placement.label` | Reserved label `local`. |
 | `placement.remote` | False on the caller's machine. |
-| `placement.providers` | Observed eligible local provider IDs. |
 | `placement.slot` | Local capacity booking. |
 | `placement.slot.id` | Handle returned to `done`. |
 | `placement.slot.expiresAt` | End of the booking. |
@@ -360,12 +415,53 @@ the links itself, the request can omit that read.
 | `needsObservation.calls[].args.environmentId` | Queried environment on tools that accept it. |
 | `needsObservation.observe` | Router command to receive the results on stdin. |
 
+`needsObservation.calls[].tool` is only ever one of three read-only tools: `t3_environment_links`,
+`orchestrator_capabilities`, `t3_project_list`. The skill tells the agent to ignore any other name, so a tampered
+state file cannot turn this field into a way to make the agent call something else.
+
 For each call, give `observe` a record with its `tool`, `args`, and a `pages` array of raw tool replies, one for a
-non-paginated call. Send the records as one JSON array. Complete the `t3_project_list` pagination with `nextCursor`
-before supplying the project record, so a missing first-page project never counts as a negative. For local
-providers, call `orchestrator_capabilities` without an `environmentId`. The router timestamps receipt, extracts
-only the necessary fields, and re-evaluates on the next `place`. If a T3 read fails, report it to the caller as
-missing evidence. The caller can still ask to place explicitly on a known eligible machine.
+non-paginated call. Send the records as one JSON array on stdin. Complete the `t3_project_list` pagination with
+`nextCursor` before supplying the project record.
+
+```json
+[
+  {
+    "tool": "t3_environment_links",
+    "args": {},
+    "pages": [
+      { "links": [{ "environmentId": "<environmentId>", "label": "home-box", "status": "reachable", "access": "full-access", "expiresAt": "2030-02-01T00:00:00Z", "lastError": null }] }
+    ]
+  },
+  {
+    "tool": "orchestrator_capabilities",
+    "args": { "environmentId": "<environmentId>" },
+    "pages": [
+      { "providers": [{ "providerInstanceId": "<providerInstanceId>", "canRunChildTask": true }] }
+    ]
+  },
+  {
+    "tool": "t3_project_list",
+    "args": { "environmentId": "<environmentId>" },
+    "pages": [
+      { "projects": [{ "id": "<projectId>", "repositoryIdentity": { "canonicalKey": "github.com/owner/repo" }, "archivedAt": null, "deletedAt": null }], "nextCursor": 1 },
+      { "projects": [] }
+    ]
+  }
+]
+```
+
+| Tool | What the router keeps | Matched to a machine by |
+| --- | --- | --- |
+| `t3_environment_links` | Per link: `status`, `access`, `expiresAt`, and whether `lastError` is set. | `links[].environmentId` equal to a configured `environmentId`. Unknown links are ignored (`discover` is what proposes them). |
+| `orchestrator_capabilities` | `providers[].providerInstanceId` where `canRunChildTask` is true. | `args.environmentId`. |
+| `t3_project_list` | A map from `repositoryIdentity.canonicalKey` (lowercased) to `id`, skipping projects whose `archivedAt` or `deletedAt` is set. | `args.environmentId`. |
+
+Everything else in the replies is discarded, so model lists, paths and titles never reach the state file. `observe`
+answers `{ "ok": true, "updated": ["home-box"] }` with the labels it refreshed, or `ok: false` with the record it
+could not read. The router timestamps receipt and re-evaluates on the next `place`. T3 says of the project list
+that "Pages can shift", so a project missing from a complete read is reported as "no project observed for this
+repo" with a hint to read once more, not as proof that the box lacks it. If a T3 read fails, report it to the
+caller as missing evidence. The caller can still ask to place explicitly on a known eligible machine.
 
 ### Step 2 · Delegate
 
@@ -398,8 +494,11 @@ Lead's T3 audit did not rerun that test, so Phase 1 uses the documented manual w
 ### Step 3 · Return the slot
 
 Once the tool reports completion, or a dispatch attempt fails, run `box-router done --slot '<slotId>' --outcome
-ok`. Use `failed` for task or dispatch failures unrelated to machine reachability, and `unreachable` when the
-machine is lost. For an active lost task, cancel first.
+ok`. Use `failed` for task or dispatch failures unrelated to machine reachability: it frees this slot and leaves
+the machine's health alone. Use `unreachable` when the machine is lost: it is exactly `report <label> unreachable`
+for the slot's machine, so it frees every slot there and starts the cooldown, and it takes the same
+`--min-cooldown`. `report` exists for the caller that holds no slot on the lost machine. For an active lost task,
+cancel first.
 
 ```json
 {
@@ -424,7 +523,7 @@ devices, tools, resources and credential presence. Examples include `linux`, `ma
 `godot`, `android-sdk`, `xcode`, `ios-sim`, `android-emu`, `signed-in-browser` and `secret:<name>`. Local-only work
 can require a tag only local provides or take an explicit local pin where repo rules demand it.
 
-Local is always present with tags, priority, weight and capacity. Obtain its OS and architecture from Node's `os`.
+Local is always present with tags, priority and capacity. Obtain its OS and architecture from Node's `os`.
 An always-on box has a stable T3 environment ID in config. An ephemeral box is a leased driver instance with the
 lowest priority tier. A user may associate a machine with a device host. Use `device_list` and
 `hosts[].platforms[].available` to suggest `ios-sim` and `android-emu` for that host. Its `hostId` and a linked
@@ -441,38 +540,44 @@ uniqueness within one registration.
 
 1. **Filter.** A remote requires a fresh, `reachable` link with enough time
    remaining, an eligible provider, a matching project and link access
-   suitable for the task. An edit task cannot use a `read-only` link.
-   Require all `needs`, enforce active cooldowns, capacity and exclusive tags,
+   suitable for the task. Phase 1 skips a box whose link `access` is
+   `read-only`. That reading of `access` is inferred from the field's
+   name and the link tool's access enum; it has not been tested, and
+   neither has how an `approval-required` link behaves for an unattended
+   child. Require all `needs`, enforce active cooldowns, capacity and exclusive tags,
    and apply trusted or narrowing project restrictions. Respect
    `--place local|box|<label>`. With `--run`, require a current lease for
    each remote. Local remains available to the run, subject to its own
    filters. With `--provider`, require that specific provider. Without it,
    require an eligible provider set and return it. Give each rejected machine
-   an actionable reason. A default edit intent can be narrowed with
-   `--read-only` for work with no writes.
+   an actionable reason.
 2. **Choose the highest eligible priority tier.** A full box drops out
    before priority is compared. Lower tiers take overflow. Ephemeral boxes
    always rank below eligible always-on or local machines.
-3. **Share work within that tier.** Use smooth weighted round-robin as in
-   swarm's `swrrPick`. Add each eligible machine's effective weight to its
-   credit, select the highest credit and deduct the sum of the tier's
-   effective weights from the winner. Resolve ties by label. Multiply
-   configured weights by a bounded factor for preferred tag matches and
-   recent affinity, and by 0.5 for degraded health. Affinity is an expiring
-   hint for worktree or cache reuse, within the current eligible tier.
+3. **Choose within that tier.** In Phase 1 this is a plain ordering with
+   no stored state: `ready` before `degraded`; then more `--prefers` tags
+   matched; then the lowest load, `activeSlots / maxConcurrent`; then
+   label. Capacity is the weight: two boxes in one tier with caps 6 and 2
+   fill three to one without anyone configuring a share.
 4. **Take a slot.** Commit the choice and its expiry together under the
    state lock. Evaluate capacity and exclusions again against current
    state before taking the slot. Return the slot and decision reasons.
 
-For Phase 1, use a preference multiplier of 1.25 per matched tag, capped at 2, and an affinity multiplier of 1.25
-for the most recent matching repo-and-key placement. These are router defaults, with behavior tested against
-representative routes. Persist the credits so separate calls share work. Expire affinity and prune stale credits.
-Changing preferences changes the effective share gradually. Priority still wins across tiers.
+**Weights and affinity are designed here and built in Phase 2, if they are needed.** For one to five machines,
+priority plus capacity plus least-loaded already gives "box first until full, then local" and a deterministic,
+explainable spread. If real use shows that capacity is the wrong proxy for share (a big box that should still take
+only a little of one repo's work), Phase 2 replaces step 3's load ordering with smooth weighted round-robin, the
+algorithm swarm's `swrrPick` uses, so there is one mental model: add each eligible machine's effective weight to its
+credit, pick the highest credit, deduct the tier's total from the winner, break ties by label. The effective weight
+is the configured `weight`, times 1.25 per matched preferred tag (capped at 2), times 1.25 when `--affinity <key>`
+matches that repo's most recent placement, times 0.5 when `degraded`. Credits and affinity then persist in state
+and expire. Priority still wins across tiers. The config and state examples below show these fields and mark them
+Phase 2; adding them later changes no Phase 1 field.
 
 ### Capacity and examples
 
-`maxConcurrent` counts active slots per machine across all runs and standalone calls using this installation. Apply
-a per-repo cap in addition to the machine-wide cap. A slot with a required tag in `exclusive` holds the one slot
+`maxConcurrent` counts active slots per machine across all runs and standalone calls using this installation.
+Phase 2 can add a per-repo cap on top of the machine-wide cap. A slot with a required tag in `exclusive` holds the one slot
 for that tag on its machine. All affected capacity counters update in the same state transaction. Release on
 `done`, or let the slot expire after `slotTtlMinutes`. A batch books up to its requested count, updating capacity
 after every selection. With no eligible placement it fails. With a partial batch it returns the booked placements,
@@ -487,8 +592,8 @@ started by another Coordinator or outside the router.
 
 ### Override trust
 
-Trusted `repos["github.com/owner/repo"]` config sets defaults for needs and preferences, denies or pins machines,
-names the worktree command, and can set per-repo priorities and caps. Caller preferences are additive. Caller needs
+Trusted `repos["github.com/owner/repo"]` config sets defaults for needs and preferences, denies or pins machines
+and names the worktree command. Per-repo priorities and caps are Phase 2. Caller preferences are additive. Caller needs
 union with required repo tags. Explicit pins, denies and local-only rules combine by intersection. Conflicting hard
 rules can leave no eligible machine.
 
@@ -556,8 +661,12 @@ snapshots and result files. Attachments remain a T3 tool path for small inputs.
 credential on the machine that needs it. Exclude secret values from config, state, diagnostics, handoff content,
 attachments and T3 `task` text. Protect the local directory with mode 700 and its files with mode 600. Require
 credential-free URLs. The only transient credential handling proposed is the Phase 2 link-renewal subprocess
-handoff. Keep its short-lived pairing token out of output, logs and persistent storage. Apply link access as a hard
-placement filter.
+handoff. Keep its short-lived pairing token out of output, logs and persistent storage. One exposure remains and
+is stated, not hidden: `t3 environment link <url> --pairing-code <code>` takes the code as an argument, so other
+processes of the same user can see it in the process list for as long as that command runs. Mint it with the
+shortest practical `--ttl` (the surveyed provider uses two minutes). `--from -` reads the code from stdin, but the
+surveyed provider notes that it leaves an existing link as it is, so it suits a first link and not a renewal.
+Apply link access as a hard placement filter.
 
 ## 7. Health, cooldown, failover and ephemeral boxes
 
@@ -591,22 +700,34 @@ read of the same outage does not extend a caller-reported cooldown.
 | Router state | Placement behavior |
 | --- | --- |
 | `ready` | Fresh evidence supports placement, subject to repo, provider, access and slot filters. |
-| `degraded` | Link is still eligible. Use half weight within the tier. A recovering box admits one trial slot at a time. |
+| `degraded` | The link is reachable but the auxiliary HTTPS probe failed. Still eligible; ordered after `ready` machines in its tier. |
+| `recovering` | A cooldown has ended and no task has succeeded since. Eligible for one slot at a time until a `done --outcome ok` clears it. |
 | `cooling` | Disallow new placements until a recorded `cooldownUntil` passes or a current non-reachable T3 report is superseded, whichever is later. |
 | `unlinked` | Missing or expired link. Ask the user to link, or use a configured renewal path in Phase 2. |
 | `unknown` | No fresh observation for the fact required to place. Ask for evidence. |
 
-Derive the state on read from the current observations and outage record. A short-lived probe failure is distinct
-from expired link authority. A proposed 15-minute observation TTL bounds stale providers, projects and links in
-Phase 1. An expiry timestamp on a link still applies immediately.
+Derive the state on read from the current observations and outage record; when more than one applies, report the
+most restrictive (`unlinked`, `cooling`, `unknown`, `recovering`, `degraded`, `ready`). A short-lived probe failure
+is distinct from expired link authority.
+
+Observations age at two speeds. Link facts change quickly and are cheap to re-read, so they are fresh for 15
+minutes (`linkTtlMinutes`); when the `t3` CLI is present the router refreshes them itself and no agent is involved.
+Provider and project facts change rarely and only an agent can read them, so they are fresh for 24 hours
+(`factTtlHours`), which covers a run. The Coordinator refreshes them at `acquire` and before every
+`register-payload`. A Lead therefore does not normally meet `needsObservation` for providers or projects, which
+matters because its brief authorizes `orchestrator_capabilities` and `delegate_task` only. Without the CLI, a
+Lead can meet a request for `t3_environment_links`; the policy line authorizes that one read-only call. An expiry
+timestamp on a link still applies immediately.
 
 ### Cooldown and recovery
 
-Use 5, 15 and 60 minutes for consecutive machine failures, capped at 60 minutes for automatic backoff. Manual
-cooldown and the Level 0 mirror can hold a longer explicit deadline. A failure never shortens an existing deadline.
-After the cooldown expires, admit at most one trial placement on the machine until a fresh successful outcome
-clears the failure streak. Manual `cooldown` and `clear-cooldown` adjust that machine's recovery state. Expiry
-alone never overrides fresh evidence that the link cannot be used.
+Phase 1 uses one fixed cooldown, `cooldownMinutes`, default 30. That is the duration the Lead brief already uses
+for swarm's `cooldown env:<label> 30m`, so the two Level 0 stores agree by default. Manual `cooldown` and
+`--min-cooldown` can set a longer deadline. A failure never shortens an existing deadline. When the cooldown ends
+the machine is `recovering`: at most one slot at a time until a successful outcome clears the failure record.
+`clear-cooldown` returns it to normal at once. Expiry alone never overrides fresh evidence that the link cannot be
+used. Backoff that grows with repeated failures (5, 15, 60 minutes) is a Phase 2 refinement, worth adding only if
+boxes turn out to flap.
 
 On a lost box, the calling agent cancels its lost tasks with `task_cancel` before reporting the outage and
 re-placing. When several callers have work there, notify them to cancel and reconcile their work. The router does
@@ -628,21 +749,28 @@ uses them. Re-test renewal of an existing link, keep the user's access policy, a
 placing. Pass the token transiently to the subprocess within its TTL and suppress command and subprocess output
 that could contain it. This path is off by default, since it can mint access unattended.
 
-Phase 2 can invoke an optional user-supplied per-box `up` command during acquisition when a selected box is
+Phase 2 can invoke an optional user-supplied per-box `bringUp` command during acquisition when a selected box is
 unavailable. Run only the configured argument vector, with a timeout. Re-observe link and project facts after it
 returns. The router ships no service or update logic. If the hook can restart T3, require the operator's idle check
 and refuse while slots are held. Expiring slots alone cannot authorize a restart. Phase 1 acquires ready boxes and
 reports unavailable ones.
 
-### Phase 4 · Driver protocol
+This is a real step back for anyone replacing a hand-built provider in Phase 1. The surveyed provider starts the
+box's T3 service, waits for the link and renews it as part of `acquire`. Until Phase 2, such a user keeps their own
+bring-up script and runs it before `acquire`. The `bringUp` hook is small (one argument vector, one timeout), so
+moving it into Phase 1 is an open question below, with a recommendation to do so.
 
-A user-supplied executable receives `up`, `status` or `down` as its first argument and one JSON request on stdin.
-The router passes the configured label, run ID and, for an existing instance, a stable `instanceId`. State records
-the instance's quote, lease, provisioning operation and preservation status. The driver prints one JSON object,
-exits 0 on success, and keeps diagnostics on stderr. Use bounded calls and a durable operation record. Make retry
-safe by keying the operation by the run and label, and reconcile with `status` if `up` or `down` times out. Before
-`up`, `status` for a configured label without an instance supplies a quote. Unknown cost stops provisioning until a
-price is available.
+### Future · Ephemeral boxes (Phase 4 sketch)
+
+This part is a sketch, not a committed interface. Nobody in the stated audience (one to five always-on machines)
+needs it today, and the surveyed setup retired its cloud provider on cost. It is here for one reason: to show that
+the routing model has a place for short-lived machines (`kind: "ephemeral"`, lowest priority tier, a lease tied to
+a run) without any Phase 1 field having to change. Do not build it until someone needs it and the linking question
+below has an answer.
+
+The seam is a driver: a user-supplied executable that receives `up`, `status` or `down` as its first argument and
+one JSON request on stdin (the configured label, the run ID and, for an existing instance, its `instanceId`), and
+prints one JSON object. The skill contains no vendor code.
 
 ```json
 {
@@ -666,17 +794,15 @@ price is available.
 | `hourlyCost` | Quoted price per hour, also supplied before provisioning. |
 | `currency` | Currency of the hourly price. |
 
-`status` on an existing instance returns the same metadata when it exists, and `down` returns the last known
-metadata and operation result. Once provisioned, the box still needs a reachable T3 link, an eligible provider and
-a project observation before placement. A sandbox instance ID is not a T3 environment ID. Confirm the price before
-each `up`, optionally check a run budget, put the box in the lowest tier and lease it to the requesting run.
-Spilling over never provisions on its own. Down on release only after the worker's output is preserved. Refuse
-while active slots, reported unpushed branches or unresolved task outcomes remain. Expiring a lease leaves a
-cleanup candidate for the caller instead of tearing down a machine in the background.
+Four rules would sit in the router, not in a driver. Once provisioned, the box still needs a reachable T3 link, an
+eligible provider and a project observation before any placement; a sandbox instance ID is not a T3 environment
+ID. The price is stated and confirmed before each `up`, and overflow never provisions on its own. `down` is refused
+while slots are held or a worker's output is not yet pushed. An expired lease leaves a cleanup candidate for the
+caller; nothing is torn down in the background.
 
-The audited setup retired a previous cloud provider on cost. The surveyed sandbox products expose forwarded ports,
-but T3 linking, cold start, and credential and repository provisioning remain unverified. A reference driver should
-initially exercise the protocol with a local test double.
+What is unverified decides whether this is ever built: the surveyed sandbox products expose forwarded ports, but
+whether a T3 server inside one can be linked, how long a cold start takes, and how credentials and a repository
+get there are all unconfirmed.
 
 ## 8. CLI and config
 
@@ -695,33 +821,80 @@ writes `state.json`. An optional `drivers/` holds user-owned executables. Instal
 | `doctor` | 1 | Validate config and diagnose missing links, provider or project facts, and invalid labels. |
 | `list` | 1 | Return inventory, derived health, leases and slots. |
 | `observe` | 1 | Read T3 observation records on stdin and update the bounded cache. |
-| `place [--count N] [--run <runId>]` | 1 | Select and book placements. Accept needs, preferences, affinity, provider, pin and base or worker branch hints. |
+| `place [--count N] [--run <runId>]` | 1 | Select and book placements. Flags are in the table in Section 4. |
 | `done --slot <slotId> --outcome <outcome>` | 1 | Release a booking and apply a reported outcome. |
 | `report <label> unreachable` | 1 | Record an outage and clear active slots there. Accept `--min-cooldown` for the swarm seam. |
 | `cooldown <label> <duration>` | 1 | Set an explicit machine deadline. |
 | `clear-cooldown <label>` | 1 | Clear manual or automatic cooldown and reset the failure streak. |
 | `acquire --run <runId> [--count N] [--needs a,b]` | 1 | Lease distinct ready boxes. Count defaults to one and must be positive. |
 | `release --run <runId>` | 1 | Idempotently drop a run's lease. In Phase 4, also request safe cleanup of its ephemeral boxes. |
-| `register-payload --run <runId>` | 1 | Emit the raw swarm registration array as the success response. |
+| `register-payload --run <runId> [--clear]` | 1 | Emit the raw swarm registration array as the success response. Errors on a lapsed lease unless `--clear`. |
 | `policy-line --run <runId>` | 1 | Render the Boundaries instructions for the run ledgers. |
-| `brief` | 1 | Render the Git handoff instructions for a placement and selected refs. |
 | `handoff` | 2 | Create and transfer a snapshot commit. |
 | `fetch` | 2 | Fetch a worker branch or recover a snapshot over declared SSH. |
 | `pull` | 2 | Return selected artifacts with bounded transport. |
 | `renew` | 2 | Renew a link only with trusted opt-in configuration. |
 | `check` | 2 | Run configured tag gates and supported SSH push-access checks. |
-| `up` | 4 | Quote, confirm and provision a driver instance for a run. |
-| `down` | 4 | Tear down a driver instance after the preservation checks. |
+
+That is fifteen commands in Phase 1. There is no separate `brief` command: `place` already returns
+`briefAddendum`. The Phase 4 sketch would add two commands to provision and tear down a driver instance; they are
+not specified here.
 
 Release responds with `ok` and two label arrays, `stopped` and `kept`. Always-on boxes go in `kept`; Phase 1 leaves
-`stopped` empty. A second release of the same run succeeds with both arrays empty.
+`stopped` empty. A second release of the same run succeeds with both arrays empty. `init`, `discover`, `doctor`,
+`report`, `cooldown` and `clear-cooldown` use the same `{ "ok": ... }` envelope; their exact fields are left to the
+Phase 1 implementation and its `references/`, because nothing outside the router parses them.
 
 Omitting `--count` on `place` returns a single placement as in Section 4. With `--count`, the response has `ok`, a
 `placements` array of the per-placement objects without their individual `ok`, and a `shortfall` if the count was
-only partly met. Include filter reasons when placements run out. Read or refresh outside the write lock and
-validate decisions against current state before reserving. Fail without booking when required observations are
-missing. Reject invalid counts, conflicting pins and unknown labels before changing state. When a task uses
-`--kind`, it supplies the stable task-kind name evaluated by repo overrides.
+only partly met. A partial batch is a success, as a partial `acquire` is: `ok` is true and the exit code is 0
+whenever at least one placement was booked, and `skipped` says why the rest could not be. With none booked it is
+the "No eligible machine" error from Section 4.
+
+```json
+{
+  "ok": true,
+  "placements": [
+    {
+      "target": { "environmentId": "<environmentId>", "projectId": "<projectId>" },
+      "placement": {
+        "label": "home-box",
+        "remote": true,
+        "providers": ["<providerInstanceId>"],
+        "slot": { "id": "<slotId-1>", "expiresAt": "2030-01-01T13:00:00Z" },
+        "why": "Highest eligible priority tier with a free slot."
+      },
+      "briefAddendum": "Run on home-box. In its project checkout, run git fetch origin && git worktree add ~/work/<worker-branch> -b <worker-branch> origin/<branch>. Work there, then push your branch to origin."
+    },
+    {
+      "target": {},
+      "placement": {
+        "label": "local",
+        "remote": false,
+        "slot": { "id": "<slotId-2>", "expiresAt": "2030-01-01T13:00:00Z" },
+        "why": "home-box is full. Local is the next tier with a free slot."
+      },
+      "briefAddendum": "Run on the caller's machine. Use the caller's local checkout instructions."
+    }
+  ],
+  "shortfall": 1,
+  "skipped": [
+    { "label": "home-box", "reason": "No free slot (6 of 6 in use)." },
+    { "label": "local", "reason": "No free slot (4 of 4 in use)." }
+  ]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `ok` | True when at least one placement was booked. |
+| `placements` | One entry per booked slot, in booking order. Each has the `target`, `placement` and `briefAddendum` of a single result. |
+| `shortfall` | Requested count minus booked count. Absent when the whole batch was booked. |
+| `skipped` | Why no further placement was possible, per machine. Absent when the whole batch was booked. |
+
+Read or refresh outside the write lock and validate decisions against current state before reserving. Fail without
+booking when required observations are missing. Reject invalid counts, conflicting pins and unknown labels before
+changing state.
 
 ### Config schema
 
@@ -735,9 +908,11 @@ feature ships. Values such as the expiry thresholds are proposed defaults and ca
   "allowProjectOverride": true,
   "defaults": {
     "minLinkHours": 24,
-    "observationTtlMinutes": 15,
+    "linkTtlMinutes": 15,
+    "factTtlHours": 24,
     "slotTtlMinutes": 180,
     "leaseTtlHours": 24,
+    "cooldownMinutes": 30,
     "affinityTtlMinutes": 120
   },
   "local": {
@@ -761,7 +936,7 @@ feature ships. Values such as the expiry thresholds are proposed defaults and ca
       "exclusive": ["gpu"],
       "worktreeRoot": "~/work",
       "renew": "manual",
-      "up": ["/path/to/start-box"],
+      "bringUp": ["/path/to/start-box"],
       "checks": [{ "tag": "gpu", "command": ["/path/to/check-gpu"], "timeoutMs": 3000 }]
     }
   },
@@ -787,10 +962,12 @@ feature ships. Values such as the expiry thresholds are proposed defaults and ca
 | `allowProjectOverride` | Enables the restricted repo file in Phase 2. Default false. |
 | `defaults` | Installation-wide timing defaults. |
 | `defaults.minLinkHours` | Minimum remaining link lifetime for remote placement. |
-| `defaults.observationTtlMinutes` | Maximum age for cached T3 facts. |
+| `defaults.linkTtlMinutes` | Maximum age of a cached link observation. |
+| `defaults.factTtlHours` | Maximum age of cached provider and project observations. |
 | `defaults.slotTtlMinutes` | Maximum age of a slot. |
 | `defaults.leaseTtlHours` | Time since last run lease renewal before expiry. |
-| `defaults.affinityTtlMinutes` | Maximum age of a preferred previous placement. |
+| `defaults.cooldownMinutes` | Cooldown after a machine failure. Matches the 30 minutes the Lead brief uses for swarm. |
+| `defaults.affinityTtlMinutes` | Phase 2. Maximum age of a preferred previous placement. |
 | `local` | Caller machine policy. |
 | `machines` | Remote inventory keyed by globally unique label. |
 | `machines.<label>.kind` | Always-on in Phase 1. Driver-backed ephemeral in Phase 4. |
@@ -800,12 +977,12 @@ feature ships. Values such as the expiry thresholds are proposed defaults and ca
 | `tags` | Declared capabilities for a local or remote entry. |
 | `deviceHostId` | Optional T3 device-host mapping, separate from the link. |
 | `priority` | Strict priority tier for a machine. |
-| `weight` | Positive share within its priority tier. |
+| `weight` | Phase 2. Positive share within its priority tier. Phase 1 ignores it and orders by load. |
 | `maxConcurrent` | Positive total slot cap per machine. |
 | `exclusive` | Tags with one slot per machine. |
 | `machines.<label>.worktreeRoot` | Parent for worker-managed checkout paths. Defaults to `~/work`. |
 | `machines.<label>.renew` | Phase 2 link renewal policy, `manual` by default or `auto` with SSH. |
-| `machines.<label>.up` | Optional Phase 2 user-owned bring-up command and arguments. |
+| `machines.<label>.bringUp` | Optional Phase 2 user-owned bring-up command and arguments. |
 | `machines.<label>.checks` | Phase 2 tag-gating checks. |
 | `checks[].tag` | Capability gated by the command. |
 | `checks[].command` | User-owned command and arguments. |
@@ -815,8 +992,8 @@ feature ships. Values such as the expiry thresholds are proposed defaults and ca
 | `repos.<key>.prefers` | Default soft preferences. |
 | `repos.<key>.deny` | Machine labels this repo may never use. |
 | `repos.<key>.pin` | Optional trusted machine constraint. |
-| `repos.<key>.priority` | Priority overrides for this repo, keyed by machine. |
-| `repos.<key>.maxConcurrent` | Additional cap for this repo's placements, keyed by machine. |
+| `repos.<key>.priority` | Phase 2. Priority overrides for this repo, keyed by machine. |
+| `repos.<key>.maxConcurrent` | Phase 2. Additional cap for this repo's placements, keyed by machine. |
 | `repos.<key>.worktreeCommand` | Trusted worktree script to name in the worker's brief. |
 | `repos.<key>.allowWorktreeScripts` | Explicitly accepted repo script names for Phase 2 overrides. |
 
@@ -845,7 +1022,10 @@ The CLI prunes expired observations, slots, leases and affinity as it evaluates 
 cooldown separate so a stale observation cannot overwrite an outage report. Use the file-lock and
 atomic-replacement pattern in swarm (S:104–157). Keep network and T3 work outside the lock. Under the lock, reload
 state, purge expired bookings, decide, and write the next state. On lock or write failure, return an error instead
-of reporting a reservation. Retain bad state for diagnosis and require recovery before making fresh bookings.
+of reporting a reservation. A state file that does not parse is handled as swarm handles a corrupt `health.json`
+(S:173–186): copy it to `state.json.corrupt.<ms>`, answer `ok: false` once with that path, and start the next
+command from empty state. Empty state loses slots and cooldowns, which is safe because both are advisory and
+expire; config is untouched.
 
 ```json
 {
@@ -858,11 +1038,11 @@ of reporting a reservation. Retain bad state for diagnosis and require recovery 
         "value": { "status": "reachable", "access": "full-access", "expiresAt": "2030-02-01T00:00:00Z", "lastError": null }
       },
       "providers": {
-        "source": "agent", "observedAt": "2030-01-01T09:55:00Z", "validUntil": "2030-01-01T10:10:00Z",
+        "source": "agent", "observedAt": "2030-01-01T09:55:00Z", "validUntil": "2030-01-02T09:55:00Z",
         "value": ["<providerInstanceId>"]
       },
       "projects": {
-        "source": "agent", "observedAt": "2030-01-01T09:55:00Z", "validUntil": "2030-01-01T10:10:00Z",
+        "source": "agent", "observedAt": "2030-01-01T09:55:00Z", "validUntil": "2030-01-02T09:55:00Z",
         "value": { "github.com/owner/repo": "<projectId>" }
       }
     }
@@ -900,7 +1080,7 @@ of reporting a reservation. Retain bad state for diagnosis and require recovery 
 | `observations.<label>.link` | Freshness envelope and reduced link facts. |
 | `observations.<label>.providers` | Freshness envelope and eligible provider IDs. |
 | `observations.<label>.projects` | Freshness envelope and canonical repo-to-project map. |
-| `source` | Observation source, agent or CLI. |
+| `source` | Observation source: `agent` (handed in through `observe`) or `t3-cli` (read by the router). |
 | `observedAt` | UTC time the CLI accepted the observation. |
 | `validUntil` | Router TTL deadline for that observation. |
 | `value` | Reduced payload for that observation kind. |
@@ -909,21 +1089,21 @@ of reporting a reservation. Retain bad state for diagnosis and require recovery 
 | `link.value.expiresAt` | Link's own expiry, independent of freshness. |
 | `link.value.lastError` | Sanitized T3 error summary, or null. |
 | `health` | Machine-local failure records keyed by label. |
-| `health.<label>.failures` | Failure streak. A nonzero streak after cooldown means trial placement. |
+| `health.<label>.failures` | Failures since the last success. Nonzero after the cooldown has ended means `recovering`. |
 | `health.<label>.cooldownUntil` | Hard cooldown deadline or null. |
 | `health.<label>.lastFailureAt` | Outage timestamp used to ignore obsolete success reports. |
 | `leases` | Run leases keyed by run ID. |
 | `leases.<runId>.machines` | Remote labels held by that run. |
 | `leases.<runId>.expiresAt` | Lease deadline after the most recent renewal. |
-| `slots` | Active bookings keyed by opaque slot ID, with trial occupancy derived from these bookings. |
+| `slots` | Active bookings keyed by opaque slot ID. The one-slot limit of a `recovering` machine is counted from these. |
 | `slots.<slotId>.label` | Machine holding the booking. |
 | `slots.<slotId>.run` | Run ID or null for standalone use. |
 | `slots.<slotId>.repo` | Canonical repository key, or null for local work outside a repo. |
 | `slots.<slotId>.exclusive` | Exclusive tags held by this slot. |
 | `slots.<slotId>.placedAt` | Booking time used to order outcomes against outages. |
 | `slots.<slotId>.expiresAt` | Independent stale-slot deadline. |
-| `credits` | Smooth weighted round-robin credits by label. |
-| `affinity` | Most recent placement by repo and caller-supplied affinity key. |
+| `credits` | Phase 2. Smooth weighted round-robin credits by label. Absent in Phase 1. |
+| `affinity` | Phase 2. Most recent placement by repo and caller-supplied `--affinity` key. Absent in Phase 1. |
 | `affinity.<repo>.<key>.label` | Preferred candidate if still eligible. |
 | `affinity.<repo>.<key>.expiresAt` | Affinity expiry. |
 
@@ -973,8 +1153,10 @@ otherwise equivalent candidates. When fewer are currently usable, return a parti
 lease to current usable boxes and requires fresh provider and project observations. If they are stale for an
 otherwise eligible leased box, request a refresh before replacing the swarm snapshot. Emit a full replacement
 payload with observed provider lists. The router always sends `providers` since omitting it would let swarm assume
-any provider can run there. An expired or released lease produces an empty array so a caller can explicitly clear
-swarm registration.
+any provider can run there. An expired or released lease is an error (`ok: false`, nonzero exit), never an empty
+array: swarm deletes the run's box list when it is given `[]` (S:1899), so a Coordinator that re-registered mid-run
+after its lease lapsed would strip every box from the run without any error. Renew with `acquire` first. To clear
+swarm's registration on purpose, pass `--clear`, which prints `[]`.
 
 ```json
 [
@@ -1006,7 +1188,6 @@ swarm registration.
       "heldBy": ["<runId>"],
       "tags": ["linux", "gpu"],
       "priority": 10,
-      "weight": 2,
       "maxConcurrent": 6,
       "activeSlots": 1
     },
@@ -1016,7 +1197,6 @@ swarm registration.
       "heldBy": [],
       "tags": ["macos", "ios-sim"],
       "priority": 0,
-      "weight": 1,
       "maxConcurrent": 4,
       "activeSlots": 0
     }
@@ -1034,7 +1214,6 @@ swarm registration.
 | `machines[].heldBy` | Run IDs with unexpired leases. |
 | `machines[].tags` | Effective capability set. |
 | `machines[].priority` | Default priority tier. |
-| `machines[].weight` | Configured within-tier share. |
 | `machines[].maxConcurrent` | Machine-wide maximum slots. |
 | `machines[].activeSlots` | Number of unexpired bookings. |
 
@@ -1044,10 +1223,13 @@ Use one skill. A short inventory can be discovered mechanically and confirmed in
 skill exists because quota buckets, model tiers and depth mappings require a longer interview. Keep the router's
 setup procedure in `references/setup.md`, loaded on demand by either a standalone agent or a Coordinator.
 
-1. Run `discover` to propose rows from `t3 environment list --json` or
-   agent-supplied links. Confirm labels, expected capabilities, SSH and
-   access requirements, priority and capacity. Ask the user to resolve
-   collisions and unknown mappings.
+1. Run `discover` to propose rows. It reads `t3 environment list --json`
+   itself when it finds the `t3` binary; otherwise it takes a
+   `t3_environment_links` record on stdin, in the `observe` format. Confirm
+   labels, expected capabilities, SSH and access requirements, priority and
+   capacity. Ask the user to resolve collisions and unknown mappings.
+   `doctor` later warns when a label no longer matches T3's link label,
+   because the swarm viewer shows T3's.
 2. Write config with `init` after the user confirms the inventory. Discover
    providers and projects through the agent, not the T3 filesystem. A
    missing project can be cloned with `t3_project_clone` and registered
@@ -1086,8 +1268,8 @@ npx skills@latest add mochahub/skills --skill t3-box-router -g -a <agent> [--cop
 
 Use `node --test` without dependencies. Keep the placement decision function pure and test it with explicit inputs
 for time, health, policy and capacity. Test locking and atomic writes separately. Existing project-specific box
-skills can retain setup facts and trusted scripts. Move their policy prose into `repos` and their bring-up script
-into the box's optional `up` hook.
+skills can retain setup facts and trusted scripts. Move their policy prose into `repos` and, from Phase 2, their
+bring-up script into the box's optional `bringUp` hook.
 
 ## 10. Tradeoffs and alternatives rejected
 
@@ -1099,6 +1281,8 @@ into the box's optional `up` hook.
 | Run a monitoring daemon | On-demand reads cover agent tasks that last minutes. A daemon adds install, supervision and stale-process recovery for a small inventory. |
 | Wrap the router in an MCP server | The script already runs from every harness with Node. MCP packaging adds installation and still needs access to the caller's T3 context. |
 | Rank by latency or live load | An HTTPS timeout is a useful health threshold. Milliseconds of latency say little about a minutes-long task, and load changes during a run. Declared capacity is more predictable. |
+| Weighted round-robin, preference multipliers and affinity in Phase 1 | Priority, capacity and least-loaded give the same result for a handful of machines with no stored credits to explain or debug. The weighted design is kept in Section 5 and deferred until capacity proves the wrong proxy for share. |
+| Backoff that grows with each failure in Phase 1 | One fixed cooldown equal to swarm's keeps the two Level 0 stores in step. Growing backoff is a Phase 2 refinement. |
 | Rank by token cost | Swarm owns model and quota decisions. Machine spend belongs to the ephemeral provisioning guard. |
 | Ship built-in cloud vendors | Linking in a sandbox is unverified and cost can dominate. A driver protocol keeps those dependencies and credentials with the user. |
 | Read T3's private project database | Internal tables can change across T3 versions. The project tool provides the supported join key. |
@@ -1120,11 +1304,13 @@ into the box's optional `up` hook.
 | Does `t3_thread_launch` honor a worktree strategy on a linked environment? | Run one disposable test in a separate top-level-thread task. Keep manual Git worktrees for child dispatch. |
 | Can an attachment uploaded here reach a thread on a different environment? | Run one test with a small synthetic file. Treat the route as unverified until it passes. |
 | Pick an ephemeral vendor now? | Defer until a user needs one. First test reachability and T3 linking with a disposable instance. |
-| Should Level 0 remote capacity count against the local wave allowance? | Let remote slots add to it by grouping picks by label and forcing only eligible remote groups over the per-call cap. |
+| Confirm: at Level 0, box capacity adds to the local wave allowance, and the policy line overrides the Lead brief's single cap, unpinned picks and `--place box` gates. | Section 3 decides this. The alternative that leaves the brief untouched is one `pick-worker` per booked box slot (single picks have no cap), at the cost of one call per worker. |
+| Move the `bringUp` hook from Phase 2 into Phase 1? | Yes. Without it, replacing a hand-built provider loses automatic bring-up until Phase 2. It is one argument vector and one timeout, run only at `acquire`. |
+| Build weights, preference multipliers and affinity at all? | Not until Phase 1 has run. Capacity-proportional fill may be all that is needed. |
 | Document the T3 v0.1.x CLI? | Yes. Feature-detect the observed commands and keep agent observations as a fallback. |
 | What should a shell-only caller use to start a task? | Keep `t3 thread start` exploratory until a separate design verifies remote targeting and outcome handling. |
-| When should cold-cache acquisition read provider and project facts? | Request them before leasing. The brief's post-acquire read sequence and its rule to validate before handing out a usable box conflict on a cold cache. Preserve both the tool reads and the ready-only lease by adding a preflight response. The existing provider can check the link first and let the consumer read providers and projects later. |
-| Should every success response be a JSON object? | Keep `register-payload` as a narrow array exception. Swarm requires an array on stdin, and the proposed direct pipe conflicts with a universal object envelope. An envelope would require a separate extraction step. |
+| Confirm: on a cold cache, `acquire` asks for provider and project facts before it leases. | Section 3 decides this, so a lease is only ever handed out for a box known to be usable. The surveyed provider does it the other way round: it checks the link, leases, and lets the consumer read providers and projects afterwards. |
+| Confirm: `register-payload` prints a bare array on success, the one exception to "every command prints one object". | Section 3 decides this. Swarm reads an array on stdin, and an envelope would need an extraction step between the two commands. |
 | How should long tasks and multiple Coordinators share capacity? | Start with configurable slot expiry and one router home per Coordinator. Confirm typical run lengths in P1. Revisit refresh or shared accounting if that deployment model changes. |
 
 ## 12. Phased implementation plan
@@ -1132,10 +1318,10 @@ into the box's optional `up` hook.
 | Phase | Scope and deliverables | Exit test | Rough size |
 | --- | --- | --- | --- |
 | P0 · Scope | This spec and owner decisions on open questions. | Owner agrees on ownership, Phase 1 boundary and disposition of the open questions. | One design document and review. |
-| P1 · Always-on MVP | Installable skill, CLI and schemas, pure decision logic, slots and leases, T3 observations and probes, Level 0 adapter, brief generation, tests, guide and README row. No swarm code change. | Replace a hand-built provider in one real swarm run and complete a standalone place, delegate, done sequence. Exercise partial acquisition, simultaneous Leads, remote overflow and outage recovery. | Large single change, about 1,500–2,500 code and test lines plus docs. |
-| P2 · Transport and recovery | Snapshot and artifact helpers, tag checks, bring-up hook, link warnings and opt-in renewal, repo override file. | Round-trip a snapshot without changing the user's index, return a small artifact, gate a failed GPU tag, and renew an opted-in link without persisting a credential. Exercise a repo override that attempts to widen access. | Medium to large, about 800–1,500 code and test lines. |
+| P1 · Always-on MVP | Installable skill, the fifteen Phase 1 commands and schemas, pure decision logic (filter, priority, load), slots and leases, T3 observations and probes, fixed cooldown, Level 0 adapter with the generated policy line, brief generation, tests, guide and README row. No swarm code change. Not included: bring-up and link renewal, so a user replacing a hand-built provider keeps running its bring-up script before `acquire` (see the open question on moving `bringUp` here). | Replace the acquire, release and placement policy of a hand-built provider in one real swarm run and complete a standalone place, delegate, done sequence. Exercise partial acquisition, simultaneous Leads, remote overflow and outage recovery. | Large single change, about 1,200–2,000 code and test lines plus docs. |
+| P2 · Transport and recovery | Snapshot and artifact helpers, tag checks, `bringUp` hook, link warnings and opt-in renewal, repo override file, `--kind` and `--read-only`, per-repo priority and caps. Only if Phase 1 shows the need: weights, preference multipliers, affinity and growing backoff. | Round-trip a snapshot without changing the user's index, return a small artifact, gate a failed GPU tag, and renew an opted-in link without persisting a credential. Exercise a repo override that attempts to widen access. | Medium to large, about 800–1,500 code and test lines. |
 | P3 · Level 1 | Separate swarm change with pre-lock placement, machine cooldown forwarding, reasons in pick output and viewer, tests and docs. | Repeat the Level 0 workload with direct integration. Verify fallback and explicit-pin failures, compatibility without a router, wave rollback and absence of router calls inside the lock. | Medium, about 500–900 code and test lines across both skills. |
-| P4 · Ephemeral | Driver protocol and one reference driver, quote and budget guard, run-scoped lifecycle and teardown checks. | Exercise quote, over-budget refusal, link, place and release against a test driver. Confirm one real sandbox can link before claiming sandbox compatibility. Confirm teardown refuses while output is unpreserved. | Medium experimental work, about 500–1,000 code and test lines, plus deployment exploration. |
+| P4 · Ephemeral (not scheduled) | Only if a user needs short-lived machines. Driver protocol and one reference driver, price confirmation, run-scoped lifecycle and teardown checks. | Exercise quote, over-budget refusal, link, place and release against a test driver. Confirm one real sandbox can link before claiming sandbox compatibility. Confirm teardown refuses while output is unpreserved. | Medium experimental work, about 500–1,000 code and test lines, plus deployment exploration. |
 
 ## Appendix A. Swarm evidence
 
@@ -1150,7 +1336,7 @@ into the box's optional `up` hook.
 | Canonical origin, run lookup, lease read and registration allow-list | S:1264–1365, S:1875–1914 |
 | Machine cooldown, unit weights, target fields and model-spec grammar | S:1374–1436, S:1444 onward |
 | Cooldown and clear, archive and release instructions | S:1536–1647, S:1793–1848 |
-| Per-stream allowances and picks, Leads remain local | S:2093–2095, S:2269, S:2314–2398 |
+| Per-stream allowances and picks, Leads remain local | S:2093–2095, S:2269, S:2316–2400 |
 | Box contract, repo instructions and remote Git handoff | Swarm `SKILL.md` lines 146–165 and `lead-brief.md` lines 21, 25 and 30. `worker-brief.md` line 11 covers worktree isolation and pushed results. |
 | No box config in swarm setup, repo requirements and public packaging | Setup `SKILL.md` line 51, docs README lines 152–158 and 289, root README lines 10, 17 and 29–39. |
 | Viewer labels | `swarm-viz.mjs` lines 123–127, 164–167 and 279–283. The T3 database provides display data only. |
@@ -1163,7 +1349,7 @@ was checked. The rows identify behavior still awaiting a focused test.
 | Primitive | Use and evidence |
 | --- | --- |
 | `t3_environment_links` | Agent fallback for link facts. Response fields and `reachable` observed. Other status values were unobserved. |
-| `orchestrator_capabilities` | Read runnable provider IDs using `providers[].providerInstanceId` and `canRunChildTask`. Shape observed locally. Remote `environmentId` is documented and used by the existing swarm procedure. |
+| `orchestrator_capabilities` | Read runnable provider IDs using `providers[].providerInstanceId` and `canRunChildTask`. Shape observed locally. Remote `environmentId` is documented and used by the existing swarm procedure. The reply also has `canRunCrossProviderChildTask` per provider; the router does not keep it, and whether it limits a caller on one provider from starting a child on another provider on a box is untested. |
 | `t3_project_list` | Join `repositoryIdentity.canonicalKey` to project `id` per environment. Shape and pagination fields observed. Follow `nextCursor`. |
 | `device_list` | Suggest tags for separately mapped device hosts. Local response observed. |
 | `delegate_task` | Agent dispatch, documented text input and placement target. Linked-machine refusal of worktree isolation comes from swarm docs and was not rerun in the audit. |
