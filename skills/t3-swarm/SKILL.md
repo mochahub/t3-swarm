@@ -27,7 +27,7 @@ Users can drop back to Mode 0 or Mode 1 at any time.
 
 ## Preflight (Before Mode 1 or Mode 2)
 
-Locate `scripts/swarm.mjs` inside this skill's directory (if your harness does not expose the skill path directly, check `~/.t3/swarm/config.json`'s `scriptPath` or fall back in order to `~/.gemini/config/plugins/t3-swarm/skills/t3-swarm/scripts/swarm.mjs`, `~/.gemini/config/skills/t3-swarm/scripts/swarm.mjs`, `~/.claude/skills/t3-swarm/scripts/swarm.mjs`, `~/.codex/skills/t3-swarm/scripts/swarm.mjs`, `~/.agents/skills/t3-swarm/scripts/swarm.mjs`) and run:
+Locate `scripts/swarm.mjs` inside this skill's directory (if your harness does not expose the skill path directly, check `~/.t3/swarm/config.json`'s `scriptPath` or fall back in order to `~/.gemini/config/skills/t3-swarm/scripts/swarm.mjs`, `~/.claude/skills/t3-swarm/scripts/swarm.mjs`, `~/.codex/skills/t3-swarm/scripts/swarm.mjs`, `~/.agents/skills/t3-swarm/scripts/swarm.mjs`) and run:
 
 ```bash
 node "<script-path>" doctor
