@@ -131,7 +131,7 @@ success to fit swarm's stdin interface, and a JSON error object on failure. The 
 Coordinator check the generator's exit code before registering.
 
 Put the generated policy in the run ledger's Boundaries (and in each workstream ledger) before dispatching Leads.
-Leads always run on the Coordinator's machine (S:2269). `policy-line` renders text like this from config, with the
+Leads always run on the Coordinator's machine (S:2269). `policy-line` renders text like this from config, in the `text` field of its JSON reply, with the
 script path, run ID and cap filled in:
 
 ```text
@@ -139,15 +139,19 @@ Box routing (t3-box-router). Where this differs from the Lead brief, this wins.
 - Place first, then pick. For every worker and every gate:
   node <router-script> place --run <runId> --count <n> [--needs <tags>]
   Pass each returned label to swarm as --place <label> (--place local for a local placement).
-  No unpinned picks and no --place box in this run: they bypass the router and book no slot.
+  No unpinned swarm picks and no swarm pick with --place box in this run: they bypass the router and book no
+  slot. For "any box" (a gate, for example) ask the router: place --run <runId> --place box, then pin its label.
 - The wave cap of <maxParallel> covers local placements. Box placements are bounded by the router's slots: pick
   them in their own call per label, with --force-wave when a box's share is larger than the cap.
 - Append each placement's briefAddendum to that worker's task. When the worker returns, or the dispatch fails:
   node <router-script> done --slot <slotId> --outcome ok|failed|unreachable
-- Box lost: task_cancel first. Then swarm.mjs cooldown env:<label> 30m AND done --outcome unreachable
-  (or report <label> unreachable when you hold no slot there). Clearing a cooldown also needs both stores.
-- place answers needsObservation: if it asks only for t3_environment_links, make that read-only call and pipe
-  the reply to observe. For anything else, place on another machine or locally and note it for the Coordinator.
+- Box lost: task_cancel first. Then swarm.mjs cooldown env:<label> 30m AND
+  done --slot <slotId> --outcome unreachable --min-cooldown 30m
+  (or report <label> unreachable --min-cooldown 30m when you hold no slot there).
+  Clearing a cooldown also needs both stores.
+- place answers needsObservation: if it asks only for t3_environment_links, make that read-only call and send
+  the reply to observe on stdin as [{"tool":"t3_environment_links","args":{},"pages":[<the reply>]}].
+  For anything else, place on another machine or locally and note it for the Coordinator.
 - Needs that keep work on this machine in this repo: <tags from config, e.g. ios-sim, xcode>.
 ```
 
@@ -452,7 +456,7 @@ non-paginated call. Send the records as one JSON array on stdin. Complete the `t
 
 | Tool | What the router keeps | Matched to a machine by |
 | --- | --- | --- |
-| `t3_environment_links` | Per link: `status`, `access`, `expiresAt`, and whether `lastError` is set. | `links[].environmentId` equal to a configured `environmentId`. Unknown links are ignored (`discover` is what proposes them). |
+| `t3_environment_links` | Per link: `status`, `access`, `expiresAt`, and `lastError` reduced to a short sanitized summary, or null. | `links[].environmentId` equal to a configured `environmentId`. Unknown links are ignored (`discover` is what proposes them). |
 | `orchestrator_capabilities` | `providers[].providerInstanceId` where `canRunChildTask` is true. | `args.environmentId`. |
 | `t3_project_list` | A map from `repositoryIdentity.canonicalKey` (lowercased) to `id`, skipping projects whose `archivedAt` or `deletedAt` is set. | `args.environmentId`. |
 
@@ -548,16 +552,20 @@ uniqueness within one registration.
    and apply trusted or narrowing project restrictions. Respect
    `--place local|box|<label>`. With `--run`, require a current lease for
    each remote. Local remains available to the run, subject to its own
-   filters. With `--provider`, require that specific provider. Without it,
-   require an eligible provider set and return it. Give each rejected machine
-   an actionable reason.
+   filters. For a remote, with `--provider`, require that specific
+   provider; without it, require an eligible provider set and return it.
+   Local has no provider check: the caller is running there, and choosing
+   a provider that works locally is the caller's job. Give each rejected
+   machine an actionable reason.
 2. **Choose the highest eligible priority tier.** A full box drops out
    before priority is compared. Lower tiers take overflow. Ephemeral boxes
    always rank below eligible always-on or local machines.
-3. **Choose within that tier.** In Phase 1 this is a plain ordering with
-   no stored state: `ready` before `degraded`; then more `--prefers` tags
-   matched; then the lowest load, `activeSlots / maxConcurrent`; then
-   label. Capacity is the weight: two boxes in one tier with caps 6 and 2
+3. **Choose within that tier.** In Phase 1 this is a plain ordering that
+   stores no ranking credits: more `--prefers` tags matched; then the
+   lowest load, `activeSlots / maxConcurrent`; then label. Health does
+   not reorder machines in Phase 1: `degraded` is reported, and
+   `recovering` is limited to one slot by the filter. Capacity is the
+   weight: two boxes in one tier with caps 6 and 2
    fill three to one without anyone configuring a share.
 4. **Take a slot.** Commit the choice and its expiry together under the
    state lock. Evaluate capacity and exclusions again against current
@@ -700,7 +708,7 @@ read of the same outage does not extend a caller-reported cooldown.
 | Router state | Placement behavior |
 | --- | --- |
 | `ready` | Fresh evidence supports placement, subject to repo, provider, access and slot filters. |
-| `degraded` | The link is reachable but the auxiliary HTTPS probe failed. Still eligible; ordered after `ready` machines in its tier. |
+| `degraded` | The link is reachable but the auxiliary HTTPS probe failed. Still eligible. Phase 1 reports it in `list` and in `why` and does not reorder on it. |
 | `recovering` | A cooldown has ended and no task has succeeded since. Eligible for one slot at a time until a `done --outcome ok` clears it. |
 | `cooling` | Disallow new placements until a recorded `cooldownUntil` passes or a current non-reachable T3 report is superseded, whichever is later. |
 | `unlinked` | Missing or expired link. Ask the user to link, or use a configured renewal path in Phase 2. |
@@ -829,7 +837,7 @@ writes `state.json`. An optional `drivers/` holds user-owned executables. Instal
 | `acquire --run <runId> [--count N] [--needs a,b]` | 1 | Lease distinct ready boxes. Count defaults to one and must be positive. |
 | `release --run <runId>` | 1 | Idempotently drop a run's lease. In Phase 4, also request safe cleanup of its ephemeral boxes. |
 | `register-payload --run <runId> [--clear]` | 1 | Emit the raw swarm registration array as the success response. Errors on a lapsed lease unless `--clear`. |
-| `policy-line --run <runId>` | 1 | Render the Boundaries instructions for the run ledgers. |
+| `policy-line --run <runId>` | 1 | Render the Boundaries instructions for the run ledgers, as `{ "ok": true, "text": "<the lines>" }`. |
 | `handoff` | 2 | Create and transfer a snapshot commit. |
 | `fetch` | 2 | Fetch a worker branch or recover a snapshot over declared SSH. |
 | `pull` | 2 | Return selected artifacts with bounded transport. |
@@ -846,8 +854,9 @@ Release responds with `ok` and two label arrays, `stopped` and `kept`. Always-on
 Phase 1 implementation and its `references/`, because nothing outside the router parses them.
 
 Omitting `--count` on `place` returns a single placement as in Section 4. With `--count`, the response has `ok`, a
-`placements` array of the per-placement objects without their individual `ok`, and a `shortfall` if the count was
-only partly met. A partial batch is a success, as a partial `acquire` is: `ok` is true and the exit code is 0
+`placements` array of the per-placement objects without their individual `ok` and without `placement.skipped`
+(the batch reports `skipped` once, at the top level), and a `shortfall` if the count was only partly met. A partial
+batch is a success, as a partial `acquire` is: `ok` is true and the exit code is 0
 whenever at least one placement was booked, and `skipped` says why the rest could not be. With none booked it is
 the "No eligible machine" error from Section 4.
 
@@ -1022,10 +1031,11 @@ The CLI prunes expired observations, slots, leases and affinity as it evaluates 
 cooldown separate so a stale observation cannot overwrite an outage report. Use the file-lock and
 atomic-replacement pattern in swarm (S:104–157). Keep network and T3 work outside the lock. Under the lock, reload
 state, purge expired bookings, decide, and write the next state. On lock or write failure, return an error instead
-of reporting a reservation. A state file that does not parse is handled as swarm handles a corrupt `health.json`
-(S:173–186): copy it to `state.json.corrupt.<ms>`, answer `ok: false` once with that path, and start the next
-command from empty state. Empty state loses slots and cooldowns, which is safe because both are advisory and
-expire; config is untouched.
+of reporting a reservation. A state file that does not parse is moved aside: under the lock, rename it to
+`state.json.corrupt.<ms>` and answer `ok: false` once with that path. The next command finds no state file and
+starts from empty state. This goes one step further than swarm, which copies a corrupt `health.json` to a backup
+and returns the error but leaves the bad file in place (S:173–186); the router recovers by itself because empty
+state loses only slots and cooldowns, which are advisory and expire. Config is untouched.
 
 ```json
 {
