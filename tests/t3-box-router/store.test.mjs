@@ -166,16 +166,69 @@ test("validateConfig rejects unsafe and inconsistent inventory", () => {
 
 test("Phase 2 fields are reported as inactive, not rejected", async () => {
   const raw = baseConfig({ allowProjectOverride: true });
-  raw.machines["home-box"].bringUp = ["/path/to/start"];
   raw.machines["home-box"].renew = "auto";
   raw.machines["home-box"].checks = [{ tag: "gpu", command: ["/x"], timeoutMs: 3000 }];
   raw.repos["github.com/Owner/Repo"].priority = { "home-box": 10 };
   const { home } = await setup(raw);
   const r = inspectConfig(home);
   assert.equal(r.ok, true);
-  for (const f of ["allowProjectOverride", "bringUp", "renew auto", "checks", "priority"]) {
+  for (const f of ["allowProjectOverride", "renew auto", "checks", "priority"]) {
     assert.ok(r.warnings.some((w) => w.includes(f) && /inactive/.test(w)), `${f}: ${JSON.stringify(r.warnings)}`);
   }
+});
+
+test("bringUp is a Phase 1 hook: kept verbatim, validated, with its timeout and retry window", async () => {
+  const raw = baseConfig({ defaults: { bringUpTimeoutMs: 90_000, bringUpRetryMinutes: 5 } });
+  const argv = ["/opt/start box", "--label", "home-box", " spaced "];
+  raw.machines["home-box"].bringUp = argv;
+  raw.machines["home-box"].bringUpTimeoutMs = 300_000;
+  const { home } = await setup(raw);
+  const r = inspectConfig(home);
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  assert.deepEqual(r.warnings, []);
+  assert.deepEqual(r.config.machines["home-box"].bringUp, argv);
+  assert.equal(r.config.machines["home-box"].bringUpTimeoutMs, 300_000);
+  assert.equal(r.config.defaults.bringUpTimeoutMs, 90_000);
+  assert.equal(r.config.defaults.bringUpRetryMinutes, 5);
+  assert.equal(validConfig().defaults.bringUpTimeoutMs, undefined, "absent keys stay absent");
+
+  for (const [bringUp, pattern] of [
+    [[], /non-empty array/],
+    ["/bin/start", /non-empty array/],
+    [["relative/start"], /absolute path/],
+    [["/bin/start", ""], /non-empty strings/],
+    [["/bin/start", "a\0b"], /without NUL/],
+    [["/bin/start", 3], /non-empty strings/],
+  ]) {
+    const bad = baseConfig();
+    bad.machines["home-box"].bringUp = bringUp;
+    const v = validateConfig(bad);
+    assert.equal(v.ok, false, JSON.stringify(bringUp));
+    assert.ok(v.errors.some((e) => pattern.test(e)), `${JSON.stringify(bringUp)} -> ${JSON.stringify(v.errors)}`);
+  }
+  for (const t of [999, 600_001, 1.5, "60000"]) {
+    const bad = baseConfig();
+    bad.machines["home-box"].bringUp = ["/bin/start"];
+    bad.machines["home-box"].bringUpTimeoutMs = t;
+    assert.ok(validateConfig(bad).errors.some((e) => /bringUpTimeoutMs/.test(e)), String(t));
+  }
+});
+
+test("pruneState keeps a running bring-up claim and drops old attempts and unknown labels", () => {
+  const config = validConfig(baseConfig({ defaults: { bringUpRetryMinutes: 10 } }));
+  const state = {
+    ...emptyState(),
+    bringUp: {
+      "home-box": { id: "a", startedAt: iso(NOW - 60 * MIN), deadline: iso(NOW - MIN) },
+      "other-box": { id: "b", startedAt: iso(NOW - 30 * MIN), finishedAt: iso(NOW - 11 * MIN), outcome: "up" },
+      ghost: { id: "c", startedAt: iso(NOW), deadline: iso(NOW + MIN) },
+    },
+  };
+  assert.equal(pruneState(config, state, NOW), true);
+  assert.deepEqual(Object.keys(state.bringUp), ["home-box"], "an unfinished claim waits for the router to finalize it");
+  state.bringUp["other-box"] = { id: "d", startedAt: iso(NOW - 10 * MIN), finishedAt: iso(NOW - 9 * MIN), outcome: "failed" };
+  assert.equal(pruneState(config, state, NOW), false);
+  assert.ok(state.bringUp["other-box"]);
 });
 
 test("inspectConfig warns about loose permissions", async () => {

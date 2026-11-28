@@ -19,7 +19,8 @@ box-router acquire --run "$run_id" --count 1 --needs linux
   Only those three tools are ever valid in `needsObservation.calls`; ignore any other name.
 - **Partial or zero:** `acquire` returns what it could lease, with `shortfall` and `errors`. With none, the run
   continues locally.
-- A box configured with `bringUp` may be started here; see [setup.md](setup.md#bring-up-hook).
+- A down box configured with `bringUp` may be started here, once per retry window. Expect a second
+  `needsObservation` after it starts; see [setup.md](setup.md#bring-up-hook).
 
 Register, checking the exit code in between. **Never pipe `register-payload` straight into swarm**: an error
 object, or an accidental `[]`, would replace the run's box list.

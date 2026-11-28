@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { decide, parseDuration, pruneExpired, validateConfig, DEFAULTS, LINK_MISSING_STATUS } from '../../skills/t3-box-router/scripts/engine.mjs';
+import { decide, parseDuration, pruneExpired, validateConfig, linkVerdict, DEFAULTS, LINK_MISSING_STATUS } from '../../skills/t3-box-router/scripts/engine.mjs';
 
 const NOW = Date.UTC(2030, 0, 1, 10);
 const MIN = 60_000;
@@ -739,5 +739,70 @@ describe('helpers', () => {
     assert.deepEqual(Object.keys(pruned.leases), ['live']);
     assert.equal(pruned.observations['home-box'].link, undefined);
     assert.ok(pruned.observations['home-box'].providers);
+  });
+});
+
+describe('bring-up hook state', () => {
+  const claim = (extra = {}) => ({ id: 'c1', run: 'r1', pid: 1, startedAt: iso(NOW - MIN), deadline: iso(NOW + 5 * MIN), ...extra });
+
+  test('a link read with no link for the environment (value null) is unlinked everywhere', () => {
+    const obs = freshObs('env-home');
+    obs.link = envelope(null);
+    const state = mkState({ 'home-box': obs });
+    assert.equal(run('list', { state }).result.machines[1].state, 'unlinked');
+    const place = run('place', { state }).result;
+    assert.equal(place.placement.label, 'local');
+    assert.match(place.placement.skipped[0].reason, /missing or expired/);
+    const acquire = run('acquire', { state, options: { run: 'r1' } }).result;
+    assert.match(acquire.errors[0], /^home-box: Link is missing or expired/);
+    assert.equal(acquire.needsObservation, undefined, 'a recorded absence is not re-requested');
+  });
+
+  test('linkVerdict marks only a recognized status on a valid link as down', () => {
+    const cfg = mkConfig();
+    const v = (value) => linkVerdict(cfg, { value }, NOW);
+    assert.equal(v(null).state, 'unlinked');
+    assert.equal(v({ status: 'offline', expiresAt: iso(NOW + 30 * 24 * HOUR) }).down, true);
+    assert.equal(v({ status: null }).down, undefined);
+    assert.equal(v({ status: 'unrecognized' }).down, undefined);
+    assert.equal(v({ status: 'revoked' }).state, 'unlinked');
+    assert.equal(v({ status: 'offline', expiresAt: iso(NOW + HOUR) }).state, 'unlinked');
+    assert.equal(v({ status: 'reachable' }), null);
+  });
+
+  test('a running claim blocks place, acquire and register-payload ahead of fact checks', () => {
+    const leases = { r1: { machines: ['home-box'], expiresAt: iso(NOW + HOUR) } };
+    const state = mkState({ 'home-box': freshObs('env-home') }, { leases, bringUp: { 'home-box': claim() } });
+    const place = run('place', { state, options: { place: 'home-box' } }).result;
+    assert.equal(place.ok, false);
+    assert.match(place.skipped.find((s) => s.label === 'home-box').reason, /Bring-up hook running/);
+    assert.match(run('acquire', { state, options: { run: 'r2' } }).result.errors[0], /Bring-up hook running/);
+    assert.match(run('register-payload', { state, options: { run: 'r1' } }).result.errors[0], /Bring-up hook running/);
+
+    // With stale facts it is still a named rejection, not a request for observations.
+    const cold = mkState({}, { bringUp: { 'home-box': claim() } });
+    const r = run('place', { state: cold, options: { place: 'home-box' } }).result;
+    assert.equal(r.needsObservation, undefined);
+    assert.match(r.skipped.find((s) => s.label === 'home-box').reason, /Bring-up hook running/);
+  });
+
+  test('list shows a running claim, the last attempt and its retry time', () => {
+    const running = run('list', { state: mkState({ 'home-box': freshObs('env-home') }, { bringUp: { 'home-box': claim() } }) }).result.machines[1];
+    assert.equal(running.state, 'cooling');
+    assert.deepEqual(running.bringUp, { running: true, run: 'r1', startedAt: iso(NOW - MIN), deadline: iso(NOW + 5 * MIN) });
+    const done = claim({ finishedAt: iso(NOW - MIN), outcome: 'up' });
+    const last = run('list', { state: mkState({ 'home-box': freshObs('env-home') }, { bringUp: { 'home-box': done } }) }).result.machines[1];
+    assert.equal(last.state, 'ready');
+    assert.deepEqual(last.bringUp, { running: false, outcome: 'up', startedAt: iso(NOW - MIN), finishedAt: iso(NOW - MIN), retryAfter: iso(NOW + 9 * MIN) });
+    // A claim past its deadline no longer blocks (the CLI finalizes it before deciding).
+    const late = run('place', { state: mkState({ 'home-box': freshObs('env-home') }, { bringUp: { 'home-box': claim({ deadline: iso(NOW) }) } }) }).result;
+    assert.equal(late.placement.label, 'home-box');
+  });
+
+  test('doctor no longer calls bringUp inactive', () => {
+    const cfg = mkConfig();
+    cfg.machines['home-box'].bringUp = ['/opt/start'];
+    const r = run('doctor', { config: cfg }).result;
+    assert.equal(r.warnings.some((w) => /bringUp/.test(w)), false, JSON.stringify(r.warnings));
   });
 });

@@ -757,16 +757,38 @@ uses them. Re-test renewal of an existing link, keep the user's access policy, a
 placing. Pass the token transiently to the subprocess within its TTL and suppress command and subprocess output
 that could contain it. This path is off by default, since it can mint access unattended.
 
-Phase 2 can invoke an optional user-supplied per-box `bringUp` command during acquisition when a selected box is
-unavailable. Run only the configured argument vector, with a timeout. Re-observe link and project facts after it
-returns. The router ships no service or update logic. If the hook can restart T3, require the operator's idle check
-and refuse while slots are held. Expiring slots alone cannot authorize a restart. Phase 1 acquires ready boxes and
-reports unavailable ones.
+Phase 1 can invoke an optional user-supplied per-box `bringUp` command during `acquire` when a selected box is
+down (the open question in section 11, resolved in favour of Phase 1). The rules:
 
-This is a real step back for anyone replacing a hand-built provider in Phase 1. The surveyed provider starts the
-box's T3 service, waits for the link and renews it as part of `acquire`. Until Phase 2, such a user keeps their own
-bring-up script and runs it before `acquire`. The `bringUp` hook is small (one argument vector, one timeout), so
-moving it into Phase 1 is an open question below, with a recommendation to do so.
+- **Trigger.** Only when an acquisition falls short and a fresh link read shows the box linked but down: a status
+  other than `reachable` that the router recognizes, on a link that is not missing (`value: null`), gone
+  (`missing`, `unlinked`, `revoked`, `expired`, `removed`), expired or expiring within `minLinkHours`. An unknown
+  or unreadable status, a stale or absent link read, a cooling box, a box with a router slot and an acquisition
+  still waiting for observations never start a hook. CLI, hook and `list` share one link verdict, so a box
+  `list` calls `unlinked` is never brought up.
+- **One claim in state.** Choosing candidates, checking slots, cooldown, a running hook and the retry window, and
+  writing the claim (`state.bringUp.<label>`) happen in one state transaction. Concurrent acquires never start a
+  second hook, and while the claim stands no `place`, `acquire` or `register-payload` gives a slot or lease on
+  that box. The hook itself, its timeout and the link refresh after it run outside the lock.
+- **Bounded.** Run only the configured argument vector, unchanged and without a shell, in its own process group,
+  with one JSON object on stdin and its output discarded. At `bringUpTimeoutMs` (default two minutes, at most
+  ten) the group gets SIGTERM, then SIGKILL five seconds later. A process that leaves the group (`setsid`)
+  escapes that stop. The claim has a deadline a little past that bound; the first transaction after it finalizes
+  an abandoned claim, so a router that died mid-hook blocks the box for at most that long.
+- **Invalidation before eligibility.** Finishing lifts the claim and, in the same transaction, expires every fact
+  about the box observed before the hook finished, including observations an agent handed in while it ran. A
+  link refresh that was read before the hook finished is dropped if it arrives later. The router then re-reads
+  links and decides again, so the box is leased only on post-hook link, provider and project facts. Exit 75
+  (`refused-busy`: the hook's idle check found the box busy) changes nothing, so it expires nothing.
+- **No duplicates between retries.** An attempt that finished within `defaults.bringUpRetryMinutes` (default 10)
+  is not repeated; the result reports it as `recent`.
+- **Idle check.** If the hook can restart T3, it must run the operator's idle check and exit 75 when busy.
+  Expiring slots alone cannot authorize a restart; the router's own check only covers work it placed.
+
+Each acquisition that considers a hook carries a `bringUp` array: one entry per considered box with `outcome`
+(`up`, `failed`, `timeout`, `refused-busy`, `in-progress`, `recent` or `skipped`) and `detail`, and for a hook
+that ran also `exitCode` or `signal`, `timeoutMs`, `startedAt` and `finishedAt`. `list` shows a running claim
+(`bringUp.running`, `run`, `deadline`) or the last attempt (`outcome`, `finishedAt`, `retryAfter`).
 
 ### Future · Ephemeral boxes (Phase 4 sketch)
 
@@ -946,6 +968,7 @@ feature ships. Values such as the expiry thresholds are proposed defaults and ca
       "worktreeRoot": "~/work",
       "renew": "manual",
       "bringUp": ["/path/to/start-box"],
+      "bringUpTimeoutMs": 120000,
       "checks": [{ "tag": "gpu", "command": ["/path/to/check-gpu"], "timeoutMs": 3000 }]
     }
   },
@@ -977,6 +1000,8 @@ feature ships. Values such as the expiry thresholds are proposed defaults and ca
 | `defaults.leaseTtlHours` | Time since last run lease renewal before expiry. |
 | `defaults.cooldownMinutes` | Cooldown after a machine failure. Matches the 30 minutes the Lead brief uses for swarm. |
 | `defaults.affinityTtlMinutes` | Phase 2. Maximum age of a preferred previous placement. |
+| `defaults.bringUpTimeoutMs` | Optional default hook timeout for machines that set none. |
+| `defaults.bringUpRetryMinutes` | Optional. A bring-up attempt is not repeated within this many minutes. Default 10. |
 | `local` | Caller machine policy. |
 | `machines` | Remote inventory keyed by globally unique label. |
 | `machines.<label>.kind` | Always-on in Phase 1. Driver-backed ephemeral in Phase 4. |
@@ -991,7 +1016,8 @@ feature ships. Values such as the expiry thresholds are proposed defaults and ca
 | `exclusive` | Tags with one slot per machine. |
 | `machines.<label>.worktreeRoot` | Parent for worker-managed checkout paths. Defaults to `~/work`. |
 | `machines.<label>.renew` | Phase 2 link renewal policy, `manual` by default or `auto` with SSH. |
-| `machines.<label>.bringUp` | Optional Phase 2 user-owned bring-up command and arguments. |
+| `machines.<label>.bringUp` | Optional user-owned bring-up argument vector run at `acquire` (section 7). A non-empty array of strings whose first element is an absolute path; passed unchanged, without a shell. |
+| `machines.<label>.bringUpTimeoutMs` | Hook timeout, 1000 to 600000 ms. Default `defaults.bringUpTimeoutMs`, else 120000. |
 | `machines.<label>.checks` | Phase 2 tag-gating checks. |
 | `checks[].tag` | Capability gated by the command. |
 | `checks[].command` | User-owned command and arguments. |
@@ -1073,6 +1099,12 @@ state loses only slots and cooldowns, which are advisory and expire. Config is u
       "expiresAt": "2030-01-01T13:00:00Z"
     }
   },
+  "bringUp": {
+    "home-box": {
+      "id": "<claimId>", "run": "<runId>", "startedAt": "2030-01-01T09:50:00Z", "deadline": "2030-01-01T09:52:17Z",
+      "finishedAt": "2030-01-01T09:50:40Z", "outcome": "up", "invalidatedAt": "2030-01-01T09:50:40Z"
+    }
+  },
   "credits": { "home-box": 0 },
   "affinity": {
     "github.com/owner/repo": {
@@ -1112,6 +1144,10 @@ state loses only slots and cooldowns, which are advisory and expire. Config is u
 | `slots.<slotId>.exclusive` | Exclusive tags held by this slot. |
 | `slots.<slotId>.placedAt` | Booking time used to order outcomes against outages. |
 | `slots.<slotId>.expiresAt` | Independent stale-slot deadline. |
+| `bringUp` | Bring-up hook claims and last attempts keyed by label. Absent until a hook runs. |
+| `bringUp.<label>.id`, `run`, `startedAt`, `deadline` | The claim. While it is unfinished and before `deadline`, the box gets no slot or lease. The owning `pid` is kept only while it runs. |
+| `bringUp.<label>.finishedAt`, `outcome` | The last attempt. Another is not started before `finishedAt` plus `bringUpRetryMinutes`; the record is pruned after that. |
+| `bringUp.<label>.invalidatedAt` | Facts about the box observed before this time were expired and are never merged again. Absent after `refused-busy`. |
 | `credits` | Phase 2. Smooth weighted round-robin credits by label. Absent in Phase 1. |
 | `affinity` | Phase 2. Most recent placement by repo and caller-supplied `--affinity` key. Absent in Phase 1. |
 | `affinity.<repo>.<key>.label` | Preferred candidate if still eligible. |
@@ -1278,7 +1314,7 @@ npx skills@latest add mochahub/skills --skill t3-box-router -g -a <agent> [--cop
 
 Use `node --test` without dependencies. Keep the placement decision function pure and test it with explicit inputs
 for time, health, policy and capacity. Test locking and atomic writes separately. Existing project-specific box
-skills can retain setup facts and trusted scripts. Move their policy prose into `repos` and, from Phase 2, their
+skills can retain setup facts and trusted scripts. Move their policy prose into `repos` and their
 bring-up script into the box's optional `bringUp` hook.
 
 ## 10. Tradeoffs and alternatives rejected
@@ -1315,7 +1351,7 @@ bring-up script into the box's optional `bringUp` hook.
 | Can an attachment uploaded here reach a thread on a different environment? | Run one test with a small synthetic file. Treat the route as unverified until it passes. |
 | Pick an ephemeral vendor now? | Defer until a user needs one. First test reachability and T3 linking with a disposable instance. |
 | Confirm: at Level 0, box capacity adds to the local wave allowance, and the policy line overrides the Lead brief's single cap, unpinned picks and `--place box` gates. | Section 3 decides this. The alternative that leaves the brief untouched is one `pick-worker` per booked box slot (single picks have no cap), at the cost of one call per worker. |
-| Move the `bringUp` hook from Phase 2 into Phase 1? | Yes. Without it, replacing a hand-built provider loses automatic bring-up until Phase 2. It is one argument vector and one timeout, run only at `acquire`. |
+| Move the `bringUp` hook from Phase 2 into Phase 1? | Resolved: yes, in Phase 1. One argument vector and one timeout, run only at `acquire`, under the rules in section 7. |
 | Build weights, preference multipliers and affinity at all? | Not until Phase 1 has run. Capacity-proportional fill may be all that is needed. |
 | Document the T3 v0.1.x CLI? | Yes. Feature-detect the observed commands and keep agent observations as a fallback. |
 | What should a shell-only caller use to start a task? | Keep `t3 thread start` exploratory until a separate design verifies remote targeting and outcome handling. |
@@ -1328,8 +1364,8 @@ bring-up script into the box's optional `bringUp` hook.
 | Phase | Scope and deliverables | Exit test | Rough size |
 | --- | --- | --- | --- |
 | P0 · Scope | This spec and owner decisions on open questions. | Owner agrees on ownership, Phase 1 boundary and disposition of the open questions. | One design document and review. |
-| P1 · Always-on MVP | Installable skill, the fifteen Phase 1 commands and schemas, pure decision logic (filter, priority, load), slots and leases, T3 observations and probes, fixed cooldown, Level 0 adapter with the generated policy line, brief generation, tests, guide and README row. No swarm code change. Not included: bring-up and link renewal, so a user replacing a hand-built provider keeps running its bring-up script before `acquire` (see the open question on moving `bringUp` here). | Replace the acquire, release and placement policy of a hand-built provider in one real swarm run and complete a standalone place, delegate, done sequence. Exercise partial acquisition, simultaneous Leads, remote overflow and outage recovery. | Large single change, about 1,200–2,000 code and test lines plus docs. |
-| P2 · Transport and recovery | Snapshot and artifact helpers, tag checks, `bringUp` hook, link warnings and opt-in renewal, repo override file, `--kind` and `--read-only`, per-repo priority and caps. Only if Phase 1 shows the need: weights, preference multipliers, affinity and growing backoff. | Round-trip a snapshot without changing the user's index, return a small artifact, gate a failed GPU tag, and renew an opted-in link without persisting a credential. Exercise a repo override that attempts to widen access. | Medium to large, about 800–1,500 code and test lines. |
+| P1 · Always-on MVP | Installable skill, the fifteen Phase 1 commands and schemas, pure decision logic (filter, priority, load), slots and leases, T3 observations and probes, fixed cooldown, Level 0 adapter with the generated policy line, brief generation, tests, guide and README row. No swarm code change. The `bringUp` hook at `acquire` (section 7; moved here from P2 by the section 11 decision). Not included: link renewal. | Replace the acquire, release and placement policy of a hand-built provider in one real swarm run and complete a standalone place, delegate, done sequence. Exercise partial acquisition, simultaneous Leads, remote overflow and outage recovery. | Large single change, about 1,200–2,000 code and test lines plus docs. |
+| P2 · Transport and recovery | Snapshot and artifact helpers, tag checks, link warnings and opt-in renewal, repo override file, `--kind` and `--read-only`, per-repo priority and caps. Only if Phase 1 shows the need: weights, preference multipliers, affinity and growing backoff. | Round-trip a snapshot without changing the user's index, return a small artifact, gate a failed GPU tag, and renew an opted-in link without persisting a credential. Exercise a repo override that attempts to widen access. | Medium to large, about 800–1,500 code and test lines. |
 | P3 · Level 1 | Separate swarm change with pre-lock placement, machine cooldown forwarding, reasons in pick output and viewer, tests and docs. | Repeat the Level 0 workload with direct integration. Verify fallback and explicit-pin failures, compatibility without a router, wave rollback and absence of router calls inside the lock. | Medium, about 500–900 code and test lines across both skills. |
 | P4 · Ephemeral (not scheduled) | Only if a user needs short-lived machines. Driver protocol and one reference driver, price confirmation, run-scoped lifecycle and teardown checks. | Exercise quote, over-budget refusal, link, place and release against a test driver. Confirm one real sandbox can link before claiming sandbox compatibility. Confirm teardown refuses while output is unpreserved. | Medium experimental work, about 500–1,000 code and test lines, plus deployment exploration. |
 

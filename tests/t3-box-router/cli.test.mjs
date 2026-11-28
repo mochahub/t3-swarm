@@ -12,6 +12,9 @@ import {
   mergeFactsPatch,
   expireFactsBefore,
   bringUpCandidates,
+  planBringUps,
+  finishBringUp,
+  reapBringUps,
   acquireShortfall,
   checkKnownLabels,
 } from "../../skills/t3-box-router/scripts/cli.mjs";
@@ -153,4 +156,96 @@ test("acquireShortfall ignores pending facts", () => {
   assert.equal(acquireShortfall({ ok: false, machines: [] }, 2), 2);
   assert.equal(acquireShortfall({ ok: true, machines: [{}], shortfall: 1 }, 2), 1);
   assert.equal(acquireShortfall({ ok: true, machines: [{}] }, undefined), 0);
+});
+
+test("bringUpCandidates reads links like the engine: null and gone links, unknown statuses and expiring links never qualify", () => {
+  const link = (value) => ({ environmentId: "env-1", link: env(NOW, NOW + 900000, value) });
+  const reason = (value) => {
+    const r = bringUpCandidates({ config, state: { observations: { "home-box": link(value) } }, options: {}, repo: null, now: NOW });
+    assert.deepEqual(r.candidates.filter((c) => c.label === "home-box"), [], JSON.stringify(value));
+    return r.skipped.find((x) => x.label === "home-box")?.reason ?? "";
+  };
+  assert.match(reason(null), /missing or expired.*cannot relink/);
+  for (const status of ["missing", "unlinked", "revoked", "expired", "removed"]) assert.match(reason({ status }), /missing or expired/);
+  assert.match(reason({ status: null }), /recognized down status/);
+  assert.match(reason({ status: "unrecognized" }), /recognized down status/);
+  assert.match(reason({ status: "offline", expiresAt: iso(NOW + 3600000) }), /expires within 24 hours/);
+  assert.match(reason({ status: "offline", expiresAt: iso(NOW - 1) }), /missing or expired/);
+  assert.equal(reason({ status: "reachable" }), "", "a reachable box is not reported");
+});
+
+test("planBringUps claims atomically up to the limit, honors running claims, retries and unusable hooks", () => {
+  const down = (id) => ({ environmentId: id, link: env(NOW, NOW + 900000, { status: "offline" }) });
+  const state = { observations: { "home-box": down("env-1"), "spare-box": down("env-2") }, health: {}, slots: {} };
+  let n = 0;
+  const makeClaim = () => ({ id: `c${++n}`, startedAt: iso(NOW), deadline: iso(NOW + 60000) });
+  const base = { config, options: {}, repo: null, now: NOW, exclude: new Set(), retryMs: 600000, makeClaim };
+
+  const one = planBringUps({ ...base, state, limit: 1 });
+  assert.deepEqual(one.claimed.map((c) => c.label), ["home-box"]);
+  assert.equal(one.state.bringUp["home-box"].id, "c1");
+  assert.equal(state.bringUp, undefined, "input state is not mutated");
+
+  // A second planner on the resulting state sees the running claim and moves on.
+  const two = planBringUps({ ...base, state: one.state, limit: 1 });
+  assert.deepEqual(two.claimed.map((c) => c.label), ["spare-box"]);
+  assert.equal(two.report.find((r) => r.label === "home-box").outcome, "in-progress");
+
+  const unusable = planBringUps({ ...base, state, limit: 2, unusable: new Map([["home-box", "bringUp[0] /x is missing or not executable."]]) });
+  assert.deepEqual(unusable.claimed.map((c) => c.label), ["spare-box"]);
+  assert.match(unusable.report.find((r) => r.label === "home-box").detail, /not executable/);
+
+  const recent = { ...state, bringUp: { "home-box": { id: "old", finishedAt: iso(NOW - 60000), outcome: "failed" } } };
+  const r = planBringUps({ ...base, state: recent, limit: 2 });
+  assert.equal(r.report.find((x) => x.label === "home-box").outcome, "recent");
+  assert.deepEqual(r.claimed.map((c) => c.label), ["spare-box"]);
+  assert.equal(planBringUps({ ...base, state: recent, retryMs: 30000, limit: 2 }).claimed.length, 2, "outside the window it may run again");
+});
+
+test("finishBringUp lifts the claim and expires pre-hook facts in one step; refused-busy expires nothing", () => {
+  const obs = { environmentId: "env-1", link: env(NOW - 10, NOW + 900000, { status: "offline" }), providers: env(NOW - 10, NOW + 9e6, ["p"]), probe: env(NOW - 10, NOW + 9e5, true) };
+  const claim = { id: "c1", pid: 4242, startedAt: iso(NOW - 5000), deadline: iso(NOW + 60000) };
+  const state = { observations: { "home-box": obs }, bringUp: { "home-box": claim } };
+
+  const up = finishBringUp(state, "home-box", "c1", "up", NOW);
+  assert.deepEqual(up.bringUp["home-box"], { id: "c1", startedAt: claim.startedAt, deadline: claim.deadline, finishedAt: iso(NOW), outcome: "up", invalidatedAt: iso(NOW) });
+  for (const kind of ["link", "providers", "probe"]) assert.equal(up.observations["home-box"][kind].validUntil, iso(NOW), kind);
+
+  const busy = finishBringUp(state, "home-box", "c1", "refused-busy", NOW);
+  assert.equal(busy.bringUp["home-box"].outcome, "refused-busy");
+  assert.equal(busy.bringUp["home-box"].invalidatedAt, undefined);
+  assert.equal(busy.observations, state.observations);
+
+  // A claim reaped or replaced meanwhile keeps its record, but the late hook still invalidates the facts.
+  const replaced = { ...state, bringUp: { "home-box": { id: "other", startedAt: iso(NOW), deadline: iso(NOW + 60000) } } };
+  const late = finishBringUp(replaced, "home-box", "c1", "failed", NOW);
+  assert.equal(late.bringUp["home-box"].id, "other");
+  assert.equal(late.bringUp["home-box"].finishedAt, undefined);
+  assert.equal(late.observations["home-box"].link.validUntil, iso(NOW));
+});
+
+test("reapBringUps finalizes only claims past their deadline", () => {
+  const state = {
+    observations: { "home-box": { environmentId: "env-1", link: env(NOW - 10, NOW + 900000, { status: "reachable" }) } },
+    bringUp: {
+      "home-box": { id: "dead", pid: 1, startedAt: iso(NOW - 70000), deadline: iso(NOW - 1) },
+      "spare-box": { id: "live", pid: 1, startedAt: iso(NOW - 1000), deadline: iso(NOW + 1000) },
+    },
+  };
+  const next = reapBringUps(state, NOW);
+  assert.equal(next.bringUp["home-box"].outcome, "abandoned");
+  assert.equal(next.bringUp["home-box"].invalidatedAt, iso(NOW));
+  assert.equal(next.observations["home-box"].link.validUntil, iso(NOW));
+  assert.equal(next.bringUp["spare-box"], state.bringUp["spare-box"]);
+  assert.equal(reapBringUps({ observations: {} }, NOW).bringUp, undefined);
+});
+
+test("mergeFactsPatch drops a refresh read before the last bring-up finished, and merges probes", () => {
+  const state = { observations: {}, bringUp: { "home-box": { id: "c1", finishedAt: iso(NOW), outcome: "up", invalidatedAt: iso(NOW) } } };
+  const before = { "home-box": { environmentId: "env-1", link: env(NOW - 1, NOW + 900000, { status: "offline" }), probe: env(NOW - 1, NOW + 900000, false) } };
+  assert.equal(mergeFactsPatch(state, before, config), state, "a pre-hook read never lands after the hook");
+  const after = { "home-box": { environmentId: "env-1", link: env(NOW + 1, NOW + 900000, { status: "reachable" }), probe: env(NOW + 1, NOW + 900000, true) } };
+  const merged = mergeFactsPatch(state, after, config);
+  assert.equal(merged.observations["home-box"].link.value.status, "reachable");
+  assert.equal(merged.observations["home-box"].probe.value, true);
 });

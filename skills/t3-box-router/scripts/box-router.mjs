@@ -3,7 +3,8 @@
  * t3-box-router CLI (Node 18+, no dependencies). Chooses the machine a T3 task runs on.
  *
  * This file orchestrates commands: it parses and validates flags, reads stdin, refreshes T3 link facts and runs
- * bring-up hooks outside the state lock, then makes each decision inside one store transaction.
+ * bring-up hooks outside the state lock, then makes each decision inside one store transaction. Every
+ * transaction first finalizes bring-up claims past their deadline (reapBringUps).
  *   store.mjs   config, the state lock, atomic writes and pruning
  *   facts.mjs   T3 observations: normalizing agent records, the t3 CLI refresh, discovery
  *   engine.mjs  pure decisions for place, done, report, cooldown, acquire, release, list, doctor and the rest
@@ -34,11 +35,10 @@ import {
   observationRecordsProblem,
   changedObservationLabels,
   mergeFactsPatch,
-  expireFactsBefore,
-  activeSlotCount,
-  bringUpCandidates,
+  planBringUps,
+  finishBringUp,
+  reapBringUps,
   acquireShortfall,
-  isValidLabel,
   ts,
 } from "./cli.mjs";
 
@@ -47,11 +47,11 @@ const HOME = path.resolve(process.env.T3_BOXES_HOME || path.join(os.homedir(), "
 const MAX_STDIN_BYTES = 16 * 1024 * 1024;
 
 // Bring-up bounds. A hook gets one argument vector and one timeout; the router never retries it on its own.
-const BRINGUP_DEFAULT_TIMEOUT_MS = 120_000;
-const BRINGUP_MAX_TIMEOUT_MS = 600_000;
-const BRINGUP_RETRY_MINUTES = 10;
 const BRINGUP_BUSY_EXIT = 75; // EX_TEMPFAIL: the hook's own idle check found the box busy.
-const BRINGUP_KILL_GRACE_MS = 5_000;
+const BRINGUP_KILL_GRACE_MS = 5_000; // SIGTERM to SIGKILL
+const BRINGUP_BACKSTOP_MS = 2_000; // SIGKILL to giving up on the exit event
+// A claim's deadline: the timeout, both grace periods and a margin. Past it, any transaction finalizes the claim.
+const BRINGUP_CLAIM_MARGIN_MS = 10_000;
 
 // Commands whose decision depends on link freshness. The t3 CLI refresh (when available) runs before them.
 const REFRESH_COMMANDS = new Set(["place", "acquire", "list", "doctor", "register-payload"]);
@@ -135,6 +135,14 @@ function readStdin({ idleMs = 0 } = {}) {
   });
 }
 
+function readJsonFile(p) {
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 function parseJsonInput(text, what) {
   try {
     return JSON.parse(text);
@@ -146,9 +154,19 @@ function parseJsonInput(text, what) {
 // ----------------------------------------------------------------------------------------------------------------
 // Store wrappers
 
+// Every state transaction goes through here, so a bring-up claim past its deadline is finalized (and its box's
+// facts expired) before anything else reads the state.
+async function transaction(config, fn) {
+  return store.transaction(HOME, config, (loaded, now) => {
+    const state = reapBringUps(loaded, now);
+    const out = fn(state, now);
+    return out && typeof out === "object" && out.state === undefined ? { ...out, state } : out;
+  });
+}
+
 // A copy of the current (pruned) state, taken under the lock and used only outside it.
 async function snapshot(config) {
-  return store.transaction(HOME, config, (state, now) => ({ state, result: { ok: true, state: structuredClone(state), now } }));
+  return transaction(config, (state, now) => ({ state, result: { ok: true, state: structuredClone(state), now } }));
 }
 
 function snapshotOrError(snap) {
@@ -173,7 +191,7 @@ function cleanPatch(patch) {
 
 // One transaction: merge refreshed facts onto the latest observations, then decide.
 async function decideWith(command, { config, options, repo, patch }) {
-  return store.transaction(HOME, config, (state, now) => {
+  return transaction(config, (state, now) => {
     const merged = mergeFactsPatch(state, cleanPatch(patch), config);
     return engine.decide(command, { config, state: merged, options, repo, now, newId });
   });
@@ -183,130 +201,48 @@ async function decideWith(command, { config, options, repo, patch }) {
 // Bring-up hook (acquire only)
 //
 // Safety rules:
-//   - Never under the state lock. Candidates come from a snapshot; the hook, its timeout and the refresh after
-//     it all run outside the lock.
-//   - One hook per box at a time, across processes: an O_EXCL claim file per label. A concurrent acquire, or a
-//     place racing it, never starts a second hook; a stale claim (dead process or past its deadline) is replaced.
-//   - Not on retry: an attempt within BRINGUP_RETRY_MINUTES is not repeated, so an agent retrying while it reads
-//     facts does not restart the box again. Pending facts (needsObservation) never trigger a hook at all.
-//   - Not while the router holds a slot there, and that is not enough: slots are advisory and expire, so the hook
-//     must run the operator's own idle check before restarting T3 and exit 75 when the box is busy.
-//   - Only the configured argument vector, no shell, output discarded (it could carry tokens).
-//   - Afterwards every fact about the box observed before the hook finished is expired, links are re-read, and
-//     the acquisition is decided again on fresh evidence.
-
-const bringUpDir = () => path.join(HOME, "bringup");
-function safeLabel(label) {
-  if (!isValidLabel(label)) throw new Error(`Invalid machine label ${JSON.stringify(label)} for a bring-up file.`);
-  return label;
-}
-const claimPath = (label) => path.join(bringUpDir(), `${safeLabel(label)}.lock`);
-const recordPath = (label) => path.join(bringUpDir(), `${safeLabel(label)}.json`);
-
-function pidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return e?.code === "EPERM";
-  }
-}
-
-function readJsonFile(p) {
-  try {
-    return JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-function writeJsonFile(p, obj) {
-  const tmp = `${p}.${process.pid}.${newId()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n", { mode: 0o600 });
-  fs.renameSync(tmp, p);
-}
-
-// A claim is live while its process runs and its deadline has not passed. An empty claim is one being written
-// right now, unless it is old (its writer died between create and write).
-function claimIsLive(p) {
-  const cur = readJsonFile(p);
-  if (!cur) {
-    try {
-      return Date.now() - fs.statSync(p).mtimeMs < 60_000;
-    } catch {
-      return false;
-    }
-  }
-  return pidAlive(cur.pid) && Number(cur.deadline) > Date.now();
-}
-
-function liveClaim(label) {
-  return fs.existsSync(claimPath(label)) && claimIsLive(claimPath(label));
-}
-
-// Move a stale claim aside atomically. If what we moved turns out to be a fresh claim another process wrote in
-// the meantime, put it back (link fails if yet another claim exists, which then stands).
-function breakStaleClaim(p) {
-  const stale = readJsonFile(p);
-  const aside = `${p}.stale.${process.pid}.${newId()}`;
-  try {
-    fs.renameSync(p, aside);
-  } catch {
-    return;
-  }
-  const moved = readJsonFile(aside);
-  if (moved && stale && moved.token !== stale.token) {
-    try {
-      fs.linkSync(aside, p);
-    } catch {
-      // Another claim exists now; it stands.
-    }
-  }
-  fs.rmSync(aside, { force: true });
-}
-
-// Returns a release function, or null when another live process holds the claim.
-function claimBringUp(label, deadlineMs) {
-  fs.mkdirSync(bringUpDir(), { recursive: true, mode: 0o700 });
-  const p = claimPath(label);
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = fs.openSync(p, "wx", 0o600);
-      const token = newId();
-      fs.writeSync(fd, JSON.stringify({ pid: process.pid, token, startedAt: Date.now(), deadline: deadlineMs }));
-      fs.closeSync(fd);
-      return () => {
-        const cur = readJsonFile(p);
-        if (cur?.token === token) fs.rmSync(p, { force: true });
-      };
-    } catch (e) {
-      if (e?.code !== "EEXIST") throw e;
-      if (claimIsLive(p)) return null;
-      breakStaleClaim(p);
-    }
-  }
-  return null;
-}
+//   - One claim per box, held in state.json. Choosing candidates, checking slots, cooldown, a running hook and
+//     the retry window, and writing the claim happen in one transaction, so concurrent acquires never start a
+//     second hook and a concurrent place never books past the check. While the claim stands, the engine gives
+//     no slot or lease on that box.
+//   - Never under the state lock: the executable check, the hook, its timeout and the link refresh after it all
+//     run between transactions.
+//   - Only on fresh evidence that the box is linked but down (cli.bringUpCandidates). A missing or expiring link,
+//     an unknown status, a cooling box, held slots and pending facts never start a hook.
+//   - Not on retry: an attempt that finished within bringUpRetryMinutes is not repeated, so an agent retrying
+//     while it reads facts does not restart the box again.
+//   - Slots are advisory and expire, so holding none is not proof the box is idle: the hook must run the
+//     operator's own idle check before restarting T3 and exit 75 when the box is busy.
+//   - Only the configured argument vector, no shell, output discarded (it could carry tokens). Its own process
+//     group, stopped with SIGTERM then SIGKILL at the timeout. A process that leaves that group (setsid) escapes.
+//   - Finishing lifts the claim and expires every fact about the box observed before the hook finished, in one
+//     transaction; links are then re-read and the acquisition decided again on fresh evidence. A claim whose
+//     router died is finalized the same way by the first transaction after its deadline.
 
 function hookTimeoutMs(config, machine) {
-  const raw = Number(machine.bringUpTimeoutMs ?? config.defaults?.bringUpTimeoutMs ?? BRINGUP_DEFAULT_TIMEOUT_MS);
-  return Math.min(BRINGUP_MAX_TIMEOUT_MS, Math.max(1000, Number.isFinite(raw) ? raw : BRINGUP_DEFAULT_TIMEOUT_MS));
+  const raw = Number(machine.bringUpTimeoutMs ?? config.defaults?.bringUpTimeoutMs ?? store.BRINGUP_LIMITS.defaultTimeoutMs);
+  const { minTimeoutMs, maxTimeoutMs, defaultTimeoutMs } = store.BRINGUP_LIMITS;
+  return Math.min(maxTimeoutMs, Math.max(minTimeoutMs, Number.isFinite(raw) ? raw : defaultTimeoutMs));
+}
+
+function retryWindowMs(config) {
+  const m = Number(config.defaults?.bringUpRetryMinutes);
+  return (m > 0 ? m : store.BRINGUP_LIMITS.defaultRetryMinutes) * 60_000;
 }
 
 function hookArgvProblem(argv) {
-  if (!Array.isArray(argv) || !argv.length || argv.some((a) => typeof a !== "string" || !a || a.includes("\0"))) {
-    return "bringUp must be a non-empty argument vector of strings.";
-  }
-  if (!path.isAbsolute(argv[0])) return "bringUp's command must be an absolute path.";
+  const shape = store.bringUpArgvProblem(argv);
+  if (shape) return shape;
   try {
+    if (!fs.statSync(argv[0]).isFile()) return `bringUp[0] ${argv[0]} is not a file.`;
     fs.accessSync(argv[0], fs.constants.X_OK);
   } catch {
-    return `bringUp's command ${argv[0]} is missing or not executable.`;
+    return `bringUp[0] ${argv[0]} is missing or not executable.`;
   }
   return null;
 }
 
+// Run the hook to completion or its bound. Resolves { outcome, detail, exitCode?, signal? }; never rejects.
 function runHook(argv, input, timeoutMs) {
   return new Promise((resolve) => {
     let child;
@@ -321,8 +257,21 @@ function runHook(argv, input, timeoutMs) {
     } catch (e) {
       return resolve({ outcome: "failed", detail: `Could not start: ${errorMessage(e)}` });
     }
+    let settled = false;
     let timedOut = false;
-    let killTimer = null;
+    const timers = [];
+    const settle = (r) => {
+      if (settled) return;
+      settled = true;
+      for (const t of timers) clearTimeout(t);
+      try {
+        child.stdin?.destroy();
+        child.unref();
+      } catch {
+        // already closed
+      }
+      resolve(r);
+    };
     const stop = (sig) => {
       try {
         if (process.platform !== "win32" && child.pid) process.kill(-child.pid, sig);
@@ -331,88 +280,61 @@ function runHook(argv, input, timeoutMs) {
         // Already gone.
       }
     };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      stop("SIGTERM");
-      killTimer = setTimeout(() => stop("SIGKILL"), BRINGUP_KILL_GRACE_MS);
-    }, timeoutMs);
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      clearTimeout(killTimer);
-      resolve({ outcome: "failed", detail: `Could not start: ${e.code || errorMessage(e)}` });
-    });
-    child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      clearTimeout(killTimer);
-      if (timedOut) return resolve({ outcome: "timeout", detail: `No exit within ${timeoutMs} ms; stopped.` });
-      if (code === 0) return resolve({ outcome: "up", detail: "Hook exited 0." });
-      if (code === BRINGUP_BUSY_EXIT) {
-        return resolve({ outcome: "refused-busy", detail: "The hook's idle check found the box busy (exit 75). Nothing was restarted." });
+    timers.push(
+      setTimeout(() => {
+        timedOut = true;
+        stop("SIGTERM");
+        timers.push(
+          setTimeout(() => {
+            stop("SIGKILL");
+            timers.push(
+              setTimeout(
+                () => settle({ outcome: "timeout", detail: `No exit within ${timeoutMs} ms; sent SIGTERM, then SIGKILL, and stopped waiting.` }),
+                BRINGUP_BACKSTOP_MS,
+              ),
+            );
+          }, BRINGUP_KILL_GRACE_MS),
+        );
+      }, timeoutMs),
+    );
+    child.on("error", (e) => settle({ outcome: "failed", detail: `Could not start: ${e.code || errorMessage(e)}` }));
+    child.on("exit", (code, signal) => {
+      if (timedOut) {
+        // Whatever the hook left in its group is stopped too; a service it started before the timeout is not
+        // trusted to be in a known state.
+        stop("SIGKILL");
+        return settle({ outcome: "timeout", detail: `No exit within ${timeoutMs} ms; stopped.`, ...(signal ? { signal } : { exitCode: code }) });
       }
-      resolve({ outcome: "failed", detail: signal ? `Hook ended by ${signal}.` : `Hook exited ${code}.` });
+      if (code === 0) return settle({ outcome: "up", detail: "Hook exited 0.", exitCode: 0 });
+      if (code === BRINGUP_BUSY_EXIT) {
+        return settle({ outcome: "refused-busy", detail: "The hook's idle check found the box busy (exit 75). Nothing was restarted.", exitCode: code });
+      }
+      settle({ outcome: "failed", detail: signal ? `Hook ended by ${signal}.` : `Hook exited ${code}.`, ...(signal ? { signal } : { exitCode: code }) });
     });
     child.stdin.on("error", () => {});
     child.stdin.end(JSON.stringify(input) + "\n");
   });
 }
 
-async function bringUpOne({ config, label, run, retryMs }) {
+async function runClaimed(config, { label, claim }, run) {
   const machine = config.machines[label];
-  const problem = hookArgvProblem(machine.bringUp);
-  if (problem) return { label, outcome: "skipped", detail: problem, ran: false };
-
-  const last = readJsonFile(recordPath(label));
-  if (last && Number(last.finishedAt) > Date.now() - retryMs) {
-    return {
-      label,
-      outcome: "recent",
-      detail: `A bring-up finished at ${new Date(last.finishedAt).toISOString()} (${last.outcome}). Not repeated within ${retryMs / 60000} minutes; observe facts and retry, or report the box.`,
-      ran: false,
-    };
-  }
-
   const timeoutMs = hookTimeoutMs(config, machine);
-  const release = claimBringUp(label, Date.now() + timeoutMs + BRINGUP_KILL_GRACE_MS + 30_000);
-  if (!release) return { label, outcome: "in-progress", detail: "Another router call is bringing this box up. Retry acquire after it finishes.", ran: false };
-
-  try {
-    // Re-check under the claim against current state: the box may have come back, or a slot may have been
-    // booked there, since the candidate snapshot.
-    const snap = await snapshot(config);
-    if (snapshotOrError(snap)) return { label, outcome: "skipped", detail: "Could not re-read router state.", ran: false };
-    const obs = snap.state.observations?.[label];
-    const link = obs?.environmentId === machine.environmentId ? obs.link : null;
-    if (link && ts(link.validUntil) > snap.now && link.value?.status === "reachable") {
-      return { label, outcome: "skipped", detail: "The box is reachable again.", ran: false };
-    }
-    const held = activeSlotCount(snap.state, label, snap.now);
-    if (held) return { label, outcome: "skipped", detail: `${held} router slot(s) are held there now. Refusing to restart.`, ran: false };
-
-    const startedAt = Date.now();
-    const input = {
-      hook: "bringUp",
-      label,
-      environmentId: machine.environmentId,
-      run: run ?? null,
-      routerActiveSlots: 0,
-      requireIdleCheck: true,
-      note: "The router holds no slot on this box, which does not prove it is idle. Run your own idle check before restarting T3 and exit 75 if the box is busy.",
-    };
-    const res = await runHook(machine.bringUp, input, timeoutMs);
-    const finishedAt = Date.now();
-    try {
-      writeJsonFile(recordPath(label), { startedAt, finishedAt, outcome: res.outcome });
-    } catch {
-      // The record only throttles retries; the claim already kept this attempt exclusive.
-    }
-    return { label, ...res, ran: res.outcome !== "refused-busy", finishedAt };
-  } finally {
-    release();
-  }
+  const input = {
+    hook: "bringUp",
+    label,
+    environmentId: machine.environmentId,
+    run: run ?? null,
+    timeoutMs,
+    routerActiveSlots: 0,
+    requireIdleCheck: true,
+    note: "The router holds no slot on this box, which does not prove it is idle. Run your own idle check before restarting T3 and exit 75 if the box is busy.",
+  };
+  const res = await runHook(machine.bringUp, input, timeoutMs);
+  return { label, claimId: claim.id, startedAt: claim.startedAt, timeoutMs, ...res, finishedAt: Date.now() };
 }
 
 async function acquireWithBringUp({ config, options, repo }) {
-  let snap = await snapshot(config);
+  const snap = await snapshot(config);
   const snapErr = snapshotOrError(snap);
   if (snapErr) return snapErr;
   let patch = await refreshPatch(config, snap.state);
@@ -420,35 +342,65 @@ async function acquireWithBringUp({ config, options, repo }) {
 
   const shortfall = acquireShortfall(result, options.count);
   if (!shortfall) return result;
-  const hooked = Object.values(config.machines || {}).some((m) => Array.isArray(m?.bringUp) && m.bringUp.length);
-  if (!hooked) return result;
+  const hooked = Object.entries(config.machines || {}).filter(([, m]) => Array.isArray(m?.bringUp) && m.bringUp.length);
+  if (!hooked.length) return result;
 
-  snap = await snapshot(config);
-  if (snapshotOrError(snap)) return result;
+  // File checks first, outside the lock.
+  const unusable = new Map();
+  for (const [label, m] of hooked) {
+    const problem = hookArgvProblem(m.bringUp);
+    if (problem) unusable.set(label, problem);
+  }
   const leased = new Set((Array.isArray(result?.machines) ? result.machines : []).map((m) => m?.label));
-  const { candidates, skipped } = bringUpCandidates({ config, state: snap.state, options, repo, now: snap.now, exclude: leased });
-  const report = skipped.map((s) => ({ label: s.label, outcome: "skipped", detail: s.reason }));
-  if (!candidates.length) return report.length ? withBringUp(result, report) : result;
+  const plan = await transaction(config, (state, now) => {
+    const planned = planBringUps({
+      config,
+      state,
+      options,
+      repo,
+      now,
+      exclude: leased,
+      retryMs: retryWindowMs(config),
+      limit: shortfall,
+      unusable,
+      makeClaim: (label) => ({
+        id: newId(),
+        run: options.run ?? null,
+        pid: process.pid,
+        startedAt: new Date(now).toISOString(),
+        deadline: new Date(now + hookTimeoutMs(config, config.machines[label]) + BRINGUP_KILL_GRACE_MS + BRINGUP_BACKSTOP_MS + BRINGUP_CLAIM_MARGIN_MS).toISOString(),
+      }),
+    });
+    return { state: planned.state, result: { ok: true, claimed: planned.claimed, report: planned.report } };
+  });
+  if (!plan || plan.ok !== true) return withBringUp(result, [{ label: null, outcome: "skipped", detail: `Could not plan a bring-up: ${plan?.error ?? "no state"}` }]);
+  const report = [...plan.report];
+  if (!plan.claimed.length) return report.length ? withBringUp(result, report) : result;
 
-  const retryMs = (Number(config.defaults?.bringUpRetryMinutes) || BRINGUP_RETRY_MINUTES) * 60000;
   const runs = await Promise.all(
-    candidates.slice(0, shortfall).map((c) =>
-      bringUpOne({ config, label: c.label, run: options.run, retryMs }).catch((e) => ({ label: c.label, outcome: "failed", detail: errorMessage(e), ran: false })),
+    plan.claimed.map((c) =>
+      runClaimed(config, c, options.run).catch((e) => ({ label: c.label, claimId: c.claim.id, outcome: "failed", detail: errorMessage(e), finishedAt: Date.now() })),
     ),
   );
-  for (const r of runs) report.push({ label: r.label, outcome: r.outcome, detail: r.detail });
-
-  const ran = runs.filter((r) => r.ran);
-  if (!ran.length) return withBringUp(result, report);
-
-  // Facts observed before the hook finished no longer describe the box. Expire them, re-read links, decide again.
-  const cutoff = Math.max(...ran.map((r) => r.finishedAt || Date.now()));
-  const after = await store.transaction(HOME, config, (state) => {
-    const next = expireFactsBefore(state, ran.map((r) => r.label), cutoff);
-    return { state: next, result: { ok: true, state: structuredClone(next), now: Date.now() } };
+  // Lift the claims and expire pre-hook facts in one step, so the box is never eligible on old evidence.
+  const finished = await transaction(config, (state) => {
+    let next = state;
+    for (const r of runs) next = finishBringUp(next, r.label, r.claimId, r.outcome, r.finishedAt);
+    return { state: next, result: { ok: true, state: structuredClone(next) } };
   });
-  if (snapshotOrError(after)) return withBringUp(result, report);
-  patch = await refreshPatch(config, after.state);
+  for (const r of runs) {
+    const { claimId, ...shown } = r;
+    report.push({
+      ...shown,
+      startedAt: r.startedAt ?? null,
+      finishedAt: new Date(r.finishedAt).toISOString(),
+      ...(finished?.ok === true ? {} : { warning: `Could not record the outcome: ${finished?.error}. The claim lapses at its deadline.` }),
+    });
+  }
+  if (finished?.ok !== true || !runs.some((r) => r.outcome !== "refused-busy")) return withBringUp(result, report);
+
+  // Re-read links (the invalidated ones are stale now) and decide again on fresh evidence.
+  patch = await refreshPatch(config, finished.state);
   result = await decideWith("acquire", { config, options, repo, patch });
   return withBringUp(result, report);
 }
@@ -481,7 +433,7 @@ async function cmdObserve(config) {
   const records = parseJsonInput(text, "observe input");
   const problem = observationRecordsProblem(records);
   if (problem) return { ok: false, error: problem };
-  return store.transaction(HOME, config, (state, now) => {
+  return transaction(config, (state, now) => {
     const next = facts.applyObservations(config, state, records, now);
     return { state: next, result: { ok: true, updated: changedObservationLabels(state, next) } };
   });
@@ -528,6 +480,7 @@ async function cmdDoctor(config, options, repo, patch) {
       label,
       ok: !problem,
       timeoutMs: hookTimeoutMs(config, m),
+      retryMinutes: retryWindowMs(config) / 60_000,
       ...(problem ? { problem } : { note: "Runs only at acquire. The hook must run the operator's idle check and exit 75 when busy." }),
     });
   }
@@ -569,27 +522,7 @@ async function main(argv) {
     patch = await refreshPatch(config, snap.state);
   }
   if (command === "doctor") return cmdDoctor(config, options, repo, patch);
-  const result = await decideWith(command, { config, options, repo, patch });
-  return command === "place" ? warnBringUpInProgress(result) : result;
-}
-
-// A place can land on a box whose bring-up hook is still running only when fresh facts already say the box is
-// reachable. Tell the caller, so a failed dispatch there is reported as failed, not as a lost machine.
-function warnBringUpInProgress(result) {
-  if (!result || typeof result !== "object" || Array.isArray(result) || result.ok !== true) return result;
-  const placements = Array.isArray(result.placements) ? result.placements : [result];
-  const labels = [...new Set(placements.map((p) => p?.placement?.label).filter((l) => l && l !== "local"))];
-  const busy = labels.filter((l) => {
-    try {
-      return liveClaim(l);
-    } catch {
-      return false;
-    }
-  });
-  if (!busy.length) return result;
-  const warnings = [...(Array.isArray(result.warnings) ? result.warnings : [])];
-  for (const l of busy) warnings.push(`${l} is being brought up by a concurrent acquire. If dispatch there fails, return the slot with done --outcome failed and place again.`);
-  return { ...result, warnings };
+  return decideWith(command, { config, options, repo, patch });
 }
 
 main(process.argv.slice(2)).then(emit, (e) => {
