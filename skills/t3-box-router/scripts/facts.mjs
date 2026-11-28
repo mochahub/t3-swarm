@@ -500,7 +500,7 @@ export function proposeLabel(t3Label, environmentId) {
  */
 export async function discover(config, opts = {}) {
   const machines = config?.machines || {};
-  let latestLinks = null;
+  let links = null;
   let source = null;
   const warnings = [];
   const bin = resolveT3(opts);
