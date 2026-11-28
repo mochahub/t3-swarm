@@ -359,6 +359,11 @@ describe("ownership and release planning", () => {
     const orphanPlan = plan(orphan);
     assert.equal(orphanPlan.claimed.length, 0);
     assert.match(entry(orphanPlan.result.tearDown, "od").detail, /1 live slot/);
+    // So does another run's lease on e-od under a removed label: pruning empties its machines, not its environments.
+    const goneLease = base({}, { ...structuredClone(owned), r2: { machines: ["gone"], environments: { gone: "e-od" }, expiresAt: later } });
+    pruneState(config, goneLease, NOW);
+    assert.deepEqual(goneLease.leases.r2.machines, []);
+    assert.match(entry(plan(goneLease).result.tearDown, "od").detail, /Still leased to run r2/);
     // A slot under the same label but naming another environment still blocks: the label match is kept, conservatively.
     const sameLabel = plan({ ...base({}, owned), slots: { s1: { label: "od", environmentId: "e-old", run: "r9", expiresAt: later } } });
     assert.equal(sameLabel.claimed.length, 0);
