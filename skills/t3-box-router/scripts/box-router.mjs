@@ -9,13 +9,15 @@
  *   facts.mjs   T3 observations: normalizing agent records, the t3 CLI refresh, discovery
  *   engine.mjs  pure decisions for place, done, report, cooldown, acquire, release, list, doctor and the rest
  *   cli.mjs     parsing, validation, the Level 0 policy line and the pure parts of bring-up
+ *   hooks.mjs   the bounded argument-vector hook runner and the bringUp start marker
+ *   lifecycle.mjs  on-demand and ephemeral boxes: ownership, tearDown at release, keep-alive, handoff and fetch
  *
  * Every command prints one JSON object and exits 0 exactly when ok is true. register-payload prints the bare
  * swarm registration array on success.
  */
 
 import crypto from "node:crypto";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -24,6 +26,8 @@ import { fileURLToPath } from "node:url";
 import * as store from "./store.mjs";
 import * as facts from "./facts.mjs";
 import * as engine from "./engine.mjs";
+import * as lifecycle from "./lifecycle.mjs";
+import { runHook, hookArgvProblem, parseStartedMarker, claimDeadline } from "./hooks.mjs";
 import {
   UsageError,
   parseArgv,
@@ -43,13 +47,6 @@ import {
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const HOME = path.resolve(process.env.T3_BOXES_HOME || path.join(os.homedir(), ".t3", "boxes"));
 const MAX_STDIN_BYTES = 16 * 1024 * 1024;
-
-// Bring-up bounds. A hook gets one argument vector and one timeout; the router never retries it on its own.
-const BRINGUP_BUSY_EXIT = 75; // EX_TEMPFAIL: the hook's own idle check found the box busy.
-const BRINGUP_KILL_GRACE_MS = 5_000; // SIGTERM to SIGKILL
-const BRINGUP_BACKSTOP_MS = 2_000; // SIGKILL to giving up on the exit event
-// A claim's deadline: the timeout, both grace periods and a margin. Past it, any transaction finalizes the claim.
-const BRINGUP_CLAIM_MARGIN_MS = 10_000;
 
 // Commands whose decision depends on link freshness. The t3 CLI refresh (when available) runs before them.
 const REFRESH_COMMANDS = new Set(["place", "acquire", "list", "doctor", "register-payload"]);
@@ -191,7 +188,9 @@ function cleanPatch(patch) {
 async function decideWith(command, { config, options, repo, patch }) {
   return transaction(config, (state, now) => {
     const merged = facts.mergeFactPatch(config, state, cleanPatch(patch), now);
-    return engine.decide(command, { config, state: merged, options, repo, now, newId });
+    const out = engine.decide(command, { config, state: merged, options, repo, now, newId });
+    // A box this run's bring-up confirmed it started becomes the run's (lease startedByRouter) as it is leased.
+    return command === "acquire" ? lifecycle.adoptAfterAcquire(out, options.run, now) : out;
   });
 }
 
@@ -212,7 +211,10 @@ async function decideWith(command, { config, options, repo, patch }) {
 //   - Slots are advisory and expire, so holding none is not proof the box is idle: the hook must run the
 //     operator's own idle check before restarting T3 and exit 75 when the box is busy.
 //   - Only the configured argument vector, no shell, output discarded (it could carry tokens). Its own process
-//     group, stopped with SIGTERM then SIGKILL at the timeout. A process that leaves that group (setsid) escapes.
+//     group, stopped with SIGTERM then SIGKILL at the timeout (hooks.mjs). A process that leaves that group
+//     (setsid) escapes.
+//   - The hook may confirm it started the box in its result file (STARTED <label> yes|no or {"started":bool}).
+//     Only that boolean, on exit 0, is kept: it makes the box this run's when acquire leases it.
 //   - Finishing lifts the claim and expires every fact about the box observed before the hook finished, in one
 //     transaction; links are then re-read and the acquisition decided again on fresh evidence. A claim whose
 //     router died is finalized the same way by the first transaction after its deadline.
@@ -228,119 +230,6 @@ function retryWindowMs(config) {
   return (m > 0 ? m : store.BRINGUP_LIMITS.defaultRetryMinutes) * 60_000;
 }
 
-function hookArgvProblem(argv) {
-  const shape = store.bringUpArgvProblem(argv);
-  if (shape) return shape;
-  try {
-    if (!fs.statSync(argv[0]).isFile()) return `bringUp[0] ${argv[0]} is not a file.`;
-    fs.accessSync(argv[0], fs.constants.X_OK);
-  } catch {
-    return `bringUp[0] ${argv[0]} is missing or not executable.`;
-  }
-  return null;
-}
-
-// Process groups of hooks still running. If the router itself is told to stop (a caller's command timeout sends
-// SIGTERM, SIGINT or SIGHUP), it kills these groups before exiting, so a hook never outlives its router unless
-// the router is SIGKILLed. The claim then lapses at its deadline and the reaper expires the box's facts.
-const liveHookGroups = new Set();
-const STOP_SIGNALS = { SIGTERM: 15, SIGINT: 2, SIGHUP: 1 };
-function onStopSignal(sig) {
-  for (const pgid of liveHookGroups) {
-    try {
-      process.kill(-pgid, "SIGKILL");
-    } catch {
-      // already gone
-    }
-  }
-  process.exit(128 + STOP_SIGNALS[sig]);
-}
-function trackHookGroup(pgid) {
-  if (process.platform === "win32" || !pgid) return;
-  if (!liveHookGroups.size) for (const sig of Object.keys(STOP_SIGNALS)) process.on(sig, onStopSignal);
-  liveHookGroups.add(pgid);
-}
-function untrackHookGroup(pgid) {
-  if (!liveHookGroups.delete(pgid) || liveHookGroups.size) return;
-  for (const sig of Object.keys(STOP_SIGNALS)) process.off(sig, onStopSignal);
-}
-
-// Run the hook to completion or its bound. Resolves { outcome, detail, exitCode?, signal? }; never rejects.
-function runHook(argv, input, timeoutMs) {
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn(argv[0], argv.slice(1), {
-        stdio: ["pipe", "ignore", "ignore"],
-        env: { ...process.env, T3_BOXES_HOOK: "bringUp", T3_BOXES_IDLE_CHECK: "required", T3_BOXES_LABEL: input.label },
-        shell: false,
-        // Its own process group, so a timeout stops everything the hook started, not just the hook.
-        detached: process.platform !== "win32",
-      });
-    } catch (e) {
-      return resolve({ outcome: "failed", detail: `Could not start: ${errorMessage(e)}` });
-    }
-    let settled = false;
-    let timedOut = false;
-    const timers = [];
-    trackHookGroup(child.pid);
-    const settle = (r) => {
-      if (settled) return;
-      settled = true;
-      for (const t of timers) clearTimeout(t);
-      untrackHookGroup(child.pid);
-      try {
-        child.stdin?.destroy();
-        child.unref();
-      } catch {
-        // already closed
-      }
-      resolve(r);
-    };
-    const stop = (sig) => {
-      try {
-        if (process.platform !== "win32" && child.pid) process.kill(-child.pid, sig);
-        else child.kill(sig);
-      } catch {
-        // Already gone.
-      }
-    };
-    timers.push(
-      setTimeout(() => {
-        timedOut = true;
-        stop("SIGTERM");
-        timers.push(
-          setTimeout(() => {
-            stop("SIGKILL");
-            timers.push(
-              setTimeout(
-                () => settle({ outcome: "timeout", detail: `No exit within ${timeoutMs} ms; sent SIGTERM, then SIGKILL, and stopped waiting.` }),
-                BRINGUP_BACKSTOP_MS,
-              ),
-            );
-          }, BRINGUP_KILL_GRACE_MS),
-        );
-      }, timeoutMs),
-    );
-    child.on("error", (e) => settle({ outcome: "failed", detail: `Could not start: ${e.code || errorMessage(e)}` }));
-    child.on("exit", (code, signal) => {
-      if (timedOut) {
-        // Whatever the hook left in its group is stopped too; a service it started before the timeout is not
-        // trusted to be in a known state.
-        stop("SIGKILL");
-        return settle({ outcome: "timeout", detail: `No exit within ${timeoutMs} ms; stopped.`, ...(signal ? { signal } : { exitCode: code }) });
-      }
-      if (code === 0) return settle({ outcome: "up", detail: "Hook exited 0.", exitCode: 0 });
-      if (code === BRINGUP_BUSY_EXIT) {
-        return settle({ outcome: "refused-busy", detail: "The hook's idle check found the box busy (exit 75). Nothing was restarted.", exitCode: code });
-      }
-      settle({ outcome: "failed", detail: signal ? `Hook ended by ${signal}.` : `Hook exited ${code}.`, ...(signal ? { signal } : { exitCode: code }) });
-    });
-    child.stdin.on("error", () => {});
-    child.stdin.end(JSON.stringify(input) + "\n");
-  });
-}
-
 async function runClaimed(config, { label, claim }, run) {
   const machine = config.machines[label];
   const timeoutMs = hookTimeoutMs(config, machine);
@@ -352,10 +241,14 @@ async function runClaimed(config, { label, claim }, run) {
     timeoutMs,
     routerActiveSlots: 0,
     requireIdleCheck: true,
+    kind: machine.kind ?? "always-on",
     note: "The router holds no slot on this box, which does not prove it is idle. Run your own idle check before restarting T3 and exit 75 if the box is busy.",
+    confirm: "Optional: write STARTED <label> yes|no, or {\"started\": true|false}, to the file named by T3_BOXES_RESULT_FILE to say whether this hook started the box. Only yes lets release stop it later.",
   };
-  const res = await runHook(machine.bringUp, input, timeoutMs);
-  return { label, claimId: claim.id, startedAt: claim.startedAt, timeoutMs, ...res, finishedAt: Date.now() };
+  const res = await runHook(machine.bringUp, input, timeoutMs, { name: "bringUp", label, idleCheck: true, resultFile: true });
+  // Reduce the result file to one boolean here; its text goes no further.
+  const started = res.outcome === "up" ? parseStartedMarker(res.resultText, label, { truncated: res.resultTruncated === true }) : null;
+  return { label, claimId: claim.id, startedAt: claim.startedAt, timeoutMs, ...lifecycle.publicHookResult(res), started, finishedAt: Date.now() };
 }
 
 async function acquireWithBringUp({ config, options, repo }) {
@@ -393,7 +286,7 @@ async function acquireWithBringUp({ config, options, repo }) {
         run: options.run ?? null,
         pid: process.pid,
         startedAt: new Date(now).toISOString(),
-        deadline: new Date(now + hookTimeoutMs(config, config.machines[label]) + BRINGUP_KILL_GRACE_MS + BRINGUP_BACKSTOP_MS + BRINGUP_CLAIM_MARGIN_MS).toISOString(),
+        deadline: new Date(claimDeadline(now, hookTimeoutMs(config, config.machines[label]))).toISOString(),
       }),
     });
     return { state: planned.state, result: { ok: true, claimed: planned.claimed, report: planned.report } };
@@ -404,13 +297,13 @@ async function acquireWithBringUp({ config, options, repo }) {
 
   const runs = await Promise.all(
     plan.claimed.map((c) =>
-      runClaimed(config, c, options.run).catch((e) => ({ label: c.label, claimId: c.claim.id, outcome: "failed", detail: errorMessage(e), finishedAt: Date.now() })),
+      runClaimed(config, c, options.run).catch((e) => ({ label: c.label, claimId: c.claim.id, outcome: "failed", detail: errorMessage(e), started: null, finishedAt: Date.now() })),
     ),
   );
   // Lift the claims and expire pre-hook facts in one step, so the box is never eligible on old evidence.
   const finished = await transaction(config, (state) => {
     let next = state;
-    for (const r of runs) next = finishBringUp(next, r.label, r.claimId, r.outcome, r.finishedAt);
+    for (const r of runs) next = finishBringUp(next, r.label, r.claimId, r.outcome, r.finishedAt, { started: r.started });
     return { state: next, result: { ok: true, state: structuredClone(next) } };
   });
   for (const r of runs) {
@@ -509,6 +402,7 @@ async function cmdDoctor(config, options, repo, patch) {
       ...(problem ? { problem } : { note: "Runs only at acquire. The hook must run the operator's idle check and exit 75 when busy." }),
     });
   }
+  const lifecycleHooks = lifecycle.doctorLifecycle(config, hookArgvProblem);
   return {
     ...result,
     router: {
@@ -518,6 +412,7 @@ async function cmdDoctor(config, options, repo, patch) {
       repo,
       ...(patch?.__error ? { linkRefreshError: patch.__error } : {}),
       ...(hooks.length ? { bringUp: hooks } : {}),
+      ...(lifecycleHooks.length ? { lifecycle: lifecycleHooks } : {}),
     },
   };
 }
@@ -541,6 +436,21 @@ async function main(argv) {
   const repo = REPO_COMMANDS.has(command) ? currentRepoKey() : null;
   if (command === "policy-line") return cmdPolicyLine(config, options, repo);
   if (command === "acquire") return acquireWithBringUp({ config, options, repo });
+  if (command === "release" || command === "keep-alive") {
+    const deps = {
+      transaction: (fn) => transaction(config, fn),
+      decide: (state, now) => engine.decide("release", { config, state, options, now }),
+      newId,
+      runHook,
+      hookArgvProblem,
+      claimDeadline,
+    };
+    return command === "release" ? lifecycle.releaseWithTearDown(deps, { config, options }) : lifecycle.keepAlive(deps, { config, options });
+  }
+  if (command === "handoff" || command === "fetch") {
+    const deps = { snapshot: () => snapshot(config), runHook, hookArgvProblem, cwd: process.cwd() };
+    return lifecycle.transfer(deps, { config, options, hook: command, repo: currentRepoKey() });
+  }
 
   let patch = null;
   if (REFRESH_COMMANDS.has(command)) {
@@ -550,7 +460,8 @@ async function main(argv) {
     patch = await refreshPatch(config, snap.state);
   }
   if (command === "doctor") return cmdDoctor(config, options, repo, patch);
-  return decideWith(command, { config, options, repo, patch });
+  const result = await decideWith(command, { config, options, repo, patch });
+  return command === "place" ? lifecycle.annotatePlacement(config, result) : result;
 }
 
 main(process.argv.slice(2)).then(emit, (e) => {

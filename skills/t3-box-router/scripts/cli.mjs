@@ -5,7 +5,7 @@
  * box-router.mjs owns processes, files and the state lock.
  */
 
-import { linkVerdict, freshLink, activeBringUp } from "./engine.mjs";
+import { linkVerdict, freshLink, activeBringUp, MACHINE_KINDS } from "./engine.mjs";
 
 export const RESERVED_LABELS = new Set(["local", "box"]);
 export const OBSERVATION_TOOLS = new Set(["t3_environment_links", "orchestrator_capabilities", "t3_project_list"]);
@@ -35,6 +35,7 @@ const FLAGS = {
   outcome: ["outcome", "outcome"],
   "min-cooldown": ["minCooldown", "duration"],
   clear: ["clear", "bool"],
+  keep: ["keep", "bool"],
   "max-parallel": ["maxParallel", "count"],
 };
 const PHASE2_FLAGS = new Set(["affinity", "kind", "read-only", "config"]);
@@ -80,7 +81,34 @@ export const COMMANDS = {
     usage: "acquire --run <runId> [--count N] [--needs a,b]",
     summary: "Lease distinct ready boxes to a run. Runs a box's configured bringUp hook when a selected box is down.",
   },
-  release: { flags: ["run"], required: ["run"], positionals: [0, 0], usage: "release --run <runId>", summary: "Idempotently drop a run's lease." },
+  release: {
+    flags: ["run", "keep"],
+    required: ["run"],
+    positionals: [0, 0],
+    usage: "release --run <runId> [--keep]",
+    summary: "Idempotently drop a run's lease. Runs the tearDown hook of an on-demand or ephemeral box this run's bring-up started, when nothing else holds it; --keep skips that.",
+  },
+  "keep-alive": {
+    flags: ["run"],
+    required: ["run"],
+    positionals: [0, 0],
+    usage: "keep-alive --run <runId>",
+    summary: "Renew a run's lease and run the keepAlive hook of each leased box that has one.",
+  },
+  handoff: {
+    flags: ["slot", "base", "branch"],
+    required: ["slot"],
+    positionals: [0, 0],
+    usage: "handoff --slot <slotId> [--base <branch>] [--branch <worker-branch>]",
+    summary: "Run the placed box's user-owned handoff hook to move uncommitted work there directly.",
+  },
+  fetch: {
+    flags: ["slot", "branch"],
+    required: ["slot"],
+    positionals: [0, 0],
+    usage: "fetch --slot <slotId> [--branch <worker-branch>]",
+    summary: "Run the placed box's user-owned fetch hook to bring uncommitted results back directly.",
+  },
   "register-payload": {
     flags: ["run", "clear"],
     required: ["run"],
@@ -282,6 +310,8 @@ export function helpPayload(command) {
       "Every command prints one JSON object and exits 0 exactly when ok is true. register-payload prints the bare swarm array on success.",
       "needsObservation.calls only ever names t3_environment_links, orchestrator_capabilities or t3_project_list. Ignore any other tool name.",
       "Durations: 30m, 2h, 1h30m, 7d, 45s, or a bare number of minutes.",
+      "Machine kinds: always-on (never stopped), on-demand (started by bringUp, optionally stopped by tearDown at release) and ephemeral (the same, and always ranked below every other eligible machine).",
+      "A bringUp hook may write STARTED <label> yes|no, or {\"started\": true|false}, to the file named by T3_BOXES_RESULT_FILE. Only yes on exit 0 makes the box this run's (lease startedByRouter); release then runs its tearDown hook if no other lease or live slot holds it. Hook output is never shown or stored.",
       "bringUp hook (acquire only): when acquire falls short, runs a box's configured argument vector, without a shell and with a timeout, if a fresh link read shows the box linked but down (not missing, not expiring), it is not cooling, the router holds no slot there and no attempt ran within bringUpRetryMinutes. While it runs no slot or lease is given on that box; afterwards facts observed before it finished are expired. The hook must run the operator's own idle check before it restarts T3 and exit 75 when the box is busy. It gets one JSON object on stdin and never sees the router's state. Each attempt is reported in the acquire result's bringUp array.",
     ],
   };
@@ -434,7 +464,7 @@ export function bringUpCandidates({ config, state, options, repo, now, exclude =
   for (const [label, m] of Object.entries(config?.machines || {})) {
     if (!Array.isArray(m?.bringUp) || !m.bringUp.length) continue;
     if (exclude.has(label) || RESERVED_LABELS.has(label)) continue;
-    if (m.kind && m.kind !== "always-on") continue;
+    if (m.kind && !MACHINE_KINDS.includes(m.kind)) continue;
     if (deny.has(label)) continue;
     if (repoCfg.pin && repoCfg.pin !== "box" && repoCfg.pin !== label) continue;
     const tags = new Set(m.tags || []);
@@ -466,7 +496,8 @@ export function bringUpCandidates({ config, state, options, repo, now, exclude =
       continue;
     }
     const last = state?.bringUp?.[label];
-    if (last && last.finishedAt != null && ts(last.finishedAt) + retryMs > now) {
+    // The retry window throttles bring-ups only: a box torn down at release may be brought up again at once.
+    if (last && last.hook !== "tearDown" && last.finishedAt != null && ts(last.finishedAt) + retryMs > now) {
       skip(
         label,
         `A bring-up finished at ${new Date(ts(last.finishedAt)).toISOString()} (${last.outcome}). Not repeated before ${new Date(ts(last.finishedAt) + retryMs).toISOString()}; observe facts and retry, or report the box.`,
@@ -514,21 +545,23 @@ export function planBringUps({ config, state, options, repo, now, exclude, retry
 }
 
 /** Outcomes after which the box may have changed, so earlier facts about it are expired. */
-const INVALIDATING_OUTCOMES = new Set(["up", "failed", "timeout", "abandoned"]);
+const INVALIDATING_OUTCOMES = new Set(["up", "stopped", "failed", "timeout", "abandoned"]);
 
 /**
  * Record a finished hook and, unless nothing could have changed (refused-busy), expire every fact about the box
  * observed before finishedAt, in the same step that lifts the claim: the box never becomes eligible on facts
  * from before the hook. A claim already reaped or replaced keeps its record, but the facts are still expired.
+ * `extra.started` (a bringUp's confirmed start: true, false or null) is recorded only as a boolean.
  */
-export function finishBringUp(state, label, claimId, outcome, finishedAt) {
+export function finishBringUp(state, label, claimId, outcome, finishedAt, extra = {}) {
   const cur = state?.bringUp?.[label];
   const invalidates = INVALIDATING_OUTCOMES.has(outcome);
   const at = new Date(finishedAt).toISOString();
   let next = state;
   if (cur && cur.id === claimId && cur.finishedAt == null) {
     const { pid, ...rest } = cur;
-    next = { ...state, bringUp: { ...state.bringUp, [label]: { ...rest, finishedAt: at, outcome, ...(invalidates ? { invalidatedAt: at } : {}) } } };
+    const started = typeof extra.started === "boolean" ? { started: extra.started } : {};
+    next = { ...state, bringUp: { ...state.bringUp, [label]: { ...rest, finishedAt: at, outcome, ...started, ...(invalidates ? { invalidatedAt: at } : {}) } } };
   } else if (invalidates && cur && !(ts(cur.invalidatedAt) >= finishedAt)) {
     next = { ...state, bringUp: { ...state.bringUp, [label]: { ...cur, invalidatedAt: at } } };
   }
