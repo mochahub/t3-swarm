@@ -683,7 +683,7 @@ const ENVELOPE_KINDS = ["link", "probe", "providers", "projects"];
  *     otherwise each envelope whose validUntil has passed or is unparseable.
  *   - health: only labels that are neither `local` nor configured. Records outlive their cooldown, because
  *     `failures > 0` after the cooldown is what makes a machine `recovering`.
- *   - slots: expired, or on a label that is no longer configured.
+ *   - slots: expired, or on a label that is no longer configured and naming no environmentId.
  *   - leases: expired; held labels filtered to configured machines.
  *   - bringUp: entries for unconfigured labels, and finished attempts older than the retry window. An unfinished
  *     claim is never dropped here: the router finalizes it (and expires that box's facts) once its deadline passes.
@@ -721,7 +721,9 @@ export function pruneState(config, state, now) {
   }
   for (const id of Object.keys(state.slots)) {
     const s = state.slots[id];
-    if (!isObj(s) || !known(s.label) || expired(s.expiresAt)) {
+    // A live slot that names its environment is kept even after its label leaves config: until it expires it still
+    // marks that environment busy, so a tear-down of the same environment under a new label waits for it.
+    if (!isObj(s) || expired(s.expiresAt) || (!known(s.label) && typeof s.environmentId !== "string")) {
       delete state.slots[id];
       changed = true;
     }

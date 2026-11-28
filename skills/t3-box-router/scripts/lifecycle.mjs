@@ -4,6 +4,12 @@
  *   ownership   A bringUp hook may confirm it started the box (hooks.parseStartedMarker). The acquire that leases
  *               that box to the same run records it in the lease as startedByRouter. Absent, ambiguous or "no"
  *               confirmation means not owned, and an unowned box is never torn down.
+ *   identity    Labels are config names and may be reassigned. Ownership is bound to the environmentId the
+ *               bringUp claim recorded: adoption needs that id to match the label's environment in config and in
+ *               the lease, and stores it in lease.startedEnvironments; release tears down only while config still
+ *               maps the label to it. A missing (legacy) or different id fails closed: the box is left running.
+ *               Quietness checks match other leases, slots and hook claims by environmentId as well as by label,
+ *               and a transfer hook runs only when the slot was booked on the environment the label names now.
  *   tearDown    At release --run, an owned on-demand or ephemeral box with a tearDown hook is stopped only when
  *               no other run leases it, no live slot (any run) is on it, and no bring-up, tear-down or keep-alive
  *               hook runs there. Those checks, dropping the lease and writing the claim happen in one transaction,
@@ -43,18 +49,41 @@ export function lifecycleTimeoutMs(config, machine) {
   return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Number.isFinite(raw) ? raw : DEFAULT_TIMEOUT_MS));
 }
 
-function activeKeepAlive(state, label, now) {
-  const k = state?.lifecycle?.keepAlive?.[label];
-  return k && typeof k === "object" && ts(k.deadline) > now ? k : null;
+const isEnvId = (v) => typeof v === "string" && v.length > 0;
+const envValues = (map) => (map && typeof map === "object" ? Object.values(map) : []);
+
+// A record touches a box when it names the box's environment, or, naming none (legacy), carries its label.
+const touches = (rec, recLabel, label, env) => (isEnvId(rec?.environmentId) ? rec.environmentId === env : recLabel === label);
+
+function activeKeepAlive(state, label, now, env = null) {
+  for (const [l, k] of Object.entries(state?.lifecycle?.keepAlive || {})) {
+    if (!k || typeof k !== "object" || !(ts(k.deadline) > now)) continue;
+    if (l === label || (env != null && touches(k, l, label, env))) return k;
+  }
+  return null;
 }
 
-function liveSlots(state, label, now) {
-  return Object.values(state?.slots || {}).filter((s) => s?.label === label && ts(s.expiresAt) > now).length;
+/** A running bringUp or tearDown claim on the box, under its label or another label naming its environment. */
+function activeHookOn(state, label, now, env) {
+  const own = activeBringUp(state, label, now);
+  if (own) return own;
+  for (const l of Object.keys(state?.bringUp || {})) {
+    if (l === label) continue;
+    const b = activeBringUp(state, l, now);
+    if (b && isEnvId(b.environmentId) && b.environmentId === env) return b;
+  }
+  return null;
 }
 
-function otherLeases(state, label, run, now) {
+function liveSlots(state, label, now, env = null) {
+  return Object.values(state?.slots || {}).filter(
+    (s) => ts(s?.expiresAt) > now && (s.label === label || (env != null && touches(s, s.label, label, env))),
+  ).length;
+}
+
+function otherLeases(state, label, run, now, env = null) {
   return Object.entries(state?.leases || {})
-    .filter(([r, l]) => r !== run && ts(l?.expiresAt) > now && arr(l.machines).includes(label))
+    .filter(([r, l]) => r !== run && ts(l?.expiresAt) > now && (arr(l.machines).includes(label) || (env != null && envValues(l.environments).includes(env))))
     .map(([r]) => r)
     .sort();
 }
@@ -64,32 +93,38 @@ function otherLeases(state, label, run, now) {
 
 /**
  * After an acquire decision for `run`, record as startedByRouter every leased box whose last bringUp, for this
- * same run, exited 0 and confirmed it started the box, and that no lease has adopted yet. Pure.
- * Returns { state, adopted }.
+ * same run, exited 0 and confirmed it started the box, and that no lease has adopted yet. The bringUp record's
+ * environmentId must match the label's environment in config and in the lease; it is stored, as the binding
+ * release checks, in lease.startedEnvironments. A record without one (written before the binding) is never
+ * adopted. Pure. Returns { state, adopted }.
  */
-export function adoptStarted(state, run, now) {
+export function adoptStarted(state, run, now, config) {
   const lease = state?.leases?.[run];
-  if (!lease || !(ts(lease.expiresAt) > now)) return { state, adopted: [] };
+  if (!lease || !(ts(lease.expiresAt) > now) || !config) return { state, adopted: [] };
   const owned = new Set(arr(lease.startedByRouter));
+  const bound = { ...(lease.startedEnvironments && typeof lease.startedEnvironments === "object" ? lease.startedEnvironments : {}) };
   const adopted = [];
   let bringUp = state.bringUp;
   for (const label of arr(lease.machines)) {
     const b = state.bringUp?.[label];
     if (!b || typeof b !== "object" || (b.hook ?? "bringUp") !== "bringUp") continue;
     if (b.finishedAt == null || b.outcome !== "up" || b.started !== true || b.run !== run || b.adoptedAt != null) continue;
+    const env = machineOf(config, label)?.environmentId;
+    if (!isEnvId(b.environmentId) || b.environmentId !== env || lease.environments?.[label] !== env) continue;
     owned.add(label);
+    bound[label] = env;
     adopted.push(label);
     bringUp = { ...bringUp, [label]: { ...b, adoptedAt: iso(now) } };
   }
   if (!adopted.length) return { state, adopted };
-  const leases = { ...state.leases, [run]: { ...lease, startedByRouter: [...owned].sort() } };
+  const leases = { ...state.leases, [run]: { ...lease, startedByRouter: [...owned].sort(), startedEnvironments: bound } };
   return { state: { ...state, leases, bringUp }, adopted: adopted.sort() };
 }
 
 /** Wrap an engine acquire decision ({state, result}) with adoption, in the same transaction. */
-export function adoptAfterAcquire(out, run, now) {
+export function adoptAfterAcquire(out, run, now, config) {
   if (!out || !out.result || out.result.ok !== true || typeof run !== "string") return out;
-  const { state, adopted } = adoptStarted(out.state, run, now);
+  const { state, adopted } = adoptStarted(out.state, run, now, config);
   if (!adopted.length) return out;
   return { state, result: { ...out.result, startedByRouter: state.leases[run].startedByRouter.slice() } };
 }
@@ -111,6 +146,7 @@ export function planRelease({ config, state, run, now, decideRelease, unusable =
   const out = decideRelease(state);
   if (!out?.result || out.result.ok !== true || !before) return { ...out, claimed: [] };
   const owned = new Set(arr(before.startedByRouter));
+  const bound = before.startedEnvironments && typeof before.startedEnvironments === "object" ? before.startedEnvironments : {};
   const leaseLive = ts(before.expiresAt) > now;
   let next = out.state;
   const report = [];
@@ -135,22 +171,32 @@ export function planRelease({ config, state, run, now, decideRelease, unusable =
       skip("Not started by the router for this run (no confirmed bringUp start). Left running.");
       continue;
     }
-    const others = otherLeases(next, label, run, now);
+    // Ownership is bound to the environment the bring-up started, not to the label.
+    const env = m.environmentId;
+    if (!isEnvId(bound[label])) {
+      skip("The ownership record names no environment (recorded before environment binding), so the router cannot prove it started this box. Left running.");
+      continue;
+    }
+    if (bound[label] !== env) {
+      skip(`${label} now names a different environment than the one this run's bring-up started. Left running; stop the original box yourself if nothing uses it.`);
+      continue;
+    }
+    const others = otherLeases(next, label, run, now, env);
     if (others.length) {
       skip(`Still leased to run${others.length > 1 ? "s" : ""} ${others.join(", ")}. Left running.`);
       continue;
     }
-    const slots = liveSlots(next, label, now);
+    const slots = liveSlots(next, label, now, env);
     if (slots) {
       skip(`${slots} live slot(s) on the box. Release them with done first; the box was left running.`);
       continue;
     }
-    const running = activeBringUp(next, label, now);
+    const running = activeHookOn(next, label, now, env);
     if (running) {
       skip(`A ${running.hook ?? "bringUp"} hook is running there (deadline ${iso(ts(running.deadline))}). Left running.`);
       continue;
     }
-    if (activeKeepAlive(next, label, now)) {
+    if (activeKeepAlive(next, label, now, env)) {
       skip("A keepAlive hook is running there. Left running.");
       continue;
     }
@@ -158,7 +204,7 @@ export function planRelease({ config, state, run, now, decideRelease, unusable =
       skip(unusable.get(label));
       continue;
     }
-    const claim = { ...makeClaim(label), hook: "tearDown" };
+    const claim = { ...makeClaim(label), hook: "tearDown", environmentId: env };
     next = { ...next, bringUp: { ...(next.bringUp || {}), [label]: claim } };
     claimed.push({ label, claim });
   }
@@ -275,6 +321,13 @@ export function transferTarget(config, state, slotId, hook, now) {
   const m = machineOf(config, slot.label);
   if (!m) return { error: `Slot ${slotId} is on ${slot.label}, which is no longer configured.` };
   if (!hasHook(m, hook)) return { error: `${slot.label} has no ${hook} hook. Use the committed Git handoff instead.` };
+  // The hook acts on the label's environment now; it must be the one the slot was booked on.
+  if (!isEnvId(slot.environmentId)) {
+    return { error: `Slot ${slotId} names no environment (placed before environment binding). Place again to transfer.` };
+  }
+  if (slot.environmentId !== m.environmentId) {
+    return { error: `Slot ${slotId} was booked on another environment than ${slot.label} names now. Refusing to transfer; place again.` };
+  }
   return { slot, machine: m };
 }
 
@@ -326,6 +379,7 @@ function fileChecks(config, labels, hook, hookArgvProblem) {
 function makeClaimer(deps, config, run, now) {
   return (label) => ({
     id: deps.newId(),
+    environmentId: machineOf(config, label)?.environmentId ?? null,
     run: run ?? null,
     pid: process.pid,
     startedAt: iso(now),
@@ -364,7 +418,7 @@ export async function releaseWithTearDown(deps, { config, options }) {
       const input = {
         hook: "tearDown",
         label,
-        environmentId: m.environmentId,
+        environmentId: claim.environmentId,
         kind: kindOf(m),
         run,
         timeoutMs,
