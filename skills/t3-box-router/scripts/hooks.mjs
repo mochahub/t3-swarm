@@ -83,7 +83,8 @@ function makeResultDir() {
 function readResult(file) {
   let fd;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    // O_NONBLOCK: a FIFO left at the path must not block the router; fstat then rejects it.
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
     if (!fs.fstatSync(fd).isFile()) return null;
     const buf = Buffer.alloc(RESULT_MAX_BYTES + 1);
     const n = fs.readSync(fd, buf, 0, buf.length, 0);

@@ -557,6 +557,32 @@ test("while a tear-down runs, place, acquire and a second release cannot use or 
   t.assertNoLeak();
 });
 
+test("a short acquire brings up an on-demand box before an ephemeral one, whatever their priorities", async () => {
+  const t = setup({
+    machines: {
+      "eph-box": { env: "env-eph", kind: "ephemeral", priority: 99, hooks: ["bringUp"] },
+      "od-box": { env: "env-od", kind: "on-demand", priority: 1, hooks: ["bringUp"] },
+    },
+    links: { "env-eph": "offline", "env-od": "offline" },
+  });
+  await observe(t, [...factRecords("env-eph"), ...factRecords("env-od")]);
+  const r = await t.run(["acquire", "--run", "r1", "--count", "1"]);
+  assert.equal(entry(r.json.bringUp, "od-box")?.outcome, "up", JSON.stringify(r.json));
+  assert.equal(t.runs("od-box", "bringUp"), 1);
+  assert.equal(t.runs("eph-box", "bringUp"), 0);
+});
+
+test("a FIFO in place of the result file does not block the router", { timeout: 20_000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "box-router-fifo-"));
+  const script = path.join(dir, "h.sh");
+  writeExec(script, `#!/bin/sh\ncat > /dev/null\nrm -f "$T3_BOXES_RESULT_FILE"\nmkfifo "$T3_BOXES_RESULT_FILE"\nexit 0\n`);
+  const started = Date.now();
+  const r = await runHook([script], { label: "b" }, 5000, { name: "bringUp", label: "b", resultFile: true });
+  assert.equal(r.outcome, "up");
+  assert.equal(r.resultText, undefined);
+  assert.ok(Date.now() - started < 5000, "returned without waiting on the FIFO");
+});
+
 test("an always-on box in a lease is only ever kept, with the release shape unchanged", async () => {
   const t = setup({ machines: { "home-box": { env: "env-home", hooks: ["keepAlive"] } }, links: { "env-home": "reachable" } });
   await observe(t, factRecords("env-home"));

@@ -451,7 +451,8 @@ export function activeSlotCount(state, label, now) {
  * place use) is a recognized down status on a valid link, is not cooling, has no hook running, had no attempt
  * within retryMs, and holds no router slot. A missing link (value null), a gone or expiring link, an unknown
  * status and stale evidence never qualify: facts come first.
- * Returns { candidates: [{label, priority}], skipped: [{label, outcome, reason}] }, candidates in priority order.
+ * Returns { candidates: [{label, priority, ephemeral}], skipped: [{label, outcome, reason}] }, candidates in rank
+ * order: ephemeral boxes last, then priority, then label.
  * outcome is "in-progress" (a hook runs there now), "recent" (inside the retry window) or "skipped".
  */
 export function bringUpCandidates({ config, state, options, repo, now, exclude = new Set(), retryMs = 10 * 60000 }) {
@@ -510,9 +511,12 @@ export function bringUpCandidates({ config, state, options, repo, now, exclude =
       skip(label, `${held} router slot(s) held there. Refusing to run a bring-up that could restart T3.`);
       continue;
     }
-    candidates.push({ label, priority: Number(m.priority) || 0 });
+    candidates.push({ label, priority: Number(m.priority) || 0, ephemeral: m.kind === "ephemeral" });
   }
-  candidates.sort((a, b) => b.priority - a.priority || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
+  // Same ranking as placement: an ephemeral box (the one that may cost money) is started last, then by priority.
+  candidates.sort(
+    (a, b) => Number(a.ephemeral) - Number(b.ephemeral) || b.priority - a.priority || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0),
+  );
   return { candidates, skipped };
 }
 
