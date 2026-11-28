@@ -78,21 +78,20 @@ For an always-on box that sometimes needs starting (for example a script that wa
 service), set `machines.<label>.bringUp`:
 
 ```json
-"bringUp": { "command": ["/Users/you/bin/start-home-box", "home-box"], "timeoutMs": 300000 }
+"bringUp": ["/Users/you/bin/start-home-box", "home-box"],
+"bringUpTimeoutMs": 300000
 ```
 
-- **When it runs:** only during `acquire`, only for a selected box that fresh evidence shows is unreachable or
-  unlinked. Never during `place`, and never just because facts are missing (observe first).
-- **Bounded:** `command` is an argument vector of strings, absolute path first, run without a shell. `timeoutMs`
-  is required; the process is stopped when it runs out. It comes from user config only, never from a repo file.
-- **Idle check is the user's:** if the script can restart T3 or anything a running task depends on, the script
-  itself must check that the box is idle and exit nonzero when it is not. The router also refuses to run the hook
-  while it holds any slot on that box. Expired slots never count as proof of idleness.
-- **Re-observation:** after the hook exits 0, the router treats the box's link, provider and project facts as
-  stale. It re-reads links itself when the `t3` CLI is present, and answers `needsObservation` for the rest; make
-  those reads and acquire again. A nonzero exit or timeout
-  is reported in `errors` and the box is not leased.
-- The router ships no service, update or wake logic. That stays in your script.
+During `acquire`, the router can run this argument vector when a fresh observation shows the selected box is
+unreachable and its link is still valid. Resolve missing or expired links through T3. The executable path must
+be absolute. The default timeout is two minutes. Set `bringUpTimeoutMs` on the machine to change it, up to ten minutes.
+
+The hook must check for active work before restarting a service. Exit 75 if the machine is busy. The router
+also checks its own slots, which account only for tasks placed through this installation.
+
+Inspect the `bringUp` array in the acquisition result for each attempt's outcome. After a start, the router
+refreshes the link when the T3 CLI is available. Supply fresh provider and project observations as requested
+and run `acquire` again.
 
 ## Not set up here
 

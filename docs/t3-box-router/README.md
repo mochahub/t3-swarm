@@ -91,11 +91,10 @@ The full sequence is in [swarm.md](../../skills/t3-box-router/references/swarm.m
 
 ## Bring-up hook
 
-If a box sometimes needs starting, point `machines.<label>.bringUp` at your own script: an argument vector run
-without a shell, with a required `timeoutMs`. It runs only during `acquire`, only for a selected box that fresh
-evidence shows is unreachable or unlinked (never just to fill a cold cache), and never while the router holds a slot there. If your script can restart T3 on the box, it must check that
-the box is idle itself and exit nonzero when it isn't: an expired slot is not proof of idleness. After it succeeds
-the router re-observes the box before leasing it. Details:
+Set `machines.<label>.bringUp` to the absolute path of your start script and its arguments as a JSON array.
+If `acquire` finds a linked box unreachable, it can run this script with a bounded timeout. The hook must
+check that the box is idle before restarting T3 and exit 75 if it is busy. Acquisition requires fresh observations
+before leasing the box. See the example and timeout setting in
 [setup.md](../../skills/t3-box-router/references/setup.md#bring-up-hook).
 
 ## Limits to know

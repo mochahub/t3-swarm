@@ -26,10 +26,8 @@
       "maxConcurrent": 6,
       "exclusive": ["gpu"],
       "worktreeRoot": "~/work",
-      "bringUp": {
-        "command": ["/Users/you/bin/start-home-box", "home-box"],
-        "timeoutMs": 300000
-      }
+      "bringUp": ["/Users/you/bin/start-home-box", "home-box"],
+      "bringUpTimeoutMs": 300000
     }
   },
   "repos": {
