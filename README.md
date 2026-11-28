@@ -24,6 +24,7 @@ See each skill's documentation for harness-specific flags and setup steps.
 | Skill | Description | Docs |
 | :--- | :--- | :--- |
 | **[`t3-swarm`](skills/t3-swarm/SKILL.md)** | Three-tier multi-provider orchestration for [T3 Code](https://t3.codes) (Coordinator → Failover Lead → Tiered Worker Pool) with quota weighting, multi-workstream boards, remote boxes, and an optional live view. | [Guide](docs/t3-swarm/README.md) |
+| **[`t3-box-router`](skills/t3-box-router/SKILL.md)** | Machine placement for [T3 Code](https://t3.codes): picks this machine or a linked always-on box for each delegated task, books capacity slots, hands back the T3 target and Git handoff, and works standalone or as `t3-swarm`'s box skill. Install on orchestrating machines only. | [Guide](docs/t3-box-router/README.md) |
 | **[`t3-swarm-setup`](skills/t3-swarm-setup/SKILL.md)** | Interactive auto-discovery & setup wizard for `t3-swarm`. Inspects enabled T3 Code providers and writes `~/.t3/swarm/config.json`. | [Guide](docs/t3-swarm/README.md#1-auto-configure-from-your-enabled-t3-providers) |
 
 ## Repository Layout

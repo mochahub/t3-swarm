@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "scriptPath": "/Users/you/.claude/skills/t3-box-router/scripts/box-router.mjs",
+  "defaults": {
+    "minLinkHours": 24,
+    "linkTtlMinutes": 15,
+    "factTtlHours": 24,
+    "slotTtlMinutes": 180,
+    "leaseTtlHours": 24,
+    "cooldownMinutes": 30
+  },
+  "local": {
+    "tags": ["macos", "arm64", "ios-sim", "xcode"],
+    "deviceHostId": "local",
+    "priority": 0,
+    "maxConcurrent": 4,
+    "exclusive": ["ios-sim"]
+  },
+  "machines": {
+    "home-box": {
+      "kind": "always-on",
+      "environmentId": "<environmentId>",
+      "url": "https://home-box.example",
+      "tags": ["linux", "gpu", "ram-32g", "godot", "secret:build-signing"],
+      "priority": 10,
+      "maxConcurrent": 6,
+      "exclusive": ["gpu"],
+      "worktreeRoot": "~/work",
+      "bringUp": {
+        "command": ["/Users/you/bin/start-home-box", "home-box"],
+        "timeoutMs": 300000
+      }
+    }
+  },
+  "repos": {
+    "github.com/owner/repo": {
+      "needs": ["godot"],
+      "prefers": ["ram-32g"],
+      "deny": [],
+      "pin": "home-box",
+      "worktreeCommand": "./scripts/worktree"
+    }
+  }
+}
