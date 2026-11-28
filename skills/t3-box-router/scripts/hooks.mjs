@@ -220,6 +220,8 @@ export function runHook(argv, input, timeoutMs, { name = "bringUp", label = inpu
       if (code === 0) {
         exitResult = { outcome: "up", detail: "Hook exited 0.", exitCode: 0 };
         if (stdoutEnded) return settle(exitResult);
+        // The hook exited before its execution deadline. Only the pipe drain remains.
+        for (const timer of timers) clearTimeout(timer);
         // A detached service may inherit stdout indefinitely. Never wait for it beyond this bound.
         timers.push(setTimeout(() => settle(exitResult), STDOUT_DRAIN_MS));
         return;
