@@ -84,10 +84,33 @@ box-router release --run "$run_id"
 ```
 
 Keep `run_id` from `init`: after `finish` the branch no longer resolves to a run. `release` is idempotent and
-applies even when swarm never got a snapshot. Always-on boxes come back in `kept`; nothing is stopped.
+applies even when swarm never got a snapshot. Always-on boxes come back in `kept`. An on-demand or ephemeral box that
+this run started is stopped by its `tearDown` hook only when no other run or slot holds it; anything skipped is listed in
+`result.tearDown` with its reason, and [setup.md](setup.md#lifecycle-hooks) says what to do by hand.
+
+For a run longer than the lease (`defaults.leaseTtlHours`, default 24), run `box-router keep-alive --run "$run_id"`
+before it lapses. It renews the lease and runs each leased box's `keepAlive` hook.
 
 ## Known gap
 
 Swarm cannot enforce a pin. A Lead that loses the policy text (compaction, or skipping it) can make an unpinned
 pick that the router never counts, so a box can exceed its cap. Slots are advisory; nothing breaks. Re-paste the
 policy line when you notice it.
+
+## Remote worker activity in swarm-viz
+
+Remote child last messages and live status cannot currently be polled by swarm-viz through a supported local
+script interface. The installed `~/.t3/bin/t3 thread show --help` exposes `<thread>`, `--messages`, `--json`,
+`--base-dir`, but no environment selector; `t3 environment --help` exposes link, list and unlink, not remote
+thread reads. `t3 thread show` is therefore useful for local threads, not a documented remote-child interface.
+Do not use link credentials or an undocumented authenticated transport to bridge this gap.
+
+Read-only schema inspection of `~/.t3/userdata/statev2.sqlite` shows what is local: `peer_environment_links`
+contains `environment_id`, `secret_name`, `label`, `urls_json`, `access`, `linked_at`, `expires_at`,
+`last_reached_at`, `last_error`, and `fenced`. These are link metadata, not remote messages or child status.
+Local projection tables include `orchestration_v2_projection_subagents` (including `child_thread_id`, `status`,
+`updated_at`), `orchestration_v2_projection_runs` (`thread_id`, `status`, `completed_at`), and
+`orchestration_v2_projection_messages` (`thread_id`, `run_id`, `role`, `updated_at`, `payload_json`). They describe
+local projections; their schema alone does not establish a live replica of remote child activity. A recorded
+local status or completion may lag a remote worker, so the visualization must not present it as live remote
+activity. Reassess if T3 publishes a supported read-only remote thread CLI with an environment selector.

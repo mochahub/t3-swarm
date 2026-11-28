@@ -31,7 +31,10 @@ Branch names and `worktreeRoot` are put into a shell line the worker runs. The r
 
 ## 2. Uncommitted work
 
-Not supported by the router. Commit it (a `wip:` commit on a throwaway branch is fine) and use rung 1.
+The router moves nothing itself. Either commit it (a `wip:` commit on a throwaway branch is fine) and use rung 1, or
+use the user's own hooks: `box-router handoff --slot <id>` sends uncommitted work to the placed box and
+`box-router fetch --slot <id>` brings results back. Both run only the commands the user configured
+([setup.md](setup.md#lifecycle-hooks)); the router keeps no copy of what moves.
 
 ## 3. Small inputs through T3 attachments
 

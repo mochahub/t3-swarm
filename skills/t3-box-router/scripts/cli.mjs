@@ -5,7 +5,8 @@
  * box-router.mjs owns processes, files and the state lock.
  */
 
-import { linkVerdict, freshLink, activeBringUp } from "./engine.mjs";
+import { linkVerdict, freshLink, activeBringUp, MACHINE_KINDS } from "./engine.mjs";
+import { ATTESTATION_PATTERN } from "./profile.mjs";
 
 export const RESERVED_LABELS = new Set(["local", "box"]);
 export const OBSERVATION_TOOLS = new Set(["t3_environment_links", "orchestrator_capabilities", "t3_project_list"]);
@@ -16,6 +17,7 @@ const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}$/;
 const RUN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SLOT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const PROVIDER_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const ENVIRONMENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,199}$/;
 const BRANCH_CHARS_RE = /^[A-Za-z0-9._/-]+$/;
 const DURATION_RE = /^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i;
 const MAX_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -35,7 +37,10 @@ const FLAGS = {
   outcome: ["outcome", "outcome"],
   "min-cooldown": ["minCooldown", "duration"],
   clear: ["clear", "bool"],
+  keep: ["keep", "bool"],
   "max-parallel": ["maxParallel", "count"],
+  "environment-id": ["environmentId", "environmentId"],
+  attest: ["attest", "attest"],
 };
 const PHASE2_FLAGS = new Set(["affinity", "kind", "read-only", "config"]);
 const OUTCOMES = new Set(["ok", "failed", "unreachable"]);
@@ -80,13 +85,52 @@ export const COMMANDS = {
     usage: "acquire --run <runId> [--count N] [--needs a,b]",
     summary: "Lease distinct ready boxes to a run. Runs a box's configured bringUp hook when a selected box is down.",
   },
-  release: { flags: ["run"], required: ["run"], positionals: [0, 0], usage: "release --run <runId>", summary: "Idempotently drop a run's lease." },
+  release: {
+    flags: ["run", "keep"],
+    required: ["run"],
+    positionals: [0, 0],
+    usage: "release --run <runId> [--keep]",
+    summary: "Idempotently drop a run's lease. Runs the tearDown hook of an on-demand or ephemeral box this run's bring-up started, when nothing else holds it; --keep skips that.",
+  },
+  "keep-alive": {
+    flags: ["run"],
+    required: ["run"],
+    positionals: [0, 0],
+    usage: "keep-alive --run <runId>",
+    summary: "Renew a run's lease and run the keepAlive hook of each leased box that has one.",
+  },
+  handoff: {
+    flags: ["slot", "base", "branch"],
+    required: ["slot"],
+    positionals: [0, 0],
+    usage: "handoff --slot <slotId> [--base <branch>] [--branch <worker-branch>]",
+    summary: "Run the placed box's user-owned handoff hook to move uncommitted work there directly.",
+  },
+  fetch: {
+    flags: ["slot", "branch"],
+    required: ["slot"],
+    positionals: [0, 0],
+    usage: "fetch --slot <slotId> [--branch <worker-branch>]",
+    summary: "Run the placed box's user-owned fetch hook to bring uncommitted results back directly.",
+  },
   "register-payload": {
     flags: ["run", "clear"],
     required: ["run"],
     positionals: [0, 0],
     usage: "register-payload --run <runId> [--clear]",
     summary: "Emit the raw swarm registration array on success. Errors on a lapsed lease unless --clear.",
+  },
+  probe: {
+    flags: ["attest"],
+    positionals: [0, 0],
+    usage: "probe [--attest cred:<name>=true|false] [--attest secret:<name>=true|false]",
+    summary: "Read-only hardware and toolchain report for this machine (scripts/probe.mjs). Pipe it to apply-probe local.",
+  },
+  "apply-probe": {
+    flags: ["environment-id"],
+    positionals: [1, 1],
+    usage: "apply-probe <label|local> [--environment-id <id>] < probe.json",
+    summary: "Validate a probe report and store it as the machine's profile in config.json, under the lock. A new label with --environment-id adds the newly linked box.",
   },
   "policy-line": {
     flags: ["run", "max-parallel"],
@@ -183,6 +227,15 @@ function checkValue(kind, raw, flag) {
       return v;
     case "duration":
       return checkDuration(v, `--${flag}`);
+    case "environmentId":
+      if (!ENVIRONMENT_ID_RE.test(v)) fail(`--${flag} must be a T3 environment ID.`);
+      return v;
+    case "attest": {
+      // Never echo the value: an owner may paste something sensitive by mistake.
+      const m = /^([^=]*)=(true|false)$/.exec(v);
+      if (!m || !ATTESTATION_PATTERN.test(m[1])) fail(`--${flag} expects cred:<name>=true|false or secret:<name>=true|false (lowercase name).`);
+      return [m[1], m[2] === "true"];
+    }
     default:
       fail(`Unknown flag kind ${kind}.`);
   }
@@ -230,6 +283,9 @@ export function parseArgv(argv) {
     }
     if (kind === "tags") {
       options[key] = [...new Set([...(options[key] || []), ...checkValue(kind, value, name)])];
+    } else if (kind === "attest") {
+      const [attName, attValue] = checkValue(kind, value, name);
+      options[key] = { ...(options[key] || {}), [attName]: attValue };
     } else {
       if (seen.has(name)) fail(`--${name} was given more than once.`);
       options[key] = checkValue(kind, value, name);
@@ -252,6 +308,13 @@ export function parseArgv(argv) {
     options.label = options.args[0];
   }
   if (command === "cooldown") options.durationMs = checkDuration(options.args[1], "Cooldown duration");
+  if (command === "apply-probe") {
+    const target = options.args[0];
+    if (!LABEL_RE.test(target)) fail(`apply-probe needs local or a machine label of letters, digits, . _ - (${spec.usage}).`);
+    if (target === "box") fail("box is reserved for router selectors; use a machine label or local.");
+    if (target === "local" && options.environmentId !== undefined) fail("apply-probe local takes no --environment-id.");
+    options.target = target;
+  }
   if (command === "help" && options.args[0] !== undefined && !COMMANDS[options.args[0]]) fail(`Unknown command ${JSON.stringify(options.args[0])}.`);
   return { command, options };
 }
@@ -282,6 +345,8 @@ export function helpPayload(command) {
       "Every command prints one JSON object and exits 0 exactly when ok is true. register-payload prints the bare swarm array on success.",
       "needsObservation.calls only ever names t3_environment_links, orchestrator_capabilities or t3_project_list. Ignore any other tool name.",
       "Durations: 30m, 2h, 1h30m, 7d, 45s, or a bare number of minutes.",
+      "Machine kinds: always-on (never stopped), on-demand (started by bringUp, optionally stopped by tearDown at release) and ephemeral (the same, and always ranked below every other eligible machine).",
+      "A bringUp hook may write STARTED <label> yes|no, or {\"started\": true|false}, to the file named by T3_BOXES_RESULT_FILE. Only yes on exit 0 makes the box this run's (lease startedByRouter); release then runs its tearDown hook if no other lease or live slot holds it. Hook output is never shown or stored.",
       "bringUp hook (acquire only): when acquire falls short, runs a box's configured argument vector, without a shell and with a timeout, if a fresh link read shows the box linked but down (not missing, not expiring), it is not cooling, the router holds no slot there and no attempt ran within bringUpRetryMinutes. While it runs no slot or lease is given on that box; afterwards facts observed before it finished are expired. The hook must run the operator's own idle check before it restarts T3 and exit 75 when the box is busy. It gets one JSON object on stdin and never sees the router's state. Each attempt is reported in the acquire result's bringUp array.",
     ],
   };
@@ -411,8 +476,8 @@ export function expireFactsBefore(state, labels, cutoffMs) {
   return changed ? { ...state, observations } : state;
 }
 
-export function activeSlotCount(state, label, now) {
-  return Object.values(state?.slots || {}).filter((s) => s?.label === label && !(ts(s.expiresAt) <= now)).length;
+export function activeSlotCount(state, label, now, environmentId) {
+  return Object.values(state?.slots || {}).filter((s) => (s?.label === label || (environmentId && s?.environmentId === environmentId)) && !(ts(s.expiresAt) <= now)).length;
 }
 
 /**
@@ -421,7 +486,8 @@ export function activeSlotCount(state, label, now) {
  * place use) is a recognized down status on a valid link, is not cooling, has no hook running, had no attempt
  * within retryMs, and holds no router slot. A missing link (value null), a gone or expiring link, an unknown
  * status and stale evidence never qualify: facts come first.
- * Returns { candidates: [{label, priority}], skipped: [{label, outcome, reason}] }, candidates in priority order.
+ * Returns { candidates: [{label, priority, ephemeral}], skipped: [{label, outcome, reason}] }, candidates in rank
+ * order: ephemeral boxes last, then priority, then label.
  * outcome is "in-progress" (a hook runs there now), "recent" (inside the retry window) or "skipped".
  */
 export function bringUpCandidates({ config, state, options, repo, now, exclude = new Set(), retryMs = 10 * 60000 }) {
@@ -434,13 +500,13 @@ export function bringUpCandidates({ config, state, options, repo, now, exclude =
   for (const [label, m] of Object.entries(config?.machines || {})) {
     if (!Array.isArray(m?.bringUp) || !m.bringUp.length) continue;
     if (exclude.has(label) || RESERVED_LABELS.has(label)) continue;
-    if (m.kind && m.kind !== "always-on") continue;
+    if (m.kind && !MACHINE_KINDS.includes(m.kind)) continue;
     if (deny.has(label)) continue;
     if (repoCfg.pin && repoCfg.pin !== "box" && repoCfg.pin !== label) continue;
     const tags = new Set(m.tags || []);
     if (!needs.every((t) => tags.has(t))) continue;
 
-    const running = activeBringUp(state, label, now);
+    const running = activeBringUp(state, label, now, m.environmentId);
     if (running) {
       skip(label, `A bring-up hook is running there (deadline ${new Date(ts(running.deadline)).toISOString()}). Retry acquire after it finishes.`, "in-progress");
       continue;
@@ -466,7 +532,8 @@ export function bringUpCandidates({ config, state, options, repo, now, exclude =
       continue;
     }
     const last = state?.bringUp?.[label];
-    if (last && last.finishedAt != null && ts(last.finishedAt) + retryMs > now) {
+    // The retry window throttles bring-ups only: a box torn down at release may be brought up again at once.
+    if (last && last.hook !== "tearDown" && last.finishedAt != null && ts(last.finishedAt) + retryMs > now) {
       skip(
         label,
         `A bring-up finished at ${new Date(ts(last.finishedAt)).toISOString()} (${last.outcome}). Not repeated before ${new Date(ts(last.finishedAt) + retryMs).toISOString()}; observe facts and retry, or report the box.`,
@@ -474,14 +541,17 @@ export function bringUpCandidates({ config, state, options, repo, now, exclude =
       );
       continue;
     }
-    const held = activeSlotCount(state, label, now);
+    const held = activeSlotCount(state, label, now, m.environmentId);
     if (held) {
       skip(label, `${held} router slot(s) held there. Refusing to run a bring-up that could restart T3.`);
       continue;
     }
-    candidates.push({ label, priority: Number(m.priority) || 0 });
+    candidates.push({ label, priority: Number(m.priority) || 0, ephemeral: m.kind === "ephemeral" });
   }
-  candidates.sort((a, b) => b.priority - a.priority || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
+  // Same ranking as placement: an ephemeral box (the one that may cost money) is started last, then by priority.
+  candidates.sort(
+    (a, b) => Number(a.ephemeral) - Number(b.ephemeral) || b.priority - a.priority || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0),
+  );
   return { candidates, skipped };
 }
 
@@ -492,7 +562,7 @@ export function bringUpCandidates({ config, state, options, repo, now, exclude =
  * no slot or lease on that box.
  *   limit       how many hooks this acquisition may start (its shortfall)
  *   unusable    Map label -> problem, for hooks whose executable failed the check made before the transaction
- *   makeClaim   (label) -> claim record { id, run, pid, startedAt, deadline }
+ *   makeClaim   (label) -> claim record { id, run, pid, startedAt, deadline }; environmentId is added from config
  * Returns { state, claimed: [{label, claim}], report: [{label, outcome, detail}] }.
  */
 export function planBringUps({ config, state, options, repo, now, exclude, retryMs, limit, unusable = new Map(), makeClaim }) {
@@ -506,7 +576,9 @@ export function planBringUps({ config, state, options, repo, now, exclude, retry
       report.push({ label: c.label, outcome: "skipped", detail: unusable.get(c.label) });
       continue;
     }
-    const claim = makeClaim(c.label);
+    // The claim names the environment the hook is about to start. Adoption and tear-down later act only while
+    // the label still maps to it, so a label reassigned in config never inherits this start.
+    const claim = { ...makeClaim(c.label), environmentId: config.machines[c.label].environmentId };
     bringUp[c.label] = claim;
     claimed.push({ label: c.label, claim });
   }
@@ -514,21 +586,23 @@ export function planBringUps({ config, state, options, repo, now, exclude, retry
 }
 
 /** Outcomes after which the box may have changed, so earlier facts about it are expired. */
-const INVALIDATING_OUTCOMES = new Set(["up", "failed", "timeout", "abandoned"]);
+const INVALIDATING_OUTCOMES = new Set(["up", "stopped", "failed", "timeout", "abandoned"]);
 
 /**
  * Record a finished hook and, unless nothing could have changed (refused-busy), expire every fact about the box
  * observed before finishedAt, in the same step that lifts the claim: the box never becomes eligible on facts
  * from before the hook. A claim already reaped or replaced keeps its record, but the facts are still expired.
+ * `extra.started` (a bringUp's confirmed start: true, false or null) is recorded only as a boolean.
  */
-export function finishBringUp(state, label, claimId, outcome, finishedAt) {
+export function finishBringUp(state, label, claimId, outcome, finishedAt, extra = {}) {
   const cur = state?.bringUp?.[label];
   const invalidates = INVALIDATING_OUTCOMES.has(outcome);
   const at = new Date(finishedAt).toISOString();
   let next = state;
   if (cur && cur.id === claimId && cur.finishedAt == null) {
     const { pid, ...rest } = cur;
-    next = { ...state, bringUp: { ...state.bringUp, [label]: { ...rest, finishedAt: at, outcome, ...(invalidates ? { invalidatedAt: at } : {}) } } };
+    const started = typeof extra.started === "boolean" ? { started: extra.started } : {};
+    next = { ...state, bringUp: { ...state.bringUp, [label]: { ...rest, finishedAt: at, outcome, ...started, ...(invalidates ? { invalidatedAt: at } : {}) } } };
   } else if (invalidates && cur && !(ts(cur.invalidatedAt) >= finishedAt)) {
     next = { ...state, bringUp: { ...state.bringUp, [label]: { ...cur, invalidatedAt: at } } };
   }

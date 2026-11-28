@@ -7,7 +7,10 @@
     "factTtlHours": 24,
     "slotTtlMinutes": 180,
     "leaseTtlHours": 24,
-    "cooldownMinutes": 30
+    "cooldownMinutes": 30,
+    "bringUpTimeoutMs": 120000,
+    "bringUpRetryMinutes": 10,
+    "probeTtlDays": 7
   },
   "local": {
     "tags": ["macos", "arm64", "ios-sim", "xcode"],
@@ -19,7 +22,7 @@
   "machines": {
     "home-box": {
       "kind": "always-on",
-      "environmentId": "<environmentId>",
+      "environmentId": "env-home-box",
       "url": "https://home-box.example",
       "tags": ["linux", "gpu", "ram-32g", "godot", "secret:build-signing"],
       "priority": 10,
@@ -28,6 +31,21 @@
       "worktreeRoot": "~/work",
       "bringUp": ["/Users/you/bin/start-home-box", "home-box"],
       "bringUpTimeoutMs": 300000
+    },
+    "cloud-gpu": {
+      "kind": "on-demand",
+      "environmentId": "env-cloud-gpu",
+      "tags": ["linux", "gpu"],
+      "extraTags": ["ci"],
+      "denyTags": ["display"],
+      "priority": 5,
+      "maxConcurrent": 2,
+      "exclusive": ["gpu"],
+      "worktreeRoot": "~/work",
+      "bringUp": ["/Users/you/bin/start-cloud-gpu", "cloud-gpu"],
+      "tearDown": ["/Users/you/bin/stop-cloud-gpu", "cloud-gpu"],
+      "keepAlive": ["/Users/you/bin/ping-cloud-gpu", "cloud-gpu"],
+      "hookTimeoutMs": 120000
     }
   },
   "repos": {

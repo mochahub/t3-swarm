@@ -6,6 +6,8 @@
 // See docs/t3-box-router/SPEC.md sections 3–8 for the contracts implemented here.
 
 export const RESERVED_LABELS = new Set(['local', 'box']);
+/** Remote machine kinds. Ephemeral boxes always rank below every eligible local, always-on or on-demand machine. */
+export const MACHINE_KINDS = Object.freeze(['always-on', 'on-demand', 'ephemeral']);
 export const OBSERVATION_TOOLS = Object.freeze(['t3_environment_links', 'orchestrator_capabilities', 't3_project_list']);
 export const OBSERVE_COMMAND = 'box-router observe';
 /**
@@ -48,6 +50,10 @@ const arr = (value) => (Array.isArray(value) ? value : []);
 const uniq = (values) => [...new Set(values)];
 const fail = (error, extra = {}) => ({ ok: false, error, ...extra });
 const isPositiveInt = (n) => Number.isInteger(n) && n > 0;
+/** Tier rank: ephemeral below everything else, then priority. */
+const rankOf = (m) => (m.kind === 'ephemeral' ? 0 : 1);
+const outranks = (a, b) => rankOf(a) - rankOf(b) || a.priority - b.priority;
+const sameTier = (a, b) => rankOf(a) === rankOf(b) && a.priority === b.priority;
 
 /** Parse a duration: a number of milliseconds, or a string like `90s`, `30m`, `2h`, `1d`, `500ms`. */
 export function parseDuration(value) {
@@ -214,10 +220,12 @@ export function freshLink(config, state, label, now) {
 }
 
 /** A bring-up hook claim that is still running at `now`: unfinished and before its deadline. */
-export function activeBringUp(state, label, now) {
-  const b = state?.bringUp?.[label];
-  if (!b || typeof b !== 'object' || b.finishedAt != null) return null;
-  return toMs(b.deadline) > now ? b : null;
+export function activeBringUp(state, label, now, environmentId = null) {
+  const running = (claim) => claim && claim.finishedAt == null && toMs(claim.deadline) > now;
+  const own = state?.bringUp?.[label];
+  if (running(own)) return own;
+  if (!environmentId) return null;
+  return Object.values(state?.bringUp || {}).find((claim) => claim?.environmentId === environmentId && running(claim)) ?? null;
 }
 
 /**
@@ -231,7 +239,7 @@ function deriveHealth(config, state, machine, repo, now) {
   const lv = link ? linkVerdict(config, link, now) : null;
   if (lv?.state === 'unlinked') return { state: 'unlinked', notes: [lv.reason] };
   if (lv?.state === 'ready') notes.push(lv.reason);
-  const bu = activeBringUp(state, machine.label, now);
+  const bu = activeBringUp(state, machine.label, now, machine.environmentId);
   if (bu) return { state: 'cooling', notes: [bringUpReason(bu)] };
   const cd = coolingUntil(state, machine.label, now);
   if (cd != null) return { state: 'cooling', notes: [`Cooling down until ${iso(cd)}.`] };
@@ -248,8 +256,10 @@ function deriveHealth(config, state, machine, repo, now) {
   return { state: 'ready', notes };
 }
 
+const HOOK_NAMES = { tearDown: 'Tear-down', bringUp: 'Bring-up' };
 function bringUpReason(b) {
-  return `Bring-up hook running since ${iso(toMs(b.startedAt))} (deadline ${iso(toMs(b.deadline))}). No new work until it finishes.`;
+  const name = HOOK_NAMES[b.hook] ?? 'Bring-up';
+  return `${name} hook running since ${iso(toMs(b.startedAt))} (deadline ${iso(toMs(b.deadline))}). No new work until it finishes.`;
 }
 
 function missingFacts(config, state, machine, repo, now) {
@@ -310,8 +320,8 @@ function evaluate(ctx, machine) {
 
   if (ctx.allowed && !ctx.allowed.has(machine.label)) return reject(ctx.allowedReason ?? 'Excluded by placement restriction.');
   if (ctx.deny?.has(machine.label)) return reject('Denied for this repo by config.');
-  if (machine.remote && machine.kind !== 'always-on') {
-    return reject(`Machine kind ${machine.kind} is not supported in Phase 1.`);
+  if (machine.remote && !MACHINE_KINDS.includes(machine.kind)) {
+    return reject(`Machine kind ${machine.kind} is not supported.`);
   }
   if (machine.remote && ctx.checkLease) {
     const lease = activeLease(state, ctx.run, now);
@@ -328,7 +338,7 @@ function evaluate(ctx, machine) {
   if (machine.remote) {
     const cd = coolingUntil(state, machine.label, now);
     if (cd != null) return reject(`Cooling down until ${iso(cd)}.`);
-    const bu = activeBringUp(state, machine.label, now);
+    const bu = activeBringUp(state, machine.label, now, machine.environmentId);
     if (bu) return reject(bringUpReason(bu));
 
     const link = freshFact(config, state, machine, 'link', now);
@@ -455,8 +465,8 @@ function simulate(baseCtx, machines, prefers, count, optimistic) {
       return s === 'eligible' || (optimistic && s === 'pending');
     });
     if (!usable.length) break;
-    const top = Math.max(...usable.map((m) => m.priority));
-    const tier = usable.filter((m) => m.priority === top);
+    const top = usable.reduce((best, m) => (outranks(m, best) > 0 ? m : best));
+    const tier = usable.filter((m) => sameTier(m, top));
     const loadOf = (m) => slots.filter((s) => s.label === m.label).length / m.maxConcurrent;
     tier.sort(compareInTier(prefers, loadOf));
     const winner = tier[0];
@@ -475,7 +485,9 @@ function skippedFor(machines, evals, winner) {
     if (winner && m.label === winner.label) continue;
     const ev = evals.get(m.label);
     if (ev.status === 'rejected' || ev.status === 'pending') out.push({ label: m.label, reason: ev.reason });
-    else if (winner && m.priority < winner.priority) {
+    else if (winner && rankOf(m) < rankOf(winner)) {
+      out.push({ label: m.label, reason: `Ephemeral boxes rank below every local, always-on and on-demand machine; ${winner.label} is eligible.` });
+    } else if (winner && outranks(m, winner) < 0) {
       out.push({ label: m.label, reason: `Lower priority tier (${m.priority} < ${winner.priority}).` });
     } else if (winner) {
       out.push({ label: m.label, reason: `Same priority tier; ordered after ${winner.label} by preferred tags, load or label.` });
@@ -488,7 +500,7 @@ function whyFor(pick, initialEval, machines, needs) {
   const { machine, evaluation } = pick;
   const fullHigher = machines.filter(
     (m) =>
-      m.priority > machine.priority &&
+      outranks(m, machine) > 0 &&
       initialEval.get(m.label)?.status === 'eligible' &&
       pick.evals.get(m.label)?.status === 'rejected',
   );
@@ -561,6 +573,8 @@ function decidePlace(config, state, options, repo, now, newId) {
     const expiresAt = iso(now + d.slotTtlMinutes * MINUTE);
     next.slots[id] = {
       label: machine.label,
+      // A remote slot names its environment, so a label later reassigned in config cannot hide it (lifecycle).
+      ...(machine.remote ? { environmentId: machine.environmentId } : {}),
       run,
       repo: repo ?? null,
       exclusive: req.needs.filter((t) => machine.exclusive.includes(t)),
@@ -721,7 +735,7 @@ function decideAcquire(config, state, options, repo, now) {
   const held = new Set(current ? arr(current.machines) : []);
   const group = (m) => (held.has(m.label) ? 0 : heldBy(state, m.label, now).length === 0 ? 1 : 2);
   const order = (a, b) =>
-    group(a) - group(b) || b.priority - a.priority || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0);
+    group(a) - group(b) || outranks(b, a) || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0);
 
   const usable = remotes.filter((m) => ['eligible', 'pending'].includes(evals.get(m.label).status)).sort(order);
   // Keep every currently held usable box; add others only up to the requested count.
@@ -744,11 +758,29 @@ function decideAcquire(config, state, options, repo, now) {
   }
   const d = defaultsOf(config);
   const next = structuredClone(state);
-  next.leases[run] = { machines: chosen.map((m) => m.label), expiresAt: iso(now + d.leaseTtlHours * HOUR) };
+  // Other lease fields (startedByRouter and its startedEnvironments binding, recorded by the lifecycle module)
+  // survive, narrowed to the boxes kept. The binding is never recomputed from config: it names the environment the
+  // run's bring-up started. environments maps each leased label to the environment it was leased under now.
+  const labels = chosen.map((m) => m.label);
+  const environments = Object.fromEntries(chosen.map((m) => [m.label, m.environmentId]));
+  const previousOwned = arr(current?.startedByRouter);
+  const owned = previousOwned.filter((l) => labels.includes(l) && current.startedEnvironments?.[l] === environments[l]);
+  const dropped = previousOwned.filter((l) => !owned.includes(l));
+  next.leases[run] = { ...(current ?? {}), machines: labels, environments, expiresAt: iso(now + d.leaseTtlHours * HOUR) };
+  if (owned.length) next.leases[run].startedByRouter = owned;
+  else delete next.leases[run].startedByRouter;
+  const bound = current?.startedEnvironments && typeof current.startedEnvironments === 'object' ? current.startedEnvironments : {};
+  const keptBinding = Object.fromEntries(owned.filter((l) => typeof bound[l] === 'string').map((l) => [l, bound[l]]));
+  if (Object.keys(keptBinding).length) next.leases[run].startedEnvironments = keptBinding;
+  else delete next.leases[run].startedEnvironments;
   const result = {
     ok: true,
     machines: chosen.map((m) => ({ label: m.label, environmentId: m.environmentId })),
     errors: chosen.length < count ? errors : [],
+    ...(dropped.length ? {
+      droppedStartedBoxes: dropped.map((label) => ({ label, environmentId: bound[label] ?? null })),
+      cleanup: 'These boxes left router ownership. Check whether each original environment is idle before stopping it manually.',
+    } : {}),
   };
   if (chosen.length < count) {
     result.shortfall = count - chosen.length;
@@ -822,6 +854,7 @@ function decideList(config, state, repo, now) {
     const health = deriveHealth(config, state, m, repo, now);
     const entry = { label: m.label };
     if (m.remote) entry.environmentId = m.environmentId;
+    if (m.remote && m.kind !== 'always-on') entry.kind = m.kind;
     Object.assign(entry, {
       state: health.state,
       heldBy: m.remote ? heldBy(state, m.label, now) : [],
@@ -839,7 +872,12 @@ function decideList(config, state, repo, now) {
   });
   const leases = Object.entries(state.leases)
     .filter(([, l]) => toMs(l?.expiresAt) > now)
-    .map(([run, l]) => ({ run, machines: arr(l.machines).slice(), expiresAt: l.expiresAt }))
+    .map(([run, l]) => ({
+      run,
+      machines: arr(l.machines).slice(),
+      expiresAt: l.expiresAt,
+      ...(arr(l.startedByRouter).length ? { startedByRouter: arr(l.startedByRouter).slice() } : {}),
+    }))
     .sort((a, b) => (a.run < b.run ? -1 : 1));
   const slotList = slots
     .map((s) => ({ id: s.id, label: s.label, run: s.run ?? null, repo: s.repo ?? null, exclusive: arr(s.exclusive), placedAt: s.placedAt, expiresAt: s.expiresAt }))
@@ -854,16 +892,19 @@ export const BRINGUP_RETRY_MINUTES = 10;
 function bringUpSummary(config, state, label, now) {
   const b = state.bringUp?.[label];
   if (!b || typeof b !== 'object') return null;
-  if (activeBringUp(state, label, now)) return { running: true, run: b.run ?? null, startedAt: b.startedAt, deadline: b.deadline };
+  const hook = b.hook && b.hook !== 'bringUp' ? { hook: b.hook } : {};
+  if (activeBringUp(state, label, now)) return { running: true, ...hook, run: b.run ?? null, startedAt: b.startedAt, deadline: b.deadline };
   if (b.finishedAt == null) return null;
   const minutes = Number(config?.defaults?.bringUpRetryMinutes) > 0 ? Number(config.defaults.bringUpRetryMinutes) : BRINGUP_RETRY_MINUTES;
   const retryAt = toMs(b.finishedAt) + minutes * MINUTE;
   return {
     running: false,
+    ...hook,
     outcome: b.outcome ?? null,
+    ...(typeof b.started === 'boolean' ? { started: b.started } : {}),
     startedAt: b.startedAt ?? null,
     finishedAt: b.finishedAt,
-    ...(retryAt > now ? { retryAfter: iso(retryAt) } : {}),
+    ...(b.hook !== 'tearDown' && retryAt > now ? { retryAfter: iso(retryAt) } : {}),
   };
 }
 
@@ -902,9 +943,8 @@ export function validateConfig(config) {
       continue;
     }
     const kind = m.kind ?? 'always-on';
-    if (kind === 'ephemeral') warnings.push(`${where} is ephemeral, a Phase 4 kind; it is never placed in Phase 1.`);
-    else if (kind !== 'always-on') errors.push(`${where}.kind must be always-on.`);
-    if (kind === 'always-on' && (typeof m.environmentId !== 'string' || !m.environmentId)) errors.push(`${where}.environmentId is required.`);
+    if (!MACHINE_KINDS.includes(kind)) errors.push(`${where}.kind must be one of ${MACHINE_KINDS.join(', ')}.`);
+    if (typeof m.environmentId !== 'string' || !m.environmentId) errors.push(`${where}.environmentId is required.`);
     if (m.environmentId) {
       if (envIds.has(m.environmentId)) errors.push(`${where}.environmentId duplicates machines.${envIds.get(m.environmentId)}.`);
       else envIds.set(m.environmentId, label);

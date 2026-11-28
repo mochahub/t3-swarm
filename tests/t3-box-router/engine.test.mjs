@@ -94,7 +94,7 @@ describe('place: single placement', () => {
       'Run on home-box. In its project checkout, run git fetch origin && git worktree add ~/work/feat-x -b feat-x origin/main. Work there, then push your branch to origin.',
     );
     assert.deepEqual(state.slots.s1, {
-      label: 'home-box', run: null, repo: REPO, exclusive: [], placedAt: iso(NOW), expiresAt: iso(NOW + 180 * MIN),
+      label: 'home-box', environmentId: 'env-home', run: null, repo: REPO, exclusive: [], placedAt: iso(NOW), expiresAt: iso(NOW + 180 * MIN),
     });
   });
 
@@ -319,11 +319,19 @@ describe('place: filters', () => {
     assert.equal(ids.n, 0, 'no slot ID consumed on error');
   });
 
-  test('ephemeral machines are never placed in Phase 1', () => {
-    const config = mkConfig({ machines: { eph: box('env-eph', { kind: 'ephemeral', priority: 99 }) } });
-    const r = run('place', { config, state: mkState({ eph: freshObs('env-eph') }) }).result;
-    assert.equal(r.placement.label, 'local');
-    assert.match(r.placement.skipped[0].reason, /ephemeral is not supported/);
+  test('ephemeral machines rank below local and every other box, whatever their priority', () => {
+    const config = mkConfig({ machines: { eph: box('env-eph', { kind: 'ephemeral', priority: 99 }), od: box('env-od', { kind: 'on-demand', priority: 1 }) } });
+    const state = mkState({ eph: freshObs('env-eph'), od: freshObs('env-od') });
+    const r = run('place', { config, state }).result;
+    assert.equal(r.placement.label, 'od', 'on-demand ranks by priority like always-on');
+    assert.match(r.placement.skipped.find((s) => s.label === 'eph').reason, /Ephemeral boxes rank below/);
+    const onlyEph = run('place', { config, state, options: { place: 'box', needs: ['linux'] } });
+    assert.equal(onlyEph.result.placement.label, 'od');
+    // With local and on-demand full or excluded, the ephemeral box takes overflow.
+    const overflow = run('place', { config, state, options: { place: 'eph' } }).result;
+    assert.equal(overflow.placement.label, 'eph');
+    const batch = run('place', { config: mkConfig({ local: { maxConcurrent: 1 }, machines: { eph: box('env-eph', { kind: 'ephemeral', priority: 99 }) } }), state: mkState({ eph: freshObs('env-eph') }), options: { count: 2 } }).result;
+    assert.deepEqual(batch.placements.map((p) => p.placement.label), ['local', 'eph']);
   });
 });
 
@@ -449,6 +457,14 @@ describe('TTL and leases', () => {
     const slots = Object.fromEntries([1, 2, 3, 4, 5, 6].map((i) => [`x${i}`, slot('home-box')]));
     const { result } = run('acquire', { state: mkState({ 'home-box': freshObs('env-home') }, { slots }), options: { run: 'r1' } });
     assert.equal(result.ok, true);
+  });
+
+  test('reacquire identifies a previously started environment that now needs manual cleanup', () => {
+    const leases = { r1: { machines: ['old'], startedByRouter: ['old'], startedEnvironments: { old: 'env-old' }, expiresAt: iso(NOW + HOUR) } };
+    const state = mkState({ 'home-box': freshObs('env-home') }, { leases });
+    const { result } = run('acquire', { state, options: { run: 'r1' } });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.droppedStartedBoxes, [{ label: 'old', environmentId: 'env-old' }]);
   });
 
   test('reacquire keeps held boxes, then prefers unheld over shared boxes', () => {

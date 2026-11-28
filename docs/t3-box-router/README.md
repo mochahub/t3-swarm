@@ -6,21 +6,22 @@ short-lived slot there, explains why, and returns the T3 target plus the Git han
 
 - **Standalone** from any T3 harness: `place` → `delegate_task` → `done`.
 - **With t3-swarm** as the user's "box skill", using today's swarm commands (Level 0): `acquire`, `observe`,
-  `register-payload`, `policy-line`, `release`.
+  `register-payload`, `policy-line`, `release`, `keep-alive`.
 
 It is a zero-dependency Node 18+ CLI that runs on demand. There is no daemon, queue or monitor. Design,
-rationale and evidence: [SPEC.md](SPEC.md).
+rationale and evidence: [SPEC.md](SPEC.md) (historical; the references below describe the integrated CLI).
 
 ## What this release does, and what it doesn't
 
 | Included | Not included |
 | --- | --- |
-| Local plus always-on boxes with stable T3 environment IDs | Short-lived or cloud boxes, drivers, cost handling |
-| Hard `--needs`, soft `--prefers`, strict priority tiers, `maxConcurrent` slots, exclusive tags | Weights, affinity, per-repo priorities or caps |
+| Local, always-on, on-demand and ephemeral machines with stable T3 environment IDs | Cloud provisioning, spend, pricing |
+| Hard `--needs`, soft `--prefers`, strict priority tiers, `maxConcurrent` slots, exclusive tags; ephemeral ranks last | Weights, affinity, per-repo priorities or caps |
 | Fixed 30-minute cooldown, `recovering` limited to one slot | Growing backoff |
 | Cached T3 facts with expiry (links 15 min, providers and projects 24 h) | Reading T3's private files or databases |
-| Git handoff through `origin` with per-task worktrees | Snapshots of uncommitted work, SSH fetch, artifact pull |
-| User-owned `bringUp` hook during `acquire` | Link renewal, tag-check commands, repo override file |
+| Hardware and toolchain profiles from a read-only probe, applied automatically | Credential detection (owner attestations only) |
+| User-owned `bringUp`, `tearDown`, `keepAlive`, `handoff` and `fetch` hooks; teardown only for boxes the run started | Hooks the router writes, link renewal, repo override file |
+| Git handoff through `origin` with per-task worktrees; user-owned handoff and fetch hooks for uncommitted work | Snapshots the router makes itself, SSH fetch, artifact pull |
 | Level 0 swarm integration through a generated policy line | Changes to swarm itself (Level 1) |
 
 ## Install
@@ -49,7 +50,8 @@ Ask your agent to "set up t3-box-router". It follows
    exclusive tags, and that each box can push to `origin`. `init` writes `~/.t3/boxes/config.json`
    (`T3_BOXES_HOME` overrides the directory). Start from
    [config.example.json](../../skills/t3-box-router/references/config.example.json).
-3. `doctor`, then one test placement, then `done` to return the slot.
+3. `doctor`, then one test placement, then `done` to return the slot. Then probe each new box as in
+   [probe.md](../../skills/t3-box-router/references/probe.md).
 
 "Box first until full, then local": give the box priority 10 and six slots and local priority 0 and four slots.
 A batch of seven fills six on the box and one locally. Tags only local has (for example `ios-sim`) keep that
@@ -89,15 +91,22 @@ The full sequence is in [swarm.md](../../skills/t3-box-router/references/swarm.m
   both stores.
 - `release --run <runId>` after `swarm finish`, using the run ID you saved.
 
-## Bring-up hook
+## Machines, probes and lifecycle
 
-Set `machines.<label>.bringUp` to the absolute path of your start script and its arguments as a JSON array.
-If `acquire` falls short and a fresh link read shows a linked box down, it runs this script once, without a
-shell and with a bounded timeout. It never runs for a missing or expiring link, a cooling box, a box where the
-router holds a slot, or again within `bringUpRetryMinutes`. While it runs, nothing is placed on that box; after it,
-the router asks for fresh observations before leasing it. The hook must check that the box is idle before
-restarting T3 and exit 75 if it is busy. See the rules, example and timeout setting in
-[setup.md](../../skills/t3-box-router/references/setup.md#bring-up-hook).
+- **Kinds.** `always-on` (never stopped by the router), `on-demand` and `ephemeral` (the router stops them only when
+  this run started them and nothing else holds them). Table in [setup.md](../../skills/t3-box-router/references/setup.md#machine-kinds).
+- **Profiles.** A read-only probe reports each box's hardware and tools. The Coordinator runs it in the background
+  for boxes `place`/`acquire`/`list` report as `unprofiledBoxes`, then applies it with `apply-probe` without an
+  owner step. Dedupe and the flow: [probe.md](../../skills/t3-box-router/references/probe.md). Owner attestations
+  cover `cred:` and `secret:` tags only.
+- **Bring-up.** `acquire` may run a box's `bringUp` hook when it is down. The router owns the box for the run only if
+  the hook writes `STARTED <label> yes` (or `{"started": true}`) to the private file named by `T3_BOXES_RESULT_FILE`, or to stdout with `bringUpStdout: true`.
+- **Teardown, keep-alive, handoff, fetch.** `release` stops only owned on-demand or ephemeral boxes, when no other
+  run, slot, hook or keep-alive holds them. `keep-alive` renews a lease. `handoff` and `fetch` call the user's own
+  transfer hooks for uncommitted work. The contract, conditions and manual steps when a release leaves a box running:
+  [setup.md](../../skills/t3-box-router/references/setup.md#lifecycle-hooks).
+
+Sample config with one always-on and one on-demand box: [config.example.json](../../skills/t3-box-router/references/config.example.json).
 
 ## Limits to know
 
@@ -107,4 +116,4 @@ restarting T3 and exit 75 if it is busy. See the rules, example and timeout sett
   is untested.
 - Cross-environment attachments and `t3_thread_launch` worktree strategies on a box are unverified; `t3 thread
   start` is not a dispatch path. See [transport.md](../../skills/t3-box-router/references/transport.md).
-- Short-lived machines are out of scope: [drivers.md](../../skills/t3-box-router/references/drivers.md).
+- The router provisions nothing. Cloud machines need your own start and stop scripts ([drivers.md](../../skills/t3-box-router/references/drivers.md)).

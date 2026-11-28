@@ -24,7 +24,9 @@
  *   readState(home, config, now?)       -> lock-free pruned snapshot, for refreshFacts outside the lock
  *
  * Helpers: resolveHome, homePaths, validateConfig, inspectConfig, defaultConfig, emptyState, normalizeState,
- * pruneState, acquireLock, releaseLock, localPlatformTags, isoTime, parseTime, StoreError, validation patterns.
+ * pruneState, acquireLock, releaseLock, atomicWrite, serialize, localPlatformTags, isoTime, parseTime, StoreError,
+ * validation patterns. Profile fields (profile, extraTags, denyTags, defaults.probeTtlDays) and the
+ * discovered-links cache (state.discovered) are defined in profile.mjs.
  *
  * Config maps (machines, repos) are plain objects and labels such as `constructor` are valid: look up any
  * caller-supplied label with Object.hasOwn, never `config.machines[label]` alone.
@@ -34,6 +36,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+import { PROFILE_DEFAULTS, PROFILE_DEFAULT_KEYS, readStoredProfile, profileTags, deriveCapacity, mergeTags, pruneDiscovered } from "./profile.mjs";
 
 export const CONFIG_VERSION = 1;
 export const STATE_VERSION = 1;
@@ -53,7 +57,12 @@ export const DEFAULTS = Object.freeze({
  * these keys only when the user sets them.
  */
 export const BRINGUP_LIMITS = Object.freeze({ minTimeoutMs: 1000, maxTimeoutMs: 600_000, defaultTimeoutMs: 120_000, defaultRetryMinutes: 10 });
-const BRINGUP_DEFAULT_KEYS = ["bringUpTimeoutMs", "bringUpRetryMinutes"];
+const BRINGUP_DEFAULT_KEYS = ["bringUpTimeoutMs", "bringUpRetryMinutes", "hookTimeoutMs"];
+
+/** Machine kinds. always-on is never stopped by the router; on-demand and ephemeral may be, with a tearDown hook. */
+export const MACHINE_KINDS = Object.freeze(["always-on", "on-demand", "ephemeral"]);
+/** Lifecycle hooks besides bringUp, each an argument vector like bringUp. */
+export const LIFECYCLE_HOOKS = Object.freeze(["tearDown", "keepAlive", "handoff", "fetch"]);
 
 export const LOCAL_DEFAULTS = Object.freeze({ priority: 0, weight: 1, maxConcurrent: 4 });
 export const MACHINE_DEFAULTS = Object.freeze({ kind: "always-on", priority: 10, weight: 1, maxConcurrent: 2, worktreeRoot: "~/work", renew: "manual" });
@@ -131,10 +140,11 @@ export function emptyState() {
 const PHASE2_MACHINE_FIELDS = ["checks"];
 const PHASE2_REPO_FIELDS = ["priority", "maxConcurrent", "allowWorktreeScripts"];
 const KNOWN_TOP = new Set(["version", "scriptPath", "allowProjectOverride", "defaults", "local", "machines", "repos"]);
-const KNOWN_LOCAL = new Set(["tags", "deviceHostId", "priority", "weight", "maxConcurrent", "exclusive"]);
+const KNOWN_LOCAL = new Set(["tags", "deviceHostId", "priority", "weight", "maxConcurrent", "exclusive", "profile", "extraTags", "denyTags"]);
 const KNOWN_MACHINE = new Set([
   "kind", "environmentId", "url", "ssh", "tags", "deviceHostId", "priority", "weight", "maxConcurrent", "exclusive",
-  "worktreeRoot", "renew", "bringUp", "bringUpTimeoutMs", "checks",
+  "worktreeRoot", "renew", "bringUp", "bringUpTimeoutMs", "bringUpStdout", "checks", "profile", "extraTags", "denyTags",
+  ...LIFECYCLE_HOOKS, "hookTimeoutMs",
 ]);
 const KNOWN_REPO = new Set(["needs", "prefers", "deny", "pin", "priority", "maxConcurrent", "worktreeCommand", "allowWorktreeScripts"]);
 
@@ -195,6 +205,24 @@ function warnUnknown(obj, known, where, warnings) {
   for (const k of Object.keys(obj)) if (!known.has(k)) warnings.push(`${where}.${k} is not a known field and is ignored.`);
 }
 
+/**
+ * Profile fields (profile.mjs): keep a valid stored profile (or `false`, the opt-out), the user's extraTags and
+ * denyTags, and set entry.tags to (tags ∪ profile tags ∪ extraTags) − denyTags. Returns the capacity defaults the
+ * profile implies, which apply only where the user set no explicit value.
+ */
+function applyProfileFields(entry, raw, where, errors, warnings, { remote }) {
+  const extra = checkTags(raw.extraTags, `${where}.extraTags`, errors);
+  const deny = checkTags(raw.denyTags, `${where}.denyTags`, errors);
+  const read = readStoredProfile(raw.profile, { environmentId: remote ? entry.environmentId : undefined });
+  if (read.problem) warnings.push(`${where}.profile ${read.problem}.`);
+  if (read.profile) entry.profile = read.profile;
+  else if (read.optOut) entry.profile = false;
+  if (extra.length) entry.extraTags = extra;
+  if (deny.length) entry.denyTags = deny;
+  entry.tags = mergeTags(entry.tags, profileTags(read.profile), extra, deny);
+  return read.profile ? deriveCapacity(read.profile, { remote }) : {};
+}
+
 function checkUrl(value, where, errors) {
   if (typeof value !== "string") {
     errors.push(`${where} must be a string.`);
@@ -241,7 +269,7 @@ export function validateConfig(raw) {
   if (!isObj(d)) errors.push("config.defaults must be an object.");
   config.defaults = { ...DEFAULTS };
   if (isObj(d)) {
-    warnUnknown(d, new Set([...Object.keys(DEFAULTS), ...BRINGUP_DEFAULT_KEYS]), "config.defaults", warnings);
+    warnUnknown(d, new Set([...Object.keys(DEFAULTS), ...BRINGUP_DEFAULT_KEYS, ...PROFILE_DEFAULT_KEYS]), "config.defaults", warnings);
     for (const key of Object.keys(DEFAULTS)) {
       config.defaults[key] = checkNumber(d[key], `config.defaults.${key}`, errors, {
         fallback: DEFAULTS[key],
@@ -252,9 +280,18 @@ export function validateConfig(raw) {
     if (d.bringUpTimeoutMs !== undefined) {
       config.defaults.bringUpTimeoutMs = checkTimeoutMs(d.bringUpTimeoutMs, "config.defaults.bringUpTimeoutMs", errors);
     }
+    if (d.hookTimeoutMs !== undefined) {
+      config.defaults.hookTimeoutMs = checkTimeoutMs(d.hookTimeoutMs, "config.defaults.hookTimeoutMs", errors);
+    }
     if (d.bringUpRetryMinutes !== undefined) {
       config.defaults.bringUpRetryMinutes = checkNumber(d.bringUpRetryMinutes, "config.defaults.bringUpRetryMinutes", errors, {
         fallback: BRINGUP_LIMITS.defaultRetryMinutes, positive: true,
+      });
+    }
+    // Like the bring-up keys, written to the validated config only when the user sets it (init output unchanged).
+    if (d.probeTtlDays !== undefined) {
+      config.defaults.probeTtlDays = checkNumber(d.probeTtlDays, "config.defaults.probeTtlDays", errors, {
+        fallback: PROFILE_DEFAULTS.probeTtlDays, positive: true,
       });
     }
   }
@@ -268,15 +305,18 @@ export function validateConfig(raw) {
     const declared = checkTags(l.tags, "config.local.tags", errors);
     const tags = [...declared];
     for (const t of localPlatformTags()) if (!tags.includes(t)) tags.push(t);
+    const localEntry = { tags };
+    const derived = applyProfileFields(localEntry, l, "config.local", errors, warnings, { remote: false });
     config.local = {
-      tags,
-      priority: checkNumber(l.priority, "config.local.priority", errors, { fallback: LOCAL_DEFAULTS.priority }),
+      tags: localEntry.tags,
+      priority: checkNumber(l.priority, "config.local.priority", errors, { fallback: derived.priority ?? LOCAL_DEFAULTS.priority }),
       weight: checkNumber(l.weight, "config.local.weight", errors, { fallback: LOCAL_DEFAULTS.weight, positive: true }),
       maxConcurrent: checkNumber(l.maxConcurrent, "config.local.maxConcurrent", errors, {
-        fallback: LOCAL_DEFAULTS.maxConcurrent, positive: true, integer: true,
+        fallback: derived.maxConcurrent ?? LOCAL_DEFAULTS.maxConcurrent, positive: true, integer: true,
       }),
       exclusive: checkTags(l.exclusive, "config.local.exclusive", errors),
     };
+    for (const k of ["profile", "extraTags", "denyTags"]) if (localEntry[k] !== undefined) config.local[k] = localEntry[k];
     if (l.deviceHostId !== undefined) {
       if (typeof l.deviceHostId !== "string" || !ID_PATTERN.test(l.deviceHostId)) errors.push("config.local.deviceHostId is invalid.");
       else config.local.deviceHostId = l.deviceHostId;
@@ -309,9 +349,8 @@ export function validateConfig(raw) {
     warnUnknown(m, KNOWN_MACHINE, where, warnings);
     const entry = {};
     const kind = m.kind === undefined ? MACHINE_DEFAULTS.kind : m.kind;
-    if (kind === "ephemeral") errors.push(`${where}.kind ephemeral is a Phase 4 sketch and is not supported.`);
-    else if (kind !== "always-on") errors.push(`${where}.kind must be "always-on".`);
-    entry.kind = "always-on";
+    if (!MACHINE_KINDS.includes(kind)) errors.push(`${where}.kind must be one of ${MACHINE_KINDS.map((k) => `"${k}"`).join(", ")}.`);
+    entry.kind = MACHINE_KINDS.includes(kind) ? kind : MACHINE_DEFAULTS.kind;
     if (typeof m.environmentId !== "string" || !ID_PATTERN.test(m.environmentId)) {
       errors.push(`${where}.environmentId is required and must be a T3 environment ID.`);
     } else {
@@ -332,10 +371,11 @@ export function validateConfig(raw) {
       else entry.deviceHostId = m.deviceHostId;
     }
     entry.tags = checkTags(m.tags, `${where}.tags`, errors);
-    entry.priority = checkNumber(m.priority, `${where}.priority`, errors, { fallback: MACHINE_DEFAULTS.priority });
+    const derived = applyProfileFields(entry, m, where, errors, warnings, { remote: true });
+    entry.priority = checkNumber(m.priority, `${where}.priority`, errors, { fallback: derived.priority ?? MACHINE_DEFAULTS.priority });
     entry.weight = checkNumber(m.weight, `${where}.weight`, errors, { fallback: MACHINE_DEFAULTS.weight, positive: true });
     entry.maxConcurrent = checkNumber(m.maxConcurrent, `${where}.maxConcurrent`, errors, {
-      fallback: MACHINE_DEFAULTS.maxConcurrent, positive: true, integer: true,
+      fallback: derived.maxConcurrent ?? MACHINE_DEFAULTS.maxConcurrent, positive: true, integer: true,
     });
     entry.exclusive = checkTags(m.exclusive, `${where}.exclusive`, errors);
     for (const t of entry.exclusive) if (!entry.tags.includes(t)) warnings.push(`${where}.exclusive tag ${t} is not among its tags.`);
@@ -354,9 +394,29 @@ export function validateConfig(raw) {
       // Kept exactly as written: the router passes this argument vector to the hook unchanged, with no shell.
       else entry.bringUp = m.bringUp.slice();
     }
+    if (m.bringUpStdout !== undefined) {
+      if (typeof m.bringUpStdout === "boolean") entry.bringUpStdout = m.bringUpStdout;
+      else errors.push(`${where}.bringUpStdout must be a boolean.`);
+    }
     if (m.bringUpTimeoutMs !== undefined) {
       entry.bringUpTimeoutMs = checkTimeoutMs(m.bringUpTimeoutMs, `${where}.bringUpTimeoutMs`, errors);
       if (m.bringUp === undefined) warnings.push(`${where}.bringUpTimeoutMs has no bringUp hook to bound.`);
+    }
+    for (const hook of LIFECYCLE_HOOKS) {
+      if (m[hook] === undefined) continue;
+      const problem = bringUpArgvProblem(m[hook]);
+      if (problem) errors.push(`${where}.${problem.replaceAll("bringUp", hook)}`);
+      else entry[hook] = m[hook].slice();
+    }
+    if (m.tearDown !== undefined && entry.kind === "always-on") {
+      errors.push(`${where}.tearDown needs kind "on-demand" or "ephemeral": the router never stops an always-on box.`);
+    }
+    if (m.hookTimeoutMs !== undefined) {
+      entry.hookTimeoutMs = checkTimeoutMs(m.hookTimeoutMs, `${where}.hookTimeoutMs`, errors);
+      if (!LIFECYCLE_HOOKS.some((h) => m[h] !== undefined)) warnings.push(`${where}.hookTimeoutMs has no tearDown, keepAlive, handoff or fetch hook to bound.`);
+    }
+    if (entry.kind === "on-demand" && m.bringUp === undefined) {
+      warnings.push(`${where} is on-demand without a bringUp hook; the router cannot start it.`);
     }
     for (const f of PHASE2_MACHINE_FIELDS) {
       if (m[f] === undefined) continue;
@@ -479,7 +539,8 @@ function ensureHome(home) {
   }
 }
 
-function atomicWrite(filePath, text) {
+/** Write text to filePath (mode 600) through a temporary file and one rename. */
+export function atomicWrite(filePath, text) {
   const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
   try {
     fs.writeFileSync(tmp, text, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -495,7 +556,7 @@ function atomicWrite(filePath, text) {
   }
 }
 
-const serialize = (obj) => JSON.stringify(obj, null, 2) + "\n";
+export const serialize = (obj) => JSON.stringify(obj, null, 2) + "\n";
 
 /**
  * Create config.json (the proposed config, or a local-only default) and an empty state.json.
@@ -611,8 +672,10 @@ export function normalizeState(raw) {
   const state = emptyState();
   for (const k of ["observations", "health", "leases", "slots"]) state[k] = isObj(raw[k]) ? raw[k] : {};
   if (isObj(raw.bringUp)) state.bringUp = raw.bringUp;
+  if (isObj(raw.lifecycle)) state.lifecycle = raw.lifecycle;
   if (isObj(raw.credits)) state.credits = raw.credits;
   if (isObj(raw.affinity)) state.affinity = raw.affinity;
+  if (isObj(raw.discovered)) state.discovered = raw.discovered;
   return state;
 }
 
@@ -624,10 +687,12 @@ const ENVELOPE_KINDS = ["link", "probe", "providers", "projects"];
  *     otherwise each envelope whose validUntil has passed or is unparseable.
  *   - health: only labels that are neither `local` nor configured. Records outlive their cooldown, because
  *     `failures > 0` after the cooldown is what makes a machine `recovering`.
- *   - slots: expired, or on a label that is no longer configured.
+ *   - slots: expired, or on a label that is no longer configured and naming no environmentId.
  *   - leases: expired; held labels filtered to configured machines.
  *   - bringUp: entries for unconfigured labels, and finished attempts older than the retry window. An unfinished
  *     claim is never dropped here: the router finalizes it (and expires that box's facts) once its deadline passes.
+ *     A finished bringUp that confirmed it started the box, not yet adopted by a lease, is kept for leaseTtlHours.
+ *   - lifecycle.keepAlive: running keep-alive claims past their deadline or on unconfigured labels.
  *   - affinity (Phase 2): expired or unknown label. credits (Phase 2): unknown label.
  */
 export function pruneState(config, state, now) {
@@ -660,7 +725,9 @@ export function pruneState(config, state, now) {
   }
   for (const id of Object.keys(state.slots)) {
     const s = state.slots[id];
-    if (!isObj(s) || !known(s.label) || expired(s.expiresAt)) {
+    // A live slot that names its environment is kept even after its label leaves config: until it expires it still
+    // marks that environment busy, so a tear-down of the same environment under a new label waits for it.
+    if (!isObj(s) || expired(s.expiresAt) || (!known(s.label) && typeof s.environmentId !== "string")) {
       delete state.slots[id];
       changed = true;
     }
@@ -683,11 +750,29 @@ export function pruneState(config, state, now) {
     for (const label of Object.keys(state.bringUp)) {
       const b = state.bringUp[label];
       const finished = isObj(b) && b.finishedAt != null;
-      if (!hasOwn(machines, label) || !isObj(b) || (finished && !(parseTime(b.finishedAt) + retryMs > now))) {
+      // A start the hook confirmed and no lease has adopted yet is kept for the lease TTL, so the acquire that
+      // follows the fact refresh can still record it as this run's. Losing it is safe: no ownership, no teardown.
+      const keepMs = finished && b.started === true && !b.adoptedAt ? Math.max(retryMs, (Number(config?.defaults?.leaseTtlHours) || DEFAULTS.leaseTtlHours) * 3_600_000) : retryMs;
+      const liveClaim = b?.environmentId && !finished && parseTime(b.deadline) > now;
+      if ((!hasOwn(machines, label) && !liveClaim) || !isObj(b) || (finished && !(parseTime(b.finishedAt) + keepMs > now))) {
         delete state.bringUp[label];
         changed = true;
       }
     }
+  }
+  if (isObj(state.lifecycle)) {
+    // keepAlive: running keep-alive hooks, one per box, dropped at their deadline or when the box leaves config.
+    const ka = isObj(state.lifecycle.keepAlive) ? state.lifecycle.keepAlive : {};
+    for (const label of Object.keys(ka)) {
+      if ((!hasOwn(machines, label) && !ka[label]?.environmentId) || !isObj(ka[label]) || expired(ka[label].deadline)) {
+        delete ka[label];
+        changed = true;
+      }
+    }
+    if (!Object.keys(ka).length) {
+      delete state.lifecycle;
+      changed = true;
+    } else state.lifecycle = { ...state.lifecycle, keepAlive: ka };
   }
   if (state.affinity) {
     for (const repo of Object.keys(state.affinity)) {
@@ -709,6 +794,7 @@ export function pruneState(config, state, now) {
       }
     }
   }
+  if (pruneDiscovered(state, now)) changed = true;
   if (state.credits) {
     for (const label of Object.keys(state.credits)) {
       if (!known(label)) {
