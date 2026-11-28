@@ -228,14 +228,11 @@ export function applyObservationsDetailed(config, state, records, now) {
   const byEnv = machineByEnvironment(config);
   const updated = new Set();
   const ignored = [];
-  let links = null;
+  let latestLinks = null;
 
   parsed.forEach((r, i) => {
     if (r.tool === "t3_environment_links") {
-      links = links || [];
-      for (const [environmentId, l] of r.links) {
-        if (!links.some((x) => x.environmentId === environmentId)) links.push({ environmentId, label: l.label, status: l.status, urls: l.urls || [] });
-      }
+      latestLinks = Array.from(r.links, ([environmentId, l]) => ({ environmentId, label: l.label, status: l.status, urls: l.urls || [] }));
       for (const [label, m] of Object.entries(config.machines || {})) {
         const link = r.links.get(m.environmentId);
         const value = link ? { status: link.status, access: link.access, expiresAt: link.expiresAt, lastError: link.lastError } : null;
@@ -260,7 +257,7 @@ export function applyObservationsDetailed(config, state, records, now) {
   });
 
   // links: every link read (configured or not), for the discovered-links cache; null without a links record.
-  return { state: next, updated: [...updated].sort(), ignored, links };
+  return { state: next, updated: [...updated].sort(), ignored, links: latestLinks };
 }
 
 /** applyObservationsDetailed, returning only the new state. */
@@ -452,7 +449,9 @@ export async function refreshFactsDetailed(config, state, now, opts = {}) {
     const bin = resolveT3(opts);
     if (bin) {
       t3.available = true;
-      const read = await readT3Links(bin, { timeoutMs: opts.t3TimeoutMs });
+      // Keep optional inventory refresh brief when every routing fact is already fresh.
+      const timeoutMs = opts.t3TimeoutMs ?? (needLink.length ? DEFAULT_T3_TIMEOUT_MS : 1000);
+      const read = await readT3Links(bin, { timeoutMs });
       t3.ok = read.ok;
       if (read.ok && (opts.links === "keep" || opts.links === "read")) t3.links = read.links;
       if (read.ok) {
@@ -501,7 +500,7 @@ export function proposeLabel(t3Label, environmentId) {
  */
 export async function discover(config, opts = {}) {
   const machines = config?.machines || {};
-  let links = null;
+  let latestLinks = null;
   let source = null;
   const warnings = [];
   const bin = resolveT3(opts);

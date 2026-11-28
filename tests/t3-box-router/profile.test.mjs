@@ -225,13 +225,13 @@ test("an invalid or foreign stored profile is ignored with a warning that does n
       a: { environmentId: "env-a", tags: ["linux"], profile: { ...stored({ environmentId: "env-a" }), os: CANARY } },
       b: { environmentId: "env-b", tags: ["linux"], profile: stored({ environmentId: "env-other" }) },
     },
-    defaults: { profileTtlDays: 0 },
+    defaults: { probeTtlDays: 0 },
   });
-  assert.equal(v.ok, false); // profileTtlDays must be positive
-  assert.ok(v.errors.some((e) => e.includes("profileTtlDays")));
-  const w = validateConfig({ version: 1, machines: { a: { environmentId: "env-a", tags: ["linux"], profile: { ...stored({ environmentId: "env-a" }), os: CANARY } }, b: { environmentId: "env-b", tags: ["linux"], profile: stored({ environmentId: "env-other" }) } }, defaults: { profileTtlDays: 3 } });
+  assert.equal(v.ok, false); // probeTtlDays must be positive
+  assert.ok(v.errors.some((e) => e.includes("probeTtlDays")));
+  const w = validateConfig({ version: 1, machines: { a: { environmentId: "env-a", tags: ["linux"], profile: { ...stored({ environmentId: "env-a" }), os: CANARY } }, b: { environmentId: "env-b", tags: ["linux"], profile: stored({ environmentId: "env-other" }) } }, defaults: { probeTtlDays: 3 } });
   assert.equal(w.ok, true);
-  assert.equal(w.config.defaults.profileTtlDays, 3);
+  assert.equal(w.config.defaults.probeTtlDays, 3);
   assert.equal(w.config.machines.a.profile, undefined);
   assert.deepEqual(w.config.machines.a.tags, ["linux"]);
   assert.equal(w.config.machines.a.maxConcurrent, 2);
@@ -253,7 +253,7 @@ test("the example config validates as before: no new warnings, same tags and cap
   assert.equal(box.profile, undefined);
   assert.equal(v.config.local.maxConcurrent, 4);
   assert.equal(v.config.local.priority, 0);
-  assert.equal(v.config.defaults.profileTtlDays, undefined);
+  assert.equal(v.config.defaults.probeTtlDays, undefined);
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -304,7 +304,7 @@ test("link URLs keep only credential-free origins", () => {
 test("unprofiledBoxes lists new, unprofiled and stale linked boxes and skips the rest", () => {
   const config = validateConfig({
     version: 1,
-    defaults: { profileTtlDays: 7 },
+    defaults: { probeTtlDays: 7 },
     machines: {
       fresh: { environmentId: "env-fresh", profile: stored({ environmentId: "env-fresh", profiledAt: iso(NOW - 6 * DAY) }) },
       stale: { environmentId: "env-stale", url: "https://stale.example", profile: stored({ environmentId: "env-stale", profiledAt: iso(NOW - 8 * DAY) }) },
@@ -331,7 +331,7 @@ test("unprofiledBoxes lists new, unprofiled and stale linked boxes and skips the
     { environmentId: "env-stale", label: "stale", urls: ["https://stale-t3.example", "https://stale.example"], reason: "stale" },
   ]);
   // The TTL is configurable.
-  const strict = { ...config, defaults: { ...config.defaults, profileTtlDays: 1 } };
+  const strict = { ...config, defaults: { ...config.defaults, probeTtlDays: 1 } };
   assert.ok(unprofiledBoxes({ config: strict, state, now: NOW, proposeLabel }).some((b) => b.label === "fresh" && b.reason === "stale"));
   // An expired discovery read contributes nothing; observations still do.
   const later = unprofiledBoxes({ config, state, now: NOW + 30 * 60_000, proposeLabel });

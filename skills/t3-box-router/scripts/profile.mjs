@@ -23,7 +23,7 @@
 
 export const PROBE_KIND = "t3-box-router-probe";
 export const PROBE_VERSION = 1;
-export const PROFILE_DEFAULTS = Object.freeze({ profileTtlDays: 7 });
+export const PROFILE_DEFAULTS = Object.freeze({ probeTtlDays: 7 });
 export const PROFILE_DEFAULT_KEYS = Object.freeze(Object.keys(PROFILE_DEFAULTS));
 /** Key under which box-router passes a discovery read through a fact patch. Never a valid machine label. */
 export const DISCOVERY_PATCH_KEY = "@links";
@@ -225,8 +225,8 @@ export function mergeTags(explicit = [], fromProfile = [], extra = [], deny = []
 }
 
 export function profileTtlMs(config) {
-  const days = Number(config?.defaults?.profileTtlDays);
-  return (days > 0 ? days : PROFILE_DEFAULTS.profileTtlDays) * DAY_MS;
+  const days = Number(config?.defaults?.probeTtlDays);
+  return (days > 0 ? days : PROFILE_DEFAULTS.probeTtlDays) * DAY_MS;
 }
 
 /** True when a profile belongs to this environment and is younger than the TTL (and not from the future). */
@@ -362,7 +362,7 @@ export function discoveryStale(state, now) {
  * Linked boxes without a fresh profile, for place, acquire and list. Never blocks anything.
  *   reason "new"         linked in T3 but not in config (apply-probe <label> --environment-id adds it)
  *          "unprofiled"  configured, never profiled
- *          "stale"       configured, profile older than defaults.profileTtlDays (7) or from another environment
+ *          "stale"       configured, profile older than defaults.probeTtlDays (7) or from another environment
  * Sources: the fresh discovery envelope, plus every configured machine with a fresh link observation that found
  * its link. Revoked links are skipped (they need relinking, not probing). Machines with `profile: false` are
  * skipped. proposeLabel(t3Label, environmentId) turns a T3 label into a valid router label for new boxes.

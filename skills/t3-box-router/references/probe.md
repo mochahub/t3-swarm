@@ -19,7 +19,7 @@ A **profile** records a machine's hardware and toolchain in `config.json` (`mach
 | --- | --- | --- |
 | `new` | Linked in T3 but not in config. `label` is a proposed router label. | Ask the user whether to add it; if yes, probe and apply with `--environment-id`. |
 | `unprofiled` | Configured, never probed. | Probe and apply when convenient. |
-| `stale` | Profile older than `defaults.profileTtlDays` (default 7), or probed on another environment. | Probe again and apply. |
+| `stale` | Profile older than `defaults.probeTtlDays` (default 7), or probed on another environment. | Probe again and apply. |
 
 The list is information only. It never blocks a placement, never changes `ok` and never asks for an observation.
 Ready machines keep being placed while a box waits for its probe.
@@ -120,4 +120,4 @@ A stale profile keeps contributing its tags until it is replaced; staleness only
 `unprofiledBoxes`. A profile that fails validation when the config loads is ignored, and the next `apply-probe` lists it under
 `warnings`. A profile recorded for a different `environmentId` is ignored the same way.
 
-Set the TTL with `defaults.profileTtlDays` (default 7).
+Set the TTL with `defaults.probeTtlDays` (default 7).

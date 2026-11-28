@@ -25,7 +25,7 @@
  *
  * Helpers: resolveHome, homePaths, validateConfig, inspectConfig, defaultConfig, emptyState, normalizeState,
  * pruneState, acquireLock, releaseLock, atomicWrite, serialize, localPlatformTags, isoTime, parseTime, StoreError,
- * validation patterns. Profile fields (profile, extraTags, denyTags, defaults.profileTtlDays) and the
+ * validation patterns. Profile fields (profile, extraTags, denyTags, defaults.probeTtlDays) and the
  * discovered-links cache (state.discovered) are defined in profile.mjs.
  *
  * Config maps (machines, repos) are plain objects and labels such as `constructor` are valid: look up any
@@ -280,9 +280,9 @@ export function validateConfig(raw) {
       });
     }
     // Like the bring-up keys, written to the validated config only when the user sets it (init output unchanged).
-    if (d.profileTtlDays !== undefined) {
-      config.defaults.profileTtlDays = checkNumber(d.profileTtlDays, "config.defaults.profileTtlDays", errors, {
-        fallback: PROFILE_DEFAULTS.profileTtlDays, positive: true,
+    if (d.probeTtlDays !== undefined) {
+      config.defaults.probeTtlDays = checkNumber(d.probeTtlDays, "config.defaults.probeTtlDays", errors, {
+        fallback: PROFILE_DEFAULTS.probeTtlDays, positive: true,
       });
     }
   }

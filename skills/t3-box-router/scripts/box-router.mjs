@@ -542,7 +542,7 @@ async function cmdApplyProbe(options) {
         effective: { tags: entry.tags, priority: entry.priority, maxConcurrent: entry.maxConcurrent },
         preserved: merged.preserved,
         ...(checked.ignored ? { ignoredFields: checked.ignored } : {}),
-        ...(merged.created ? { next: "Confirm the new box's label, priority, capacity and push access with the user, then run doctor." } : {}),
+        ...(merged.created ? { next: "Run doctor to check the new box." } : {}),
         warnings: v.warnings,
       },
     };
