@@ -24,7 +24,9 @@
  *   readState(home, config, now?)       -> lock-free pruned snapshot, for refreshFacts outside the lock
  *
  * Helpers: resolveHome, homePaths, validateConfig, inspectConfig, defaultConfig, emptyState, normalizeState,
- * pruneState, acquireLock, releaseLock, localPlatformTags, isoTime, parseTime, StoreError, validation patterns.
+ * pruneState, acquireLock, releaseLock, atomicWrite, serialize, localPlatformTags, isoTime, parseTime, StoreError,
+ * validation patterns. Profile fields (profile, extraTags, denyTags, defaults.profileTtlDays) and the
+ * discovered-links cache (state.discovered) are defined in profile.mjs.
  *
  * Config maps (machines, repos) are plain objects and labels such as `constructor` are valid: look up any
  * caller-supplied label with Object.hasOwn, never `config.machines[label]` alone.
@@ -34,6 +36,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+import { PROFILE_DEFAULTS, PROFILE_DEFAULT_KEYS, readStoredProfile, profileTags, deriveCapacity, mergeTags, pruneDiscovered } from "./profile.mjs";
 
 export const CONFIG_VERSION = 1;
 export const STATE_VERSION = 1;
@@ -131,10 +135,10 @@ export function emptyState() {
 const PHASE2_MACHINE_FIELDS = ["checks"];
 const PHASE2_REPO_FIELDS = ["priority", "maxConcurrent", "allowWorktreeScripts"];
 const KNOWN_TOP = new Set(["version", "scriptPath", "allowProjectOverride", "defaults", "local", "machines", "repos"]);
-const KNOWN_LOCAL = new Set(["tags", "deviceHostId", "priority", "weight", "maxConcurrent", "exclusive"]);
+const KNOWN_LOCAL = new Set(["tags", "deviceHostId", "priority", "weight", "maxConcurrent", "exclusive", "profile", "extraTags", "denyTags"]);
 const KNOWN_MACHINE = new Set([
   "kind", "environmentId", "url", "ssh", "tags", "deviceHostId", "priority", "weight", "maxConcurrent", "exclusive",
-  "worktreeRoot", "renew", "bringUp", "bringUpTimeoutMs", "checks",
+  "worktreeRoot", "renew", "bringUp", "bringUpTimeoutMs", "checks", "profile", "extraTags", "denyTags",
 ]);
 const KNOWN_REPO = new Set(["needs", "prefers", "deny", "pin", "priority", "maxConcurrent", "worktreeCommand", "allowWorktreeScripts"]);
 
@@ -195,6 +199,24 @@ function warnUnknown(obj, known, where, warnings) {
   for (const k of Object.keys(obj)) if (!known.has(k)) warnings.push(`${where}.${k} is not a known field and is ignored.`);
 }
 
+/**
+ * Profile fields (profile.mjs): keep a valid stored profile (or `false`, the opt-out), the user's extraTags and
+ * denyTags, and set entry.tags to (tags ∪ profile tags ∪ extraTags) − denyTags. Returns the capacity defaults the
+ * profile implies, which apply only where the user set no explicit value.
+ */
+function applyProfileFields(entry, raw, where, errors, warnings, { remote }) {
+  const extra = checkTags(raw.extraTags, `${where}.extraTags`, errors);
+  const deny = checkTags(raw.denyTags, `${where}.denyTags`, errors);
+  const read = readStoredProfile(raw.profile, { environmentId: remote ? entry.environmentId : undefined });
+  if (read.problem) warnings.push(`${where}.profile ${read.problem}.`);
+  if (read.profile) entry.profile = read.profile;
+  else if (read.optOut) entry.profile = false;
+  if (extra.length) entry.extraTags = extra;
+  if (deny.length) entry.denyTags = deny;
+  entry.tags = mergeTags(entry.tags, profileTags(read.profile), extra, deny);
+  return read.profile ? deriveCapacity(read.profile, { remote }) : {};
+}
+
 function checkUrl(value, where, errors) {
   if (typeof value !== "string") {
     errors.push(`${where} must be a string.`);
@@ -241,7 +263,7 @@ export function validateConfig(raw) {
   if (!isObj(d)) errors.push("config.defaults must be an object.");
   config.defaults = { ...DEFAULTS };
   if (isObj(d)) {
-    warnUnknown(d, new Set([...Object.keys(DEFAULTS), ...BRINGUP_DEFAULT_KEYS]), "config.defaults", warnings);
+    warnUnknown(d, new Set([...Object.keys(DEFAULTS), ...BRINGUP_DEFAULT_KEYS, ...PROFILE_DEFAULT_KEYS]), "config.defaults", warnings);
     for (const key of Object.keys(DEFAULTS)) {
       config.defaults[key] = checkNumber(d[key], `config.defaults.${key}`, errors, {
         fallback: DEFAULTS[key],
@@ -257,6 +279,12 @@ export function validateConfig(raw) {
         fallback: BRINGUP_LIMITS.defaultRetryMinutes, positive: true,
       });
     }
+    // Like the bring-up keys, written to the validated config only when the user sets it (init output unchanged).
+    if (d.profileTtlDays !== undefined) {
+      config.defaults.profileTtlDays = checkNumber(d.profileTtlDays, "config.defaults.profileTtlDays", errors, {
+        fallback: PROFILE_DEFAULTS.profileTtlDays, positive: true,
+      });
+    }
   }
 
   // local
@@ -268,15 +296,18 @@ export function validateConfig(raw) {
     const declared = checkTags(l.tags, "config.local.tags", errors);
     const tags = [...declared];
     for (const t of localPlatformTags()) if (!tags.includes(t)) tags.push(t);
+    const localEntry = { tags };
+    const derived = applyProfileFields(localEntry, l, "config.local", errors, warnings, { remote: false });
     config.local = {
-      tags,
-      priority: checkNumber(l.priority, "config.local.priority", errors, { fallback: LOCAL_DEFAULTS.priority }),
+      tags: localEntry.tags,
+      priority: checkNumber(l.priority, "config.local.priority", errors, { fallback: derived.priority ?? LOCAL_DEFAULTS.priority }),
       weight: checkNumber(l.weight, "config.local.weight", errors, { fallback: LOCAL_DEFAULTS.weight, positive: true }),
       maxConcurrent: checkNumber(l.maxConcurrent, "config.local.maxConcurrent", errors, {
-        fallback: LOCAL_DEFAULTS.maxConcurrent, positive: true, integer: true,
+        fallback: derived.maxConcurrent ?? LOCAL_DEFAULTS.maxConcurrent, positive: true, integer: true,
       }),
       exclusive: checkTags(l.exclusive, "config.local.exclusive", errors),
     };
+    for (const k of ["profile", "extraTags", "denyTags"]) if (localEntry[k] !== undefined) config.local[k] = localEntry[k];
     if (l.deviceHostId !== undefined) {
       if (typeof l.deviceHostId !== "string" || !ID_PATTERN.test(l.deviceHostId)) errors.push("config.local.deviceHostId is invalid.");
       else config.local.deviceHostId = l.deviceHostId;
@@ -332,10 +363,11 @@ export function validateConfig(raw) {
       else entry.deviceHostId = m.deviceHostId;
     }
     entry.tags = checkTags(m.tags, `${where}.tags`, errors);
-    entry.priority = checkNumber(m.priority, `${where}.priority`, errors, { fallback: MACHINE_DEFAULTS.priority });
+    const derived = applyProfileFields(entry, m, where, errors, warnings, { remote: true });
+    entry.priority = checkNumber(m.priority, `${where}.priority`, errors, { fallback: derived.priority ?? MACHINE_DEFAULTS.priority });
     entry.weight = checkNumber(m.weight, `${where}.weight`, errors, { fallback: MACHINE_DEFAULTS.weight, positive: true });
     entry.maxConcurrent = checkNumber(m.maxConcurrent, `${where}.maxConcurrent`, errors, {
-      fallback: MACHINE_DEFAULTS.maxConcurrent, positive: true, integer: true,
+      fallback: derived.maxConcurrent ?? MACHINE_DEFAULTS.maxConcurrent, positive: true, integer: true,
     });
     entry.exclusive = checkTags(m.exclusive, `${where}.exclusive`, errors);
     for (const t of entry.exclusive) if (!entry.tags.includes(t)) warnings.push(`${where}.exclusive tag ${t} is not among its tags.`);
@@ -479,7 +511,8 @@ function ensureHome(home) {
   }
 }
 
-function atomicWrite(filePath, text) {
+/** Write text to filePath (mode 600) through a temporary file and one rename. */
+export function atomicWrite(filePath, text) {
   const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
   try {
     fs.writeFileSync(tmp, text, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -495,7 +528,7 @@ function atomicWrite(filePath, text) {
   }
 }
 
-const serialize = (obj) => JSON.stringify(obj, null, 2) + "\n";
+export const serialize = (obj) => JSON.stringify(obj, null, 2) + "\n";
 
 /**
  * Create config.json (the proposed config, or a local-only default) and an empty state.json.
@@ -613,6 +646,7 @@ export function normalizeState(raw) {
   if (isObj(raw.bringUp)) state.bringUp = raw.bringUp;
   if (isObj(raw.credits)) state.credits = raw.credits;
   if (isObj(raw.affinity)) state.affinity = raw.affinity;
+  if (isObj(raw.discovered)) state.discovered = raw.discovered;
   return state;
 }
 
@@ -709,6 +743,7 @@ export function pruneState(config, state, now) {
       }
     }
   }
+  if (pruneDiscovered(state, now)) changed = true;
   if (state.credits) {
     for (const label of Object.keys(state.credits)) {
       if (!known(label)) {

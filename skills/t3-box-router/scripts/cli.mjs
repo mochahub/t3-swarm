@@ -6,6 +6,7 @@
  */
 
 import { linkVerdict, freshLink, activeBringUp } from "./engine.mjs";
+import { ATTESTATION_PATTERN } from "./profile.mjs";
 
 export const RESERVED_LABELS = new Set(["local", "box"]);
 export const OBSERVATION_TOOLS = new Set(["t3_environment_links", "orchestrator_capabilities", "t3_project_list"]);
@@ -16,6 +17,7 @@ const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}$/;
 const RUN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SLOT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const PROVIDER_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const ENVIRONMENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,199}$/;
 const BRANCH_CHARS_RE = /^[A-Za-z0-9._/-]+$/;
 const DURATION_RE = /^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i;
 const MAX_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -36,6 +38,8 @@ const FLAGS = {
   "min-cooldown": ["minCooldown", "duration"],
   clear: ["clear", "bool"],
   "max-parallel": ["maxParallel", "count"],
+  "environment-id": ["environmentId", "environmentId"],
+  attest: ["attest", "attest"],
 };
 const PHASE2_FLAGS = new Set(["affinity", "kind", "read-only", "config"]);
 const OUTCOMES = new Set(["ok", "failed", "unreachable"]);
@@ -87,6 +91,18 @@ export const COMMANDS = {
     positionals: [0, 0],
     usage: "register-payload --run <runId> [--clear]",
     summary: "Emit the raw swarm registration array on success. Errors on a lapsed lease unless --clear.",
+  },
+  probe: {
+    flags: ["attest"],
+    positionals: [0, 0],
+    usage: "probe [--attest cred:<name>=true|false] [--attest secret:<name>=true|false]",
+    summary: "Read-only hardware and toolchain report for this machine (scripts/probe.mjs). Pipe it to apply-probe local.",
+  },
+  "apply-probe": {
+    flags: ["environment-id"],
+    positionals: [1, 1],
+    usage: "apply-probe <label|local> [--environment-id <id>] < probe.json",
+    summary: "Validate a probe report and store it as the machine's profile in config.json, under the lock. A new label with --environment-id adds the newly linked box.",
   },
   "policy-line": {
     flags: ["run", "max-parallel"],
@@ -183,6 +199,15 @@ function checkValue(kind, raw, flag) {
       return v;
     case "duration":
       return checkDuration(v, `--${flag}`);
+    case "environmentId":
+      if (!ENVIRONMENT_ID_RE.test(v)) fail(`--${flag} must be a T3 environment ID.`);
+      return v;
+    case "attest": {
+      // Never echo the value: an owner may paste something sensitive by mistake.
+      const m = /^([^=]*)=(true|false)$/.exec(v);
+      if (!m || !ATTESTATION_PATTERN.test(m[1])) fail(`--${flag} expects cred:<name>=true|false or secret:<name>=true|false (lowercase name).`);
+      return [m[1], m[2] === "true"];
+    }
     default:
       fail(`Unknown flag kind ${kind}.`);
   }
@@ -230,6 +255,9 @@ export function parseArgv(argv) {
     }
     if (kind === "tags") {
       options[key] = [...new Set([...(options[key] || []), ...checkValue(kind, value, name)])];
+    } else if (kind === "attest") {
+      const [attName, attValue] = checkValue(kind, value, name);
+      options[key] = { ...(options[key] || {}), [attName]: attValue };
     } else {
       if (seen.has(name)) fail(`--${name} was given more than once.`);
       options[key] = checkValue(kind, value, name);
@@ -252,6 +280,13 @@ export function parseArgv(argv) {
     options.label = options.args[0];
   }
   if (command === "cooldown") options.durationMs = checkDuration(options.args[1], "Cooldown duration");
+  if (command === "apply-probe") {
+    const target = options.args[0];
+    if (!LABEL_RE.test(target)) fail(`apply-probe needs local or a machine label of letters, digits, . _ - (${spec.usage}).`);
+    if (target === "box") fail("box is reserved for router selectors; use a machine label or local.");
+    if (target === "local" && options.environmentId !== undefined) fail("apply-probe local takes no --environment-id.");
+    options.target = target;
+  }
   if (command === "help" && options.args[0] !== undefined && !COMMANDS[options.args[0]]) fail(`Unknown command ${JSON.stringify(options.args[0])}.`);
   return { command, options };
 }
