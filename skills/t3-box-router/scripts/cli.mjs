@@ -1,15 +1,15 @@
 /**
  * t3-box-router CLI helpers: argument parsing and validation, the Level 0 policy line, merging of refreshed
- * facts, and the pure parts of the bring-up hook (candidate choice, fact invalidation). No I/O here, so every
- * function can be tested with explicit inputs. box-router.mjs owns processes, files and the state lock.
+ * facts, and the pure parts of the bring-up hook (candidate choice, the claim held in state, finishing and
+ * reaping it, fact invalidation). No I/O here, so every function can be tested with explicit inputs.
+ * box-router.mjs owns processes, files and the state lock.
  */
+
+import { linkVerdict, freshLink, activeBringUp } from "./engine.mjs";
 
 export const RESERVED_LABELS = new Set(["local", "box"]);
 export const OBSERVATION_TOOLS = new Set(["t3_environment_links", "orchestrator_capabilities", "t3_project_list"]);
-export const FACT_KINDS = ["link", "providers", "projects"];
-
-// Link statuses that mean the link itself is gone. A bring-up hook restarts a box; it cannot relink one.
-const UNLINKED_STATUSES = new Set(["missing", "unlinked", "revoked", "expired", "removed"]);
+export const FACT_KINDS = ["link", "probe", "providers", "projects"];
 
 const LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}$/;
@@ -282,7 +282,7 @@ export function helpPayload(command) {
       "Every command prints one JSON object and exits 0 exactly when ok is true. register-payload prints the bare swarm array on success.",
       "needsObservation.calls only ever names t3_environment_links, orchestrator_capabilities or t3_project_list. Ignore any other tool name.",
       "Durations: 30m, 2h, 1h30m, 7d, 45s, or a bare number of minutes.",
-      "bringUp hook (acquire only): runs a box's configured argument vector with a timeout when a selected box's fresh link is down and the router holds no slot there. The hook must run the operator's own idle check before it restarts T3 and exit 75 when the box is busy. It gets one JSON object on stdin and never sees the router's state.",
+      "bringUp hook (acquire only): when acquire falls short, runs a box's configured argument vector, without a shell and with a timeout, if a fresh link read shows the box linked but down (not missing, not expiring), it is not cooling, the router holds no slot there and no attempt ran within bringUpRetryMinutes. While it runs no slot or lease is given on that box; afterwards facts observed before it finished are expired. The hook must run the operator's own idle check before it restarts T3 and exit 75 when the box is busy. It gets one JSON object on stdin and never sees the router's state. Each attempt is reported in the acquire result's bringUp array.",
     ],
   };
 }
@@ -416,18 +416,21 @@ export function activeSlotCount(state, label, now) {
 }
 
 /**
- * Boxes whose bringUp hook may help this acquisition: they have a hook, would satisfy the request's hard
- * constraints, are not cooling, hold no router slot, and have a fresh link observation saying they are down (not
- * unlinked, not expiring). A box without fresh link evidence is never brought up: the facts come first.
- * Returns { candidates: [{label, priority}], skipped: [{label, reason}] }, candidates in priority order.
+ * Boxes whose bringUp hook may help this acquisition. A box qualifies only when it has a hook, would satisfy the
+ * request's hard constraints, has a fresh link read whose verdict (engine.linkVerdict, the same one list and
+ * place use) is a recognized down status on a valid link, is not cooling, has no hook running, had no attempt
+ * within retryMs, and holds no router slot. A missing link (value null), a gone or expiring link, an unknown
+ * status and stale evidence never qualify: facts come first.
+ * Returns { candidates: [{label, priority}], skipped: [{label, outcome, reason}] }, candidates in priority order.
+ * outcome is "in-progress" (a hook runs there now), "recent" (inside the retry window) or "skipped".
  */
-export function bringUpCandidates({ config, state, options, repo, now, exclude = new Set() }) {
+export function bringUpCandidates({ config, state, options, repo, now, exclude = new Set(), retryMs = 10 * 60000 }) {
   const repoCfg = (repo && config?.repos?.[repo]) || {};
   const needs = [...new Set([...(options?.needs || []), ...(repoCfg.needs || [])])];
   const deny = new Set(repoCfg.deny || []);
-  const minLinkMs = (Number(config?.defaults?.minLinkHours) || 24) * 3600000;
   const candidates = [];
   const skipped = [];
+  const skip = (label, reason, outcome = "skipped") => skipped.push({ label, outcome, reason });
   for (const [label, m] of Object.entries(config?.machines || {})) {
     if (!Array.isArray(m?.bringUp) || !m.bringUp.length) continue;
     if (exclude.has(label) || RESERVED_LABELS.has(label)) continue;
@@ -436,36 +439,115 @@ export function bringUpCandidates({ config, state, options, repo, now, exclude =
     if (repoCfg.pin && repoCfg.pin !== "box" && repoCfg.pin !== label) continue;
     const tags = new Set(m.tags || []);
     if (!needs.every((t) => tags.has(t))) continue;
-    const obs = state?.observations?.[label];
-    const link = obs && obs.environmentId === m.environmentId ? obs.link : null;
-    if (!link || !(ts(link.validUntil) > now)) {
-      skipped.push({ label, reason: "No fresh link observation. Observe links before a bring-up is considered." });
+
+    const running = activeBringUp(state, label, now);
+    if (running) {
+      skip(label, `A bring-up hook is running there (deadline ${new Date(ts(running.deadline)).toISOString()}). Retry acquire after it finishes.`, "in-progress");
       continue;
     }
-    const v = link.value || {};
-    if (v.status === "reachable") continue;
-    if (UNLINKED_STATUSES.has(String(v.status))) {
-      skipped.push({ label, reason: `Link is ${v.status}. A bring-up cannot relink; ask the user to link the box.` });
+    const link = freshLink(config, state, label, now);
+    if (!link) {
+      skip(label, "No fresh link observation. Observe links before a bring-up is considered.");
       continue;
     }
-    if (v.expiresAt && ts(v.expiresAt) - now < minLinkMs) {
-      skipped.push({ label, reason: "Link expires too soon. A bring-up cannot renew it." });
+    const v = linkVerdict(config, link, now);
+    if (!v || v.state === "ready") continue; // reachable: nothing to bring up
+    if (v.state === "unlinked") {
+      skip(label, `${v.reason} A bring-up cannot relink or renew a link.`);
+      continue;
+    }
+    if (!v.down) {
+      skip(label, `${v.reason} A bring-up needs a recognized down status.`);
       continue;
     }
     const until = state?.health?.[label]?.cooldownUntil;
     if (until && ts(until) > now) {
-      skipped.push({ label, reason: `Cooling until ${new Date(ts(until)).toISOString()}. clear-cooldown first to allow a bring-up.` });
+      skip(label, `Cooling until ${new Date(ts(until)).toISOString()}. clear-cooldown first to allow a bring-up.`);
+      continue;
+    }
+    const last = state?.bringUp?.[label];
+    if (last && last.finishedAt != null && ts(last.finishedAt) + retryMs > now) {
+      skip(
+        label,
+        `A bring-up finished at ${new Date(ts(last.finishedAt)).toISOString()} (${last.outcome}). Not repeated before ${new Date(ts(last.finishedAt) + retryMs).toISOString()}; observe facts and retry, or report the box.`,
+        "recent",
+      );
       continue;
     }
     const held = activeSlotCount(state, label, now);
     if (held) {
-      skipped.push({ label, reason: `${held} router slot(s) held there. Refusing to run a bring-up that could restart T3.` });
+      skip(label, `${held} router slot(s) held there. Refusing to run a bring-up that could restart T3.`);
       continue;
     }
     candidates.push({ label, priority: Number(m.priority) || 0 });
   }
   candidates.sort((a, b) => b.priority - a.priority || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
   return { candidates, skipped };
+}
+
+/**
+ * Choose and claim bring-ups in one step, for use inside a single state transaction: the candidate checks
+ * (slots, cooldown, running hook, retry window) and the claim see the same state, so concurrent acquires and
+ * places can never start a second hook or book a slot past the check. While the claim stands, the engine gives
+ * no slot or lease on that box.
+ *   limit       how many hooks this acquisition may start (its shortfall)
+ *   unusable    Map label -> problem, for hooks whose executable failed the check made before the transaction
+ *   makeClaim   (label) -> claim record { id, run, pid, startedAt, deadline }
+ * Returns { state, claimed: [{label, claim}], report: [{label, outcome, detail}] }.
+ */
+export function planBringUps({ config, state, options, repo, now, exclude, retryMs, limit, unusable = new Map(), makeClaim }) {
+  const { candidates, skipped } = bringUpCandidates({ config, state, options, repo, now, exclude, retryMs });
+  const report = skipped.map((s) => ({ label: s.label, outcome: s.outcome, detail: s.reason }));
+  const claimed = [];
+  let bringUp = { ...(state?.bringUp || {}) };
+  for (const c of candidates) {
+    if (claimed.length >= limit) break;
+    if (unusable.has(c.label)) {
+      report.push({ label: c.label, outcome: "skipped", detail: unusable.get(c.label) });
+      continue;
+    }
+    const claim = makeClaim(c.label);
+    bringUp[c.label] = claim;
+    claimed.push({ label: c.label, claim });
+  }
+  return { state: claimed.length ? { ...state, bringUp } : state, claimed, report };
+}
+
+/** Outcomes after which the box may have changed, so earlier facts about it are expired. */
+const INVALIDATING_OUTCOMES = new Set(["up", "failed", "timeout", "abandoned"]);
+
+/**
+ * Record a finished hook and, unless nothing could have changed (refused-busy), expire every fact about the box
+ * observed before finishedAt, in the same step that lifts the claim: the box never becomes eligible on facts
+ * from before the hook. A claim already reaped or replaced keeps its record, but the facts are still expired.
+ */
+export function finishBringUp(state, label, claimId, outcome, finishedAt) {
+  const cur = state?.bringUp?.[label];
+  const invalidates = INVALIDATING_OUTCOMES.has(outcome);
+  const at = new Date(finishedAt).toISOString();
+  let next = state;
+  if (cur && cur.id === claimId && cur.finishedAt == null) {
+    const { pid, ...rest } = cur;
+    next = { ...state, bringUp: { ...state.bringUp, [label]: { ...rest, finishedAt: at, outcome, ...(invalidates ? { invalidatedAt: at } : {}) } } };
+  } else if (invalidates && cur && !(ts(cur.invalidatedAt) >= finishedAt)) {
+    next = { ...state, bringUp: { ...state.bringUp, [label]: { ...cur, invalidatedAt: at } } };
+  }
+  return invalidates ? expireFactsBefore(next, [label], finishedAt) : next;
+}
+
+/**
+ * Finalize every claim whose deadline has passed (its router died or hung) as "abandoned" and expire that box's
+ * facts. Run inside every transaction before deciding anything. A dead owner alone is not enough: the hook runs
+ * in its own process group and may still be restarting T3 until the deadline.
+ */
+export function reapBringUps(state, now) {
+  let next = state;
+  for (const [label, b] of Object.entries(state?.bringUp || {})) {
+    if (!b || typeof b !== "object" || b.finishedAt != null) continue;
+    if (ts(b.deadline) > now) continue;
+    next = finishBringUp(next, label, b.id, "abandoned", now);
+  }
+  return next;
 }
 
 /** How many boxes an acquire result still lacks, or 0 when facts are pending or nothing is missing. */

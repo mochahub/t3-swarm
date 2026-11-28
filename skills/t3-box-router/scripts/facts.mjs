@@ -262,6 +262,7 @@ export function mergeFactPatch(config, state, patch, now) {
     for (const kind of ENVELOPE_KINDS) {
       const env = p[kind];
       if (!isObj(env) || !Number.isFinite(parseTime(env.observedAt))) continue;
+      if (parseTime(env.observedAt) < parseTime(state.bringUp?.[label]?.invalidatedAt)) continue;
       if (now !== undefined && !(parseTime(env.validUntil) > now)) continue;
       entry = entryFor(next, label, m.environmentId);
       const cur = entry[kind];

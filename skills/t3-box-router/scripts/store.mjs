@@ -48,6 +48,13 @@ export const DEFAULTS = Object.freeze({
   affinityTtlMinutes: 120,
 });
 
+/**
+ * Bring-up hook bounds. Kept out of DEFAULTS so `init` writes the same config as before; config.defaults gets
+ * these keys only when the user sets them.
+ */
+export const BRINGUP_LIMITS = Object.freeze({ minTimeoutMs: 1000, maxTimeoutMs: 600_000, defaultTimeoutMs: 120_000, defaultRetryMinutes: 10 });
+const BRINGUP_DEFAULT_KEYS = ["bringUpTimeoutMs", "bringUpRetryMinutes"];
+
 export const LOCAL_DEFAULTS = Object.freeze({ priority: 0, weight: 1, maxConcurrent: 4 });
 export const MACHINE_DEFAULTS = Object.freeze({ kind: "always-on", priority: 10, weight: 1, maxConcurrent: 2, worktreeRoot: "~/work", renew: "manual" });
 
@@ -121,13 +128,13 @@ export function emptyState() {
 // ---------------------------------------------------------------------------------------------------------------
 // Config validation
 
-const PHASE2_MACHINE_FIELDS = ["bringUp", "checks"];
+const PHASE2_MACHINE_FIELDS = ["checks"];
 const PHASE2_REPO_FIELDS = ["priority", "maxConcurrent", "allowWorktreeScripts"];
 const KNOWN_TOP = new Set(["version", "scriptPath", "allowProjectOverride", "defaults", "local", "machines", "repos"]);
 const KNOWN_LOCAL = new Set(["tags", "deviceHostId", "priority", "weight", "maxConcurrent", "exclusive"]);
 const KNOWN_MACHINE = new Set([
   "kind", "environmentId", "url", "ssh", "tags", "deviceHostId", "priority", "weight", "maxConcurrent", "exclusive",
-  "worktreeRoot", "renew", "bringUp", "checks",
+  "worktreeRoot", "renew", "bringUp", "bringUpTimeoutMs", "checks",
 ]);
 const KNOWN_REPO = new Set(["needs", "prefers", "deny", "pin", "priority", "maxConcurrent", "worktreeCommand", "allowWorktreeScripts"]);
 
@@ -158,6 +165,30 @@ function checkNumber(value, where, errors, { fallback, positive = false, integer
   if (positive && value <= 0) errors.push(`${where} must be positive.`);
   if (min !== undefined && value < min) errors.push(`${where} must be at least ${min}.`);
   return value;
+}
+
+function checkTimeoutMs(value, where, errors) {
+  const { minTimeoutMs, maxTimeoutMs, defaultTimeoutMs } = BRINGUP_LIMITS;
+  if (!Number.isInteger(value) || value < minTimeoutMs || value > maxTimeoutMs) {
+    errors.push(`${where} must be an integer number of milliseconds from ${minTimeoutMs} to ${maxTimeoutMs}.`);
+    return defaultTimeoutMs;
+  }
+  return value;
+}
+
+/**
+ * Shape check for a bringUp argument vector: a non-empty array of non-empty strings without NUL, whose first
+ * element is an absolute path. Whether that file exists and is executable is checked at run time and by doctor,
+ * not here, so a config stays loadable while the script is being written. Returns a message or null.
+ */
+export function bringUpArgvProblem(argv) {
+  if (!Array.isArray(argv) || argv.length === 0) return "bringUp must be a non-empty array of strings (an argument vector).";
+  if (argv.length > 64) return "bringUp may have at most 64 arguments.";
+  if (argv.some((a) => typeof a !== "string" || a.length === 0 || a.length > 4096 || a.includes("\0"))) {
+    return "bringUp must contain only non-empty strings without NUL.";
+  }
+  if (!path.isAbsolute(argv[0])) return "bringUp[0] must be an absolute path to the hook executable.";
+  return null;
 }
 
 function warnUnknown(obj, known, where, warnings) {
@@ -210,12 +241,20 @@ export function validateConfig(raw) {
   if (!isObj(d)) errors.push("config.defaults must be an object.");
   config.defaults = { ...DEFAULTS };
   if (isObj(d)) {
-    warnUnknown(d, new Set(Object.keys(DEFAULTS)), "config.defaults", warnings);
+    warnUnknown(d, new Set([...Object.keys(DEFAULTS), ...BRINGUP_DEFAULT_KEYS]), "config.defaults", warnings);
     for (const key of Object.keys(DEFAULTS)) {
       config.defaults[key] = checkNumber(d[key], `config.defaults.${key}`, errors, {
         fallback: DEFAULTS[key],
         positive: key !== "minLinkHours",
         min: key === "minLinkHours" ? 0 : undefined,
+      });
+    }
+    if (d.bringUpTimeoutMs !== undefined) {
+      config.defaults.bringUpTimeoutMs = checkTimeoutMs(d.bringUpTimeoutMs, "config.defaults.bringUpTimeoutMs", errors);
+    }
+    if (d.bringUpRetryMinutes !== undefined) {
+      config.defaults.bringUpRetryMinutes = checkNumber(d.bringUpRetryMinutes, "config.defaults.bringUpRetryMinutes", errors, {
+        fallback: BRINGUP_LIMITS.defaultRetryMinutes, positive: true,
       });
     }
   }
@@ -309,13 +348,20 @@ export function validateConfig(raw) {
     if (renew !== "manual" && renew !== "auto") errors.push(`${where}.renew must be "manual" or "auto".`);
     entry.renew = renew;
     if (renew === "auto") warnings.push(`${where}.renew auto is a Phase 2 feature and is inactive.`);
+    if (m.bringUp !== undefined) {
+      const problem = bringUpArgvProblem(m.bringUp);
+      if (problem) errors.push(`${where}.${problem}`);
+      // Kept exactly as written: the router passes this argument vector to the hook unchanged, with no shell.
+      else entry.bringUp = m.bringUp.slice();
+    }
+    if (m.bringUpTimeoutMs !== undefined) {
+      entry.bringUpTimeoutMs = checkTimeoutMs(m.bringUpTimeoutMs, `${where}.bringUpTimeoutMs`, errors);
+      if (m.bringUp === undefined) warnings.push(`${where}.bringUpTimeoutMs has no bringUp hook to bound.`);
+    }
     for (const f of PHASE2_MACHINE_FIELDS) {
       if (m[f] === undefined) continue;
       warnings.push(`${where}.${f} is a Phase 2 feature and is inactive.`);
       entry[f] = m[f];
-    }
-    if (entry.bringUp !== undefined && (!Array.isArray(entry.bringUp) || !entry.bringUp.every((s) => typeof s === "string"))) {
-      errors.push(`${where}.bringUp must be an array of strings.`);
     }
     if (entry.checks !== undefined && !Array.isArray(entry.checks)) errors.push(`${where}.checks must be an array.`);
     config.machines[label] = entry;
@@ -578,6 +624,7 @@ export function normalizeState(raw) {
   if (!isObj(raw) || raw.version !== STATE_VERSION) return null;
   const state = emptyState();
   for (const k of ["observations", "health", "leases", "slots"]) state[k] = isObj(raw[k]) ? raw[k] : {};
+  if (isObj(raw.bringUp)) state.bringUp = raw.bringUp;
   if (isObj(raw.credits)) state.credits = raw.credits;
   if (isObj(raw.affinity)) state.affinity = raw.affinity;
   return state;
@@ -593,6 +640,8 @@ const ENVELOPE_KINDS = ["link", "probe", "providers", "projects"];
  *     `failures > 0` after the cooldown is what makes a machine `recovering`.
  *   - slots: expired, or on a label that is no longer configured.
  *   - leases: expired; held labels filtered to configured machines.
+ *   - bringUp: entries for unconfigured labels, and finished attempts older than the retry window. An unfinished
+ *     claim is never dropped here: the router finalizes it (and expires that box's facts) once its deadline passes.
  *   - affinity (Phase 2): expired or unknown label. credits (Phase 2): unknown label.
  */
 export function pruneState(config, state, now) {
@@ -641,6 +690,17 @@ export function pruneState(config, state, now) {
     if (!Array.isArray(lease.machines) || held.length !== lease.machines.length) {
       lease.machines = held;
       changed = true;
+    }
+  }
+  if (isObj(state.bringUp)) {
+    const retryMs = (Number(config?.defaults?.bringUpRetryMinutes) > 0 ? Number(config.defaults.bringUpRetryMinutes) : BRINGUP_LIMITS.defaultRetryMinutes) * 60_000;
+    for (const label of Object.keys(state.bringUp)) {
+      const b = state.bringUp[label];
+      const finished = isObj(b) && b.finishedAt != null;
+      if (!hasOwn(machines, label) || !isObj(b) || (finished && !(parseTime(b.finishedAt) + retryMs > now))) {
+        delete state.bringUp[label];
+        changed = true;
+      }
     }
   }
   if (state.affinity) {

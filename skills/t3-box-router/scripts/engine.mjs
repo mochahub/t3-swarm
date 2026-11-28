@@ -9,11 +9,14 @@ export const RESERVED_LABELS = new Set(['local', 'box']);
 export const OBSERVATION_TOOLS = Object.freeze(['t3_environment_links', 'orchestrator_capabilities', 't3_project_list']);
 export const OBSERVE_COMMAND = 'box-router observe';
 /**
- * Link status `observe` must record when a configured environmentId is absent from a complete
- * t3_environment_links reply. The engine treats it (and `unlinked`) as the `unlinked` state; writing no envelope
- * instead would make place/acquire ask for the link read again on every call.
+ * A link envelope whose `value` is null records a complete, fresh link read with no link for the configured
+ * environmentId (facts.mjs writes it that way, from both `observe` and the t3 CLI). The engine derives `unlinked`
+ * from it. A status of `missing`, or any of UNLINKED_STATUSES, means the same; writing no envelope instead would
+ * make place/acquire ask for the link read again on every call.
  */
 export const LINK_MISSING_STATUS = 'missing';
+/** Link statuses that mean the link itself is gone: only the user can relink, and a bring-up hook cannot help. */
+export const UNLINKED_STATUSES = Object.freeze(['missing', 'unlinked', 'revoked', 'expired', 'removed']);
 
 export const DEFAULTS = Object.freeze({
   minLinkHours: 24,
@@ -29,7 +32,7 @@ const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const SAFE_REF = /^[A-Za-z0-9._/-]+$/;
 const OUTCOMES = new Set(['ok', 'failed', 'unreachable']);
-const PHASE2_MACHINE_FIELDS = ['weight', 'ssh', 'renew', 'bringUp', 'checks'];
+const PHASE2_MACHINE_FIELDS = ['weight', 'ssh', 'renew', 'checks'];
 const PHASE2_REPO_FIELDS = ['priority', 'maxConcurrent', 'allowWorktreeScripts'];
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -171,23 +174,50 @@ function coolingUntil(state, label, now) {
   return until != null && until > now ? until : null;
 }
 
-/** Link facts reduced to a verdict: `ok`, or a rejection with the derived machine state. */
-function linkVerdict(config, link, now) {
+/**
+ * Link facts reduced to a verdict: null when the link is usable, else `{ state, reason, down? }`. `state` is
+ * `unlinked` (missing, gone, expired or expiring: only the user can fix it) or `cooling` (linked but not
+ * reachable). `down: true` marks a recognized, non-reachable status on a valid link: the only verdict for which a
+ * bring-up hook may run. Exported so the CLI, the hook and list all read a link the same way.
+ */
+export function linkVerdict(config, link, now) {
   const d = defaultsOf(config);
-  const v = link.value ?? {};
+  if (link?.value === null) {
+    return { state: 'unlinked', reason: 'Link is missing or expired: a complete link read has no link for this environment. Ask the user to link this box.' };
+  }
+  const v = link?.value ?? {};
   const expiresAt = toMs(v.expiresAt);
-  if (v.status === LINK_MISSING_STATUS || v.status === 'unlinked' || (expiresAt != null && expiresAt <= now)) {
-    return { state: 'unlinked', reason: 'Link is missing or expired. Ask the user to link this box.' };
+  if (UNLINKED_STATUSES.includes(v.status) || (expiresAt != null && expiresAt <= now)) {
+    const why = UNLINKED_STATUSES.includes(v.status) ? `status ${v.status}` : `expired at ${iso(expiresAt)}`;
+    return { state: 'unlinked', reason: `Link is missing or expired (${why}). Ask the user to link this box.` };
   }
   if (v.status !== 'reachable') {
     const err = v.lastError ? ` (${String(v.lastError).slice(0, 120)})` : '';
-    return { state: 'cooling', reason: `Link status is ${v.status ?? 'unknown'}${err}, not reachable.` };
+    const known = typeof v.status === 'string' && v.status !== 'unrecognized';
+    if (known && expiresAt != null && expiresAt - now < d.minLinkHours * HOUR) {
+      return { state: 'unlinked', reason: `Link status is ${v.status}${err} and it expires within ${d.minLinkHours} hours (at ${iso(expiresAt)}). Renew it.` };
+    }
+    return { state: 'cooling', reason: `Link status is ${v.status ?? 'unknown'}${err}, not reachable.`, ...(known ? { down: true } : {}) };
   }
   if (expiresAt != null && expiresAt - now < d.minLinkHours * HOUR) {
     return { state: 'unlinked', reason: `Link expires within ${d.minLinkHours} hours (at ${iso(expiresAt)}). Renew it.` };
   }
   if (v.access === 'read-only') return { state: 'ready', reason: 'Link access is read-only.' };
   return null;
+}
+
+/** The fresh link envelope for a configured machine label, or null. For callers outside the engine. */
+export function freshLink(config, state, label, now) {
+  const m = config?.machines?.[label];
+  if (!m || !state?.observations) return null;
+  return freshFact(config, { observations: state.observations }, { label, environmentId: m.environmentId }, 'link', now);
+}
+
+/** A bring-up hook claim that is still running at `now`: unfinished and before its deadline. */
+export function activeBringUp(state, label, now) {
+  const b = state?.bringUp?.[label];
+  if (!b || typeof b !== 'object' || b.finishedAt != null) return null;
+  return toMs(b.deadline) > now ? b : null;
 }
 
 /**
@@ -200,6 +230,8 @@ function deriveHealth(config, state, machine, repo, now) {
   const link = freshFact(config, state, machine, 'link', now);
   const lv = link ? linkVerdict(config, link, now) : null;
   if (lv?.state === 'unlinked') return { state: 'unlinked', notes: [lv.reason] };
+  const bu = activeBringUp(state, machine.label, now);
+  if (bu) return { state: 'cooling', notes: [bringUpReason(bu)] };
   const cd = coolingUntil(state, machine.label, now);
   if (cd != null) return { state: 'cooling', notes: [`Cooling down until ${iso(cd)}.`] };
   if (lv?.state === 'cooling') return { state: 'cooling', notes: [lv.reason] };
@@ -213,6 +245,10 @@ function deriveHealth(config, state, machine, repo, now) {
     return { state: 'degraded', notes };
   }
   return { state: 'ready', notes };
+}
+
+function bringUpReason(b) {
+  return `Bring-up hook running since ${iso(toMs(b.startedAt))} (deadline ${iso(toMs(b.deadline))}). No new work until it finishes.`;
 }
 
 function missingFacts(config, state, machine, repo, now) {
@@ -291,6 +327,8 @@ function evaluate(ctx, machine) {
   if (machine.remote) {
     const cd = coolingUntil(state, machine.label, now);
     if (cd != null) return reject(`Cooling down until ${iso(cd)}.`);
+    const bu = activeBringUp(state, machine.label, now);
+    if (bu) return reject(bringUpReason(bu));
 
     const link = freshFact(config, state, machine, 'link', now);
     if (link) {
@@ -794,6 +832,8 @@ function decideList(config, state, repo, now) {
     if (health.notes.length) entry.notes = health.notes;
     const cd = coolingUntil(state, m.label, now);
     if (cd != null) entry.cooldownUntil = iso(cd);
+    const bu = m.remote ? bringUpSummary(config, state, m.label, now) : null;
+    if (bu) entry.bringUp = bu;
     return entry;
   });
   const leases = Object.entries(state.leases)
@@ -804,6 +844,26 @@ function decideList(config, state, repo, now) {
     .map((s) => ({ id: s.id, label: s.label, run: s.run ?? null, repo: s.repo ?? null, exclusive: arr(s.exclusive), placedAt: s.placedAt, expiresAt: s.expiresAt }))
     .sort((a, b) => (a.id < b.id ? -1 : 1));
   return { state, result: { ok: true, machines, leases, slots: slotList } };
+}
+
+/** Default retry window for bring-up hooks, in minutes. The CLI reads `defaults.bringUpRetryMinutes` over it. */
+export const BRINGUP_RETRY_MINUTES = 10;
+
+/** What list shows about a machine's bring-up hook: the running claim, or the last attempt and when it may rerun. */
+function bringUpSummary(config, state, label, now) {
+  const b = state.bringUp?.[label];
+  if (!b || typeof b !== 'object') return null;
+  if (activeBringUp(state, label, now)) return { running: true, run: b.run ?? null, startedAt: b.startedAt, deadline: b.deadline };
+  if (b.finishedAt == null) return null;
+  const minutes = Number(config?.defaults?.bringUpRetryMinutes) > 0 ? Number(config.defaults.bringUpRetryMinutes) : BRINGUP_RETRY_MINUTES;
+  const retryAt = toMs(b.finishedAt) + minutes * MINUTE;
+  return {
+    running: false,
+    outcome: b.outcome ?? null,
+    startedAt: b.startedAt ?? null,
+    finishedAt: b.finishedAt,
+    ...(retryAt > now ? { retryAfter: iso(retryAt) } : {}),
+  };
 }
 
 /** Validate a merged config. Returns `{ errors, warnings }` with human-readable strings. */

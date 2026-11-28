@@ -75,23 +75,47 @@ agent reads. If a T3 read fails, say so to the caller as missing evidence. Don't
 ## Bring-up hook
 
 For an always-on box that sometimes needs starting (for example a script that wakes it and starts its T3
-service), set `machines.<label>.bringUp`:
+service), set `machines.<label>.bringUp` to an argument vector:
 
 ```json
 "bringUp": ["/Users/you/bin/start-home-box", "home-box"],
 "bringUpTimeoutMs": 300000
 ```
 
-During `acquire`, the router can run this argument vector when a fresh observation shows the selected box is
-unreachable and its link is still valid. Resolve missing or expired links through T3. The executable path must
-be absolute. The default timeout is two minutes. Set `bringUpTimeoutMs` on the machine to change it, up to ten minutes.
+The first element must be an absolute path to an executable. The router runs exactly these arguments, without a
+shell, in the hook's own process group, and discards its output. The default timeout is two minutes; set
+`bringUpTimeoutMs` (1000 to 600000) on the machine, or `defaults.bringUpTimeoutMs`, to change it. At the timeout
+the hook's process group gets SIGTERM, then SIGKILL five seconds later. A process the hook detaches with `setsid`
+escapes that stop.
 
-The hook must check for active work before restarting a service. Exit 75 if the machine is busy. The router
-also checks its own slots, which account only for tasks placed through this installation.
+Give the `acquire` command a timeout of at least `bringUpTimeoutMs` plus 30 seconds. If the caller stops the
+router early with SIGTERM, SIGINT or SIGHUP, the router kills the hook's process group before it exits. If the
+router is killed with SIGKILL, the hook keeps running, and the box stays blocked until the claim's deadline
+(about 17 seconds past the hook timeout). After that, the next command expires the box's facts.
 
-Inspect the `bringUp` array in the acquisition result for each attempt's outcome. After a start, the router
-refreshes the link when the T3 CLI is available. Supply fresh provider and project observations as requested
-and run `acquire` again.
+The hook runs only during `acquire`, only when the acquisition falls short, and only for a box whose fresh link
+read shows it linked but down. It never runs when:
+
+- the link is missing (no link for the box's environment ID), revoked, expired or expiring within
+  `minLinkHours`: relink or renew it through T3;
+- the link status is unknown, or there is no fresh link read: answer `needsObservation` first;
+- the box is cooling (`clear-cooldown` first) or the router holds a slot there;
+- another `acquire` is already running its hook (`in-progress`);
+- an attempt finished within `defaults.bringUpRetryMinutes` (default 10; reported as `recent`).
+
+While the hook runs, no slot or lease is given on that box, even if an agent observes it reachable. When it
+finishes, every fact about the box observed before then is expired, the router re-reads links and decides again.
+Expect the acquisition to ask for fresh provider and project observations; supply them and run `acquire` again.
+
+The hook gets one JSON object on stdin (`hook`, `label`, `environmentId`, `run`, `timeoutMs`,
+`routerActiveSlots`, `requireIdleCheck`, `note`) and the variables `T3_BOXES_HOOK=bringUp`,
+`T3_BOXES_IDLE_CHECK=required` and `T3_BOXES_LABEL`. It must check for active work before restarting a service
+and exit 75 if the machine is busy (`refused-busy`; nothing is expired). The router's own slot check covers only
+tasks placed through this installation.
+
+Each attempt is reported in the acquisition result's `bringUp` array (`outcome`: `up`, `failed`, `timeout`,
+`refused-busy`, `in-progress`, `recent` or `skipped`, plus `detail`). `list` shows a running hook or the last
+attempt and when it may run again; `doctor` checks that each hook is executable.
 
 ## Not set up here
 

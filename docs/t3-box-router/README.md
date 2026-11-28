@@ -92,9 +92,11 @@ The full sequence is in [swarm.md](../../skills/t3-box-router/references/swarm.m
 ## Bring-up hook
 
 Set `machines.<label>.bringUp` to the absolute path of your start script and its arguments as a JSON array.
-If `acquire` finds a linked box unreachable, it can run this script with a bounded timeout. The hook must
-check that the box is idle before restarting T3 and exit 75 if it is busy. Acquisition requires fresh observations
-before leasing the box. See the example and timeout setting in
+If `acquire` falls short and a fresh link read shows a linked box down, it runs this script once, without a
+shell and with a bounded timeout. It never runs for a missing or expiring link, a cooling box, a box where the
+router holds a slot, or again within `bringUpRetryMinutes`. While it runs, nothing is placed on that box; after it,
+the router asks for fresh observations before leasing it. The hook must check that the box is idle before
+restarting T3 and exit 75 if it is busy. See the rules, example and timeout setting in
 [setup.md](../../skills/t3-box-router/references/setup.md#bring-up-hook).
 
 ## Limits to know
