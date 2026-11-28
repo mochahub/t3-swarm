@@ -13,6 +13,11 @@ For the Coordinator or a standalone top-level agent, with the user. Workers and 
 - `defaults.slotTtlMinutes` (180) is when a slot stops counting toward capacity. A task that runs longer is no
   longer counted, so raise it if typical tasks run longer than that.
 
+If commands repeatedly time out on `state.lock`, inspect the PID at the start of the marker filename inside
+that directory. A live PID keeps the lock, including when the OS has reused the PID. Stop concurrent router
+invocations and confirm that no router process owns the lock before removing an abandoned lock. This also
+applies to a regular `state.lock` file left by a prerelease build.
+
 ## 1. Discover
 
 `box-router discover` proposes one row per linked environment. It runs `t3 environment list --json` itself when
@@ -94,7 +99,7 @@ router is killed with SIGKILL, the hook keeps running, and the box stays blocked
 (about 17 seconds past the hook timeout). After that, the next command expires the box's facts.
 
 The hook runs only during `acquire`, only when the acquisition falls short, and only for a box whose fresh link
-read shows it linked but down. It never runs when:
+read reports `unreachable` or `offline`. Other status strings appear in the skip reason. The router skips the hook when:
 
 - the link is missing (no link for the box's environment ID), revoked, expired or expiring within
   `minLinkHours`: relink or renew it through T3;
