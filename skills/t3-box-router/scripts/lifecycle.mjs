@@ -63,18 +63,6 @@ function activeKeepAlive(state, label, now, env = null) {
   return null;
 }
 
-/** A running bringUp or tearDown claim on the box, under its label or another label naming its environment. */
-function activeHookOn(state, label, now, env) {
-  const own = activeBringUp(state, label, now);
-  if (own) return own;
-  for (const l of Object.keys(state?.bringUp || {})) {
-    if (l === label) continue;
-    const b = activeBringUp(state, l, now);
-    if (b && isEnvId(b.environmentId) && b.environmentId === env) return b;
-  }
-  return null;
-}
-
 function liveSlots(state, label, now, env = null) {
   return Object.values(state?.slots || {}).filter(
     (s) => ts(s?.expiresAt) > now && (s.label === label || (env != null && touches(s, s.label, label, env))),
@@ -191,7 +179,7 @@ export function planRelease({ config, state, run, now, decideRelease, unusable =
       skip(`${slots} live slot(s) on the box. Release them with done first; the box was left running.`);
       continue;
     }
-    const running = activeHookOn(next, label, now, env);
+    const running = activeBringUp(next, label, now, env);
     if (running) {
       skip(`A ${running.hook ?? "bringUp"} hook is running there (deadline ${iso(ts(running.deadline))}). Left running.`);
       continue;
@@ -240,12 +228,16 @@ export function planKeepAlive({ config, state, run, now, unusable = new Map(), m
     const m = machineOf(config, label);
     if (!hasHook(m, "keepAlive")) continue;
     const skip = (detail, outcome = "skipped") => report.push({ label, outcome, detail });
-    const running = activeBringUp(next, label, now);
+    if (lease.environments?.[label] !== m.environmentId) {
+      skip("The leased environment cannot be confirmed for this label.");
+      continue;
+    }
+    const running = activeBringUp(next, label, now, m.environmentId);
     if (running) {
       skip(`A ${running.hook ?? "bringUp"} hook is running there.`);
       continue;
     }
-    if (activeKeepAlive(next, label, now)) {
+    if (activeKeepAlive(next, label, now, m.environmentId)) {
       skip("A keepAlive hook is already running there.", "in-progress");
       continue;
     }

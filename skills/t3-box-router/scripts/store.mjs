@@ -749,7 +749,8 @@ export function pruneState(config, state, now) {
       // A start the hook confirmed and no lease has adopted yet is kept for the lease TTL, so the acquire that
       // follows the fact refresh can still record it as this run's. Losing it is safe: no ownership, no teardown.
       const keepMs = finished && b.started === true && !b.adoptedAt ? Math.max(retryMs, (Number(config?.defaults?.leaseTtlHours) || DEFAULTS.leaseTtlHours) * 3_600_000) : retryMs;
-      if (!hasOwn(machines, label) || !isObj(b) || (finished && !(parseTime(b.finishedAt) + keepMs > now))) {
+      const liveClaim = b?.environmentId && !finished && parseTime(b.deadline) > now;
+      if ((!hasOwn(machines, label) && !liveClaim) || !isObj(b) || (finished && !(parseTime(b.finishedAt) + keepMs > now))) {
         delete state.bringUp[label];
         changed = true;
       }
@@ -759,7 +760,7 @@ export function pruneState(config, state, now) {
     // keepAlive: running keep-alive hooks, one per box, dropped at their deadline or when the box leaves config.
     const ka = isObj(state.lifecycle.keepAlive) ? state.lifecycle.keepAlive : {};
     for (const label of Object.keys(ka)) {
-      if (!hasOwn(machines, label) || !isObj(ka[label]) || expired(ka[label].deadline)) {
+      if ((!hasOwn(machines, label) && !ka[label]?.environmentId) || !isObj(ka[label]) || expired(ka[label].deadline)) {
         delete ka[label];
         changed = true;
       }

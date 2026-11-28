@@ -220,10 +220,12 @@ export function freshLink(config, state, label, now) {
 }
 
 /** A bring-up hook claim that is still running at `now`: unfinished and before its deadline. */
-export function activeBringUp(state, label, now) {
-  const b = state?.bringUp?.[label];
-  if (!b || typeof b !== 'object' || b.finishedAt != null) return null;
-  return toMs(b.deadline) > now ? b : null;
+export function activeBringUp(state, label, now, environmentId = null) {
+  const running = (claim) => claim && claim.finishedAt == null && toMs(claim.deadline) > now;
+  const own = state?.bringUp?.[label];
+  if (running(own)) return own;
+  if (!environmentId) return null;
+  return Object.values(state?.bringUp || {}).find((claim) => claim?.environmentId === environmentId && running(claim)) ?? null;
 }
 
 /**
@@ -237,7 +239,7 @@ function deriveHealth(config, state, machine, repo, now) {
   const lv = link ? linkVerdict(config, link, now) : null;
   if (lv?.state === 'unlinked') return { state: 'unlinked', notes: [lv.reason] };
   if (lv?.state === 'ready') notes.push(lv.reason);
-  const bu = activeBringUp(state, machine.label, now);
+  const bu = activeBringUp(state, machine.label, now, machine.environmentId);
   if (bu) return { state: 'cooling', notes: [bringUpReason(bu)] };
   const cd = coolingUntil(state, machine.label, now);
   if (cd != null) return { state: 'cooling', notes: [`Cooling down until ${iso(cd)}.`] };
@@ -336,7 +338,7 @@ function evaluate(ctx, machine) {
   if (machine.remote) {
     const cd = coolingUntil(state, machine.label, now);
     if (cd != null) return reject(`Cooling down until ${iso(cd)}.`);
-    const bu = activeBringUp(state, machine.label, now);
+    const bu = activeBringUp(state, machine.label, now, machine.environmentId);
     if (bu) return reject(bringUpReason(bu));
 
     const link = freshFact(config, state, machine, 'link', now);

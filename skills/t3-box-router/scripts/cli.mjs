@@ -476,8 +476,8 @@ export function expireFactsBefore(state, labels, cutoffMs) {
   return changed ? { ...state, observations } : state;
 }
 
-export function activeSlotCount(state, label, now) {
-  return Object.values(state?.slots || {}).filter((s) => s?.label === label && !(ts(s.expiresAt) <= now)).length;
+export function activeSlotCount(state, label, now, environmentId) {
+  return Object.values(state?.slots || {}).filter((s) => (s?.label === label || (environmentId && s?.environmentId === environmentId)) && !(ts(s.expiresAt) <= now)).length;
 }
 
 /**
@@ -506,7 +506,7 @@ export function bringUpCandidates({ config, state, options, repo, now, exclude =
     const tags = new Set(m.tags || []);
     if (!needs.every((t) => tags.has(t))) continue;
 
-    const running = activeBringUp(state, label, now);
+    const running = activeBringUp(state, label, now, m.environmentId);
     if (running) {
       skip(label, `A bring-up hook is running there (deadline ${new Date(ts(running.deadline)).toISOString()}). Retry acquire after it finishes.`, "in-progress");
       continue;
@@ -541,7 +541,7 @@ export function bringUpCandidates({ config, state, options, repo, now, exclude =
       );
       continue;
     }
-    const held = activeSlotCount(state, label, now);
+    const held = activeSlotCount(state, label, now, m.environmentId);
     if (held) {
       skip(label, `${held} router slot(s) held there. Refusing to run a bring-up that could restart T3.`);
       continue;

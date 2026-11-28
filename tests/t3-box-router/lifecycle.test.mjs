@@ -750,7 +750,7 @@ test("handoff and fetch run the user's hooks for a live slot, with metadata in p
 test("a label reassigned in config never lets release or a transfer hook act on another environment", async () => {
   const t = setup({
     machines: {
-      "od-a": { env: "env-a", kind: "on-demand", hooks: ["bringUp", "tearDown", "handoff"], tags: ["linux", "gpu"] },
+      "od-a": { env: "env-a", kind: "on-demand", hooks: ["bringUp", "tearDown", "handoff", "keepAlive"], tags: ["linux", "gpu"] },
       "od-b": { env: "env-b", kind: "on-demand", hooks: ["bringUp", "tearDown", "handoff"] },
     },
     links: { "env-a": "offline", "env-b": "reachable" },
@@ -787,6 +787,10 @@ test("a label reassigned in config never lets release or a transfer hook act on 
   assert.equal(h.code, 1, JSON.stringify(h.json));
   assert.match(h.json.error, /another environment/);
   assert.equal(t.runs("od-b", "handoff"), 0);
+
+  const ping = await t.run(["keep-alive", "--run", "r1"]);
+  assert.equal(entry(ping.json.keepAlive, "od-a").outcome, "skipped");
+  assert.equal(t.runs("od-a", "keepAlive"), 0);
 
   // r1 started env-a under od-a; od-a now names env-b. Release must stop nothing.
   const rel = await t.run(["release", "--run", "r1"]);
