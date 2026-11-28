@@ -125,3 +125,21 @@ test('standalone placement, outage, cooldown and idempotent recovery persist acr
   assert.equal(bad.status, 1);
   assert.equal(bad.json.ok, false);
 });
+
+for (const duration of ['90', '1h30m']) {
+  test(`manual cooldown accepts ${duration} as 90 minutes`, (t) => {
+    const { box } = fixture(t);
+    const start = Date.now();
+    const result = box('cooldown', 'home-box', duration);
+    assert.equal(result.status, 0);
+    const until = Date.parse(result.json.cooldownUntil);
+    assert.ok(until >= start + 90 * 60_000 && until <= Date.now() + 90 * 60_000);
+  });
+}
+
+test('doctor accepts the zero minimum link lifetime allowed by init', (t) => {
+  const { boxes, box, call } = fixture(t);
+  fs.unlinkSync(path.join(boxes, 'config.json'));
+  assert.equal(call(router, ['init'], JSON.stringify({ version: 1, defaults: { minLinkHours: 0 } })).status, 0);
+  assert.equal(box('doctor').status, 0);
+});

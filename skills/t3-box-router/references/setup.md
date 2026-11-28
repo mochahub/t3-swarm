@@ -70,7 +70,7 @@ The router keeps only link status, access, expiry and a short error; providers w
 and the canonical repo key to project ID map. Link facts are fresh for 15 minutes, provider and project facts for
 24 hours. With the T3 CLI installed (observed on v0.1.x), the router reads links itself through
 `t3 environment list --json`; the CLI has no project list, so provider and project facts always come from these
-agent reads. If a T3 read fails, say so to the caller as missing evidence. Don't invent a reply.
+agent reads. If one T3 read fails, submit the records that succeeded in a separate batch and report the missing evidence.
 
 ## Bring-up hook
 

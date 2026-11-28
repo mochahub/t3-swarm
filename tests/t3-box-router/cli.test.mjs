@@ -169,6 +169,7 @@ test("bringUpCandidates reads links like the engine: null and gone links, unknow
   assert.match(reason(null), /missing or expired.*cannot relink/);
   for (const status of ["missing", "unlinked", "revoked", "expired", "removed"]) assert.match(reason({ status }), /missing or expired/);
   assert.match(reason({ status: null }), /recognized down status/);
+  assert.match(reason({ status: "connecting" }), /recognized down status/);
   assert.match(reason({ status: "unrecognized" }), /recognized down status/);
   assert.match(reason({ status: "offline", expiresAt: iso(NOW + 3600000) }), /expires within 24 hours/);
   assert.match(reason({ status: "offline", expiresAt: iso(NOW - 1) }), /missing or expired/);

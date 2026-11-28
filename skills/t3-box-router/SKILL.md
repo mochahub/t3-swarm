@@ -62,7 +62,7 @@ Run `box-router doctor`. If there is no config, or it reports problems, follow
 
 When t3-swarm asks for the user's box skill, follow [references/swarm.md](references/swarm.md): acquire,
 observe, register-payload to a file, `swarm boxes register`, paste `policy-line` into Boundaries, release after
-`finish`.
+`finish`. For a custom swarm config, pass the run’s cap to `policy-line --max-parallel N`.
 
 ## Rules
 

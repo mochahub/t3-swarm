@@ -35,6 +35,9 @@ box-router policy-line --run "$run_id"               # { "ok": true, "text": "..
 `register-payload` refuses a lapsed lease (renew with `acquire` first). `--clear` prints `[]` on purpose, to
 clear swarm's registration. After a box is restored mid-run, `acquire` again and register the whole array again.
 
+When the run uses a custom swarm config, pass its `defaults.maxParallelWorkers` value to
+`policy-line --run "$run_id" --max-parallel N`. Otherwise the router reads the default swarm config.
+
 Paste the `text` of `policy-line` **verbatim** into the run ledger's Boundaries and into every workstream ledger
 before dispatching Leads. Don't write your own version. It deliberately overrides three things in the Lead brief:
 

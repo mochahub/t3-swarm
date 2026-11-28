@@ -425,6 +425,10 @@ test("raw MCP pages yield the same observations as their structured payloads", (
   }));
   const accept = input => applyObservations(config(), emptyState(), input, NOW);
   assert.deepEqual(accept(wrapped), accept(records));
+  const textOnly = records.map(record => ({
+    ...record, pages: record.pages.map(page => ({ content: [{ type: "text", text: JSON.stringify(page) }] })),
+  }));
+  assert.deepEqual(accept(textOnly), accept(records));
   wrapped[0].pages[0].isError = true;
   assert.throws(() => accept(wrapped), /T3 reported an error/);
 });

@@ -140,7 +140,12 @@ function readRecord(rec, index) {
   if (rec.pages.length > LIMITS.pages) fail(index, tool, `has more than ${LIMITS.pages} pages.`);
   const pages = rec.pages.map((reply, p) => {
     if (reply?.isError) fail(index, tool, `T3 reported an error on page ${p}.`);
-    return reply?.structuredContent ?? reply;
+    if (reply?.structuredContent != null) return reply.structuredContent;
+    if (Array.isArray(reply?.content) && reply.content.length === 1 && reply.content[0]?.type === "text") {
+      try { return JSON.parse(reply.content[0].text); }
+      catch { fail(index, tool, `page ${p} does not contain a JSON reply.`); }
+    }
+    return reply;
   });
   let environmentId;
   if (args.environmentId !== undefined) {

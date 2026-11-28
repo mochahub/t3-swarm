@@ -4,7 +4,7 @@
  * Files in the router home (default ~/.t3/boxes, or T3_BOXES_HOME):
  *   config.json   written by the user or `init`; the CLI only reads it.
  *   state.json    written only by `transaction`, atomically, under state.lock.
- *   state.lock    exclusive-create lock file holding the owner's token.
+ *   state.lock    lock directory containing a unique marker for the writer.
  * The directory is mode 0700 and the files 0600.
  *
  * Error convention, shared by every export below:
@@ -527,8 +527,9 @@ export async function init(home, proposedConfig) {
     fs.chmodSync(p.config, 0o600);
     let stateCreated = false;
     if (!fs.existsSync(p.state)) {
-      atomicWrite(p.state, serialize(emptyState()));
-      stateCreated = true;
+      const initialized = await transaction(home, v.config, () => ({ result: { ok: true, created: !fs.existsSync(p.state) } }));
+      if (!initialized.ok) return initialized;
+      stateCreated = initialized.created;
     }
     return { ok: true, created: true, home, configPath: p.config, statePath: p.state, stateCreated, warnings: v.warnings };
   } catch (err) {
@@ -551,68 +552,53 @@ function pidAlive(pid) {
   }
 }
 
-function readLockText(lockPath) {
-  try {
-    return fs.readFileSync(lockPath, "utf8");
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Exclusive-create lock. A lock older than staleMs, or whose owning pid is gone on this host, is broken by renaming
- * it aside; if the renamed file is not the one judged stale, it is linked back. Returns the owner token.
- */
+// Publish a populated directory in one rename. Another owner cannot rename over a
+// nonempty directory. Each marker has a unique name, so a stale-lock observer can
+// only unlink the owner it actually inspected, even if another process got there first.
 export async function acquireLock(lockPath, { timeoutMs = DEFAULT_LOCK_TIMEOUT_MS, staleMs = STALE_LOCK_MS } = {}) {
   const token = `${process.pid}.${crypto.randomBytes(8).toString("hex")}`;
+  const staged = `${lockPath}.${token}.tmp`;
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    try {
-      fs.writeFileSync(lockPath, `${token}\n${new Date().toISOString()}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-      return token;
-    } catch (err) {
-      if (err?.code !== "EEXIST") throw err;
-    }
-    let stat;
-    try {
-      stat = fs.statSync(lockPath);
-    } catch {
-      continue; // released in between
-    }
-    const seen = readLockText(lockPath);
-    const pid = seen ? Number.parseInt(seen.split(".")[0], 10) : NaN;
-    const stale = Date.now() - stat.mtimeMs > staleMs || (seen !== null && !pidAlive(pid));
-    if (stale && seen !== null) {
-      const aside = `${lockPath}.stale.${token}`;
+  fs.mkdirSync(staged, { mode: 0o700 });
+  try {
+    fs.writeFileSync(path.join(staged, token), "", { mode: 0o600 });
+    for (;;) {
       try {
-        fs.renameSync(lockPath, aside);
-        if (readLockText(aside) !== seen) {
-          try {
-            fs.linkSync(aside, lockPath); // we took a fresh lock by mistake; give it back
-          } catch {
-            // another owner is in place already
-          }
-        }
-        fs.unlinkSync(aside);
-      } catch {
-        // someone else broke it first
+        fs.renameSync(staged, lockPath);
+        return token;
+      } catch (err) {
+        if (!["EEXIST", "ENOTEMPTY", "EPERM"].includes(err.code)) throw err;
       }
-      continue;
+      try {
+        const owners = fs.readdirSync(lockPath);
+        if (owners.length === 1) {
+          const owner = owners[0];
+          const pid = Number(owner.split(".")[0]);
+          const abandoned = Number.isSafeInteger(pid) && pid > 0
+            ? !pidAlive(pid)
+            : Date.now() - fs.statSync(path.join(lockPath, owner)).mtimeMs > staleMs;
+          if (abandoned) releaseLock(lockPath, owner);
+        } else if (!owners.length) {
+          fs.rmdirSync(lockPath);
+        }
+      } catch (err) {
+        if (!["ENOENT", "EEXIST", "ENOTEMPTY"].includes(err.code)) throw err;
+      }
+      if (Date.now() >= deadline) throw new Error(`Timed out after ${timeoutMs} ms waiting for lock ${lockPath}`);
+      await sleep(15 + Math.floor(Math.random() * 20));
     }
-    if (Date.now() >= deadline) throw new Error(`Timed out after ${timeoutMs} ms waiting for lock ${lockPath}`);
-    await sleep(15 + Math.floor(Math.random() * 20));
+  } finally {
+    fs.rmSync(staged, { recursive: true, force: true });
   }
 }
 
-/** Remove the lock only if it still holds our token. */
 export function releaseLock(lockPath, token) {
-  const text = readLockText(lockPath);
-  if (text !== null && text.split("\n")[0] === token) {
-    try {
-      fs.unlinkSync(lockPath);
-    } catch {
-      // already gone
-    }
+  try {
+    fs.unlinkSync(path.join(lockPath, token));
+    fs.rmdirSync(lockPath);
+  } catch (err) {
+    // A successor may already have replaced the empty directory with its own nonempty one.
+    if (!["ENOENT", "EEXIST", "ENOTEMPTY", "EACCES", "EPERM"].includes(err.code)) throw err;
   }
 }
 

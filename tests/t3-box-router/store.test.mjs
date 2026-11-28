@@ -332,7 +332,8 @@ test("non-object state is corrupt; a newer state version is left untouched", asy
 
 test("a held lock times out with an error instead of a result", async () => {
   const { home, config, paths } = await setup();
-  fs.writeFileSync(paths.lock, `${process.pid}.held\n${new Date().toISOString()}\n`);
+  fs.mkdirSync(paths.lock);
+  fs.writeFileSync(path.join(paths.lock, `${process.pid}.held`), "");
   let called = false;
   const r = await transaction(home, config, () => {
     called = true;
@@ -344,11 +345,13 @@ test("a held lock times out with an error instead of a result", async () => {
   assert.ok(fs.existsSync(paths.lock), "someone else's lock is left in place");
 });
 
-test("a lock older than the stale threshold is broken", async () => {
+test("an old lock with an unreadable owner is broken", async () => {
   const { home, config, paths } = await setup();
-  fs.writeFileSync(paths.lock, `${process.pid}.old\n2000-01-01T00:00:00Z\n`);
+  fs.mkdirSync(paths.lock);
+  const marker = path.join(paths.lock, "invalid-owner");
+  fs.writeFileSync(marker, "");
   const old = new Date(Date.now() - 60_000);
-  fs.utimesSync(paths.lock, old, old);
+  fs.utimesSync(marker, old, old);
   const r = await transaction(home, config, () => ({ result: "got it" }), { lockTimeoutMs: 500 });
   assert.equal(r, "got it");
   assert.equal(fs.existsSync(paths.lock), false);
@@ -357,7 +360,8 @@ test("a lock older than the stale threshold is broken", async () => {
 test("a fresh lock whose owner process has exited is broken", async () => {
   const { home, config, paths } = await setup();
   const dead = spawnSync(process.execPath, ["-e", ""]).pid;
-  fs.writeFileSync(paths.lock, `${dead}.gone\n${new Date().toISOString()}\n`);
+  fs.mkdirSync(paths.lock);
+  fs.writeFileSync(path.join(paths.lock, `${dead}.gone`), "");
   const r = await transaction(home, config, () => ({ result: "got it" }), { lockTimeoutMs: 500 });
   assert.equal(r, "got it");
 });
@@ -374,13 +378,16 @@ test("a write failure returns an error, not fn's result", { skip: process.getuid
     assert.match(r.error, /Failed writing/);
   } finally {
     fs.chmodSync(home, 0o700);
-    fs.rmSync(paths.lock, { force: true });
+    fs.rmSync(paths.lock, { recursive: true, force: true });
   }
   assert.deepEqual(JSON.parse(fs.readFileSync(paths.state, "utf8")).slots, {});
 });
 
-test("concurrent processes never lose an update", async () => {
-  const { home, config } = await setup();
+test("concurrent processes recover one abandoned owner and never lose an update", async () => {
+  const { home, config, paths } = await setup();
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+  fs.mkdirSync(paths.lock);
+  fs.writeFileSync(path.join(paths.lock, `${dead}.gone`), "");
   const script = `
     const { loadConfig, transaction } = await import(${JSON.stringify(STORE_URL)});
     const home = process.argv[1];

@@ -193,7 +193,7 @@ export function linkVerdict(config, link, now) {
   }
   if (v.status !== 'reachable') {
     const err = v.lastError ? ` (${String(v.lastError).slice(0, 120)})` : '';
-    const known = typeof v.status === 'string' && v.status !== 'unrecognized';
+    const known = v.status === 'unreachable' || v.status === 'offline';
     if (known && expiresAt != null && expiresAt - now < d.minLinkHours * HOUR) {
       return { state: 'unlinked', reason: `Link status is ${v.status}${err} and it expires within ${d.minLinkHours} hours (at ${iso(expiresAt)}). Renew it.` };
     }
@@ -230,6 +230,7 @@ function deriveHealth(config, state, machine, repo, now) {
   const link = freshFact(config, state, machine, 'link', now);
   const lv = link ? linkVerdict(config, link, now) : null;
   if (lv?.state === 'unlinked') return { state: 'unlinked', notes: [lv.reason] };
+  if (lv?.state === 'ready') notes.push(lv.reason);
   const bu = activeBringUp(state, machine.label, now);
   if (bu) return { state: 'cooling', notes: [bringUpReason(bu)] };
   const cd = coolingUntil(state, machine.label, now);
@@ -672,7 +673,7 @@ function decideCooldown(config, state, options, now) {
   const [labelArg, durationArg] = arr(options.args);
   const r = remoteLabel(config, labelArg);
   if (r.error) return { state, result: fail(r.error) };
-  const duration = parseDuration(durationArg);
+  const duration = parseDuration(options.durationMs ?? durationArg);
   if (duration == null) return { state, result: fail('Usage: cooldown <label> <duration>, for example 30m or 2h.') };
   const next = structuredClone(state);
   const h = healthRecord(next, r.label);
@@ -873,7 +874,12 @@ export function validateConfig(config) {
   if (!config || typeof config !== 'object') return { errors: ['Config is not an object.'], warnings };
   if (config.version !== undefined && config.version !== 1) errors.push(`Unsupported config version ${config.version}.`);
   const d = defaultsOf(config);
-  for (const [k, v] of Object.entries(d)) if (!(typeof v === 'number' && v > 0)) errors.push(`defaults.${k} must be a positive number.`);
+  for (const [k, v] of Object.entries(d)) {
+    const allowsZero = k === 'minLinkHours';
+    if (!Number.isFinite(v) || (allowsZero ? v < 0 : v <= 0)) {
+      errors.push(`defaults.${k} must be a ${allowsZero ? 'nonnegative' : 'positive'} number.`);
+    }
+  }
   if (config.allowProjectOverride) warnings.push('allowProjectOverride is a Phase 2 feature and is inactive.');
 
   const checkEntry = (label, m, where) => {
