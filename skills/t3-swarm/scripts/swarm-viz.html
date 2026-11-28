@@ -197,24 +197,39 @@ function buildGraph() {
   const add = (p, c) => { if (!kids.has(p)) kids.set(p, []); kids.get(p).push(c); };
   const sorted = [...byId.values()].sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
   for (const n of sorted) add(n.id === root ? "you" : (n.parentId && byId.has(n.parentId) ? n.parentId : root), n.id);
-  const lead = sorted.find((n) => n.role === "lead");
+  const lead = [...sorted].reverse().find((n) => n.role === "lead" && ["working", "delegating", "waiting"].includes(n.status))
+    || [...sorted].reverse().find((n) => n.role === "lead");
   const plans = (S.meta.pending || []).map((g, i) => ({ id: `plan:${g.label}:${i}`, plan: true, ...g }));
   const leadOfStream = (st) => st && S.meta.streams?.find((x) => x.name === st)?.leadId;
   for (const g of plans) { const l = leadOfStream(g.stream); add(l && byId.has(l) ? l : lead ? lead.id : root, g.id); }
+  const activeMemo = new Map();
+  const subtreeActive = (id) => {
+    if (activeMemo.has(id)) return activeMemo.get(id);
+    activeMemo.set(id, false);
+    const st = byId.get(id)?.status;
+    let a = st === "working" || st === "delegating" || st === "waiting";
+    if (!a) for (const c of kids.get(id) || []) if (subtreeActive(c)) { a = true; break; }
+    activeMemo.set(id, a);
+    return a;
+  };
+  const subtreeSel = (id) => id === S.sel || (kids.get(id) || []).some((c) => subtreeSel(c));
   const groups = new Map(), alias = new Map();
   for (const [p, cs] of [...kids]) {
-    if (cs.length <= COLLAPSE_AT) continue;
+    if (p === "you") continue;
     if (S.expanded.has(p)) { const id = `less:${p}`; groups.set(id, { id, less: true, parent: p }); cs.push(id); continue; }
-    const fold = (pred, kind, label) => {
+    const parentFinished = p !== root && !subtreeActive(p) && !subtreeSel(p);
+    const fold = (pred, kind, label, minCount) => {
       const members = cs.filter(pred);
-      if (members.length < 3) return;
+      if (members.length < minCount) return;
       const id = `grp:${kind}:${p}`;
       groups.set(id, { id, group: true, kind, parent: p, members, label });
       for (const m of members) { alias.set(m, id); cs.splice(cs.indexOf(m), 1); }
       cs.push(id);
     };
-    fold((id) => byId.get(id)?.status === "done" && !kids.has(id) && id !== S.sel, "done", "finished");
-    fold((id) => id.startsWith("plan:"), "plan", "not started");
+    // Finished subtrees (e.g. earlier completed Leads in the same thread) collapse all finished leaves into 1 compact pill.
+    // Active parents keep working/waiting/failed cards expanded and collapse finished leaves once >= 2 are done.
+    fold((id) => byId.get(id)?.status === "done" && !kids.has(id) && id !== S.sel, "done", "finished", parentFinished ? 1 : 2);
+    fold((id) => id.startsWith("plan:"), "plan", "not started", parentFinished ? 1 : 3);
   }
   return { kids, plans: new Map(plans.map((g) => [g.id, g])), groups, alias };
 }

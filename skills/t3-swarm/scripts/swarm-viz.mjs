@@ -401,12 +401,14 @@ function ledgerTasks(text, stream) {
   for (const line of sec.split("\n")) {
     if (!line.startsWith("- ") || line.startsWith("- [ ] (")) continue;
     const parts = line.slice(2).split(" | ").map((s) => s.trim());
-    const head = parts[0];
+    const rawHead = parts[0];
+    const done = /^\[x\]/i.test(rawHead);
+    const head = rawHead.replace(/^\[[ xX]\]\s*/, "");
     const label = head.split(/\s+/)[0];
     const taskPart = parts.find((p) => p.startsWith("taskId:"));
     tasks.push({
       label, desc: head.slice(label.length).trim(), tier: parts[1] && !parts[1].startsWith("taskId:") ? parts[1] : null,
-      taskId: taskPart ? taskPart.slice("taskId:".length) : null, state: short(parts[parts.length - 1], 90), stream,
+      taskId: taskPart ? taskPart.slice("taskId:".length) : null, state: short(parts[parts.length - 1], 90), stream, done,
     });
   }
   return tasks;
@@ -623,7 +625,7 @@ function snapshot() {
     brief: clip(String(n.brief || "").replace(/^-{3,}\s*/, ""), 2000), lastText: clip(n.lastText, 1200), toolCalls: n.toolCalls, commands: n.commands,
     ledgerLabel: n.ledgerLabel ?? null, tier: n.tier ?? null, ledgerState: n.ledgerState ?? null,
   }));
-  const pending = (ledger?.tasks || []).filter((t) => !t.taskId).map((t) => ({ label: t.label, desc: t.desc, tier: t.tier, state: t.state, stream: t.stream ?? null }));
+  const pending = (ledger?.tasks || []).filter((t) => !t.taskId && !t.done).map((t) => ({ label: t.label, desc: t.desc, tier: t.tier, state: t.state, stream: t.stream ?? null }));
   return {
     v: version, root: ROOT, now: new Date().toISOString(), lastTickAt, lastError,
     ledger: ledger && { runId: ledger.runId, status: ledger.status, goal: ledger.goal }, pending, nodes: ns,
@@ -643,7 +645,7 @@ function liteNode(n) {
   };
 }
 function meta() {
-  const pending = (ledger?.tasks || []).filter((t) => !t.taskId).map((t) => ({ label: t.label, desc: t.desc, tier: t.tier, state: t.state, stream: t.stream ?? null }));
+  const pending = (ledger?.tasks || []).filter((t) => !t.taskId && !t.done).map((t) => ({ label: t.label, desc: t.desc, tier: t.tier, state: t.state, stream: t.stream ?? null }));
   return {
     serverId: SERVER_ID, run: RUN,
     root: ROOT, now: new Date().toISOString(), lastTickAt, lastError, pending,
