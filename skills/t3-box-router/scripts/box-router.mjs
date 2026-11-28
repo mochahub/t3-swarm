@@ -31,7 +31,7 @@ import * as engine from "./engine.mjs";
 import * as profile from "./profile.mjs";
 import { probeMachine } from "./probe.mjs";
 import * as lifecycle from "./lifecycle.mjs";
-import { runHook, hookArgvProblem, parseStartedMarker, claimDeadline } from "./hooks.mjs";
+import { runHook, hookArgvProblem, startedFromHookResult, claimDeadline } from "./hooks.mjs";
 import {
   UsageError,
   parseArgv,
@@ -235,10 +235,10 @@ async function decideWith(command, { config, options, repo, patch }) {
 //     while it reads facts does not restart the box again.
 //   - Slots are advisory and expire, so holding none is not proof the box is idle: the hook must run the
 //     operator's own idle check before restarting T3 and exit 75 when the box is busy.
-//   - Only the configured argument vector, no shell, output discarded (it could carry tokens). Its own process
+//   - Only the configured argument vector, no shell; output stays private. Its own process
 //     group, stopped with SIGTERM then SIGKILL at the timeout (hooks.mjs). A process that leaves that group
 //     (setsid) escapes.
-//   - The hook may confirm it started the box in its result file (STARTED <label> yes|no or {"started":bool}).
+//   - The hook may confirm it started the box on stdout or in its result file (STARTED <label> yes|no or {"started":bool}).
 //     Only that boolean, on exit 0, is kept: it makes the box this run's when acquire leases it.
 //   - Finishing lifts the claim and expires every fact about the box observed before the hook finished, in one
 //     transaction; links are then re-read and the acquisition decided again on fresh evidence. A claim whose
@@ -268,11 +268,11 @@ async function runClaimed(config, { label, claim }, run) {
     requireIdleCheck: true,
     kind: machine.kind ?? "always-on",
     note: "The router holds no slot on this box, which does not prove it is idle. Run your own idle check before restarting T3 and exit 75 if the box is busy.",
-    confirm: "Optional: write STARTED <label> yes|no, or {\"started\": true|false}, to the file named by T3_BOXES_RESULT_FILE to say whether this hook started the box. Only yes lets release stop it later.",
+    confirm: "Optional: write STARTED <label> yes|no, or {\"started\": true|false}, to stdout or the file named by T3_BOXES_RESULT_FILE to say whether this hook started the box. Only yes lets release stop it later.",
   };
   const res = await runHook(machine.bringUp, input, timeoutMs, { name: "bringUp", label, idleCheck: true, resultFile: true });
-  // Reduce the result file to one boolean here; its text goes no further.
-  const started = res.outcome === "up" ? parseStartedMarker(res.resultText, label, { truncated: res.resultTruncated === true }) : null;
+  // Reduce both private channels to one boolean; their text goes no further.
+  const started = startedFromHookResult(res, label);
   return { label, claimId: claim.id, startedAt: claim.startedAt, timeoutMs, ...lifecycle.publicHookResult(res), started, finishedAt: Date.now() };
 }
 

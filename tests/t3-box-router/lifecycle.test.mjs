@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { parseStartedMarker, runHook, RESULT_MAX_BYTES } from "../../skills/t3-box-router/scripts/hooks.mjs";
+import { parseStartedMarker, runHook, startedFromHookResult, RESULT_MAX_BYTES } from "../../skills/t3-box-router/scripts/hooks.mjs";
 import { adoptStarted, planRelease, annotatePlacement, transferInfo } from "../../skills/t3-box-router/scripts/lifecycle.mjs";
 import { decide } from "../../skills/t3-box-router/scripts/engine.mjs";
 import { validateConfig } from "../../skills/t3-box-router/scripts/store.mjs";
@@ -36,7 +36,8 @@ name="$T3_BOXES_HOOK"
 echo run >> "$MARK_DIR/$label.$name.runs"
 cat > "$MARK_DIR/$label.$name.input.json"
 env | grep '^T3_BOXES_' | sort > "$MARK_DIR/$label.$name.env"
-echo "stdout ${SECRET}"
+case "$HOOK_STDOUT" in \{*) ;; *) echo "stdout ${SECRET}" ;; esac
+[ -n "$HOOK_STDOUT" ] && printf '%s\n' "$HOOK_STDOUT"
 echo "stderr ${SECRET}" >&2
 gate=""
 [ "$name" = "tearDown" ] && gate="$DOWN_GATE"
@@ -254,6 +255,38 @@ describe("runHook result file", () => {
     assert.equal(failed.outcome, "failed");
     assert.equal(failed.resultText, undefined, "a failed hook's file is never read");
   });
+});
+
+test("bringUp stdout is bounded, private and reconciled with the result file", async () => {
+  for (const [stdout, file, expected] of [
+    ["STARTED od-box yes", "", true],
+    ["STARTED od-box no", "", false],
+    ['{"started":true}', "", true],
+    ["STARTED od-box yes", "STARTED od-box yes", true],
+    ["STARTED od-box yes", "STARTED od-box no", null],
+    ["STARTED other-box yes", "STARTED od-box yes", null],
+    ["STARTED od-box yes", "bad result", null],
+    ["STARTED od-box yes\n" + "x".repeat(RESULT_MAX_BYTES), "", null],
+  ]) {
+    const t = setup({ machines: { "od-box": { env: "env-od", kind: "on-demand", hooks: ["bringUp"] } }, links: { "env-od": "offline" }, linksUp: { "env-od": "reachable" } });
+    const r = await t.run(["acquire", "--run", "r1"], { env: { HOOK_STDOUT: stdout, HOOK_RESULT: file } });
+    assert.equal(entry(r.json.bringUp, "od-box")?.started, expected);
+    t.assertNoLeak();
+  }
+  assert.equal(startedFromHookResult({ outcome: "failed", stdoutText: "STARTED b yes" }, "b"), null);
+  assert.equal(startedFromHookResult({ outcome: "up", stdoutText: "STARTED b yes", resultTruncated: true }, "b"), null);
+});
+
+test("a descendant retaining stdout cannot delay bringUp completion", { timeout: 3000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "box-router-stdout-"));
+  const script = path.join(dir, "hook.sh");
+  writeExec(script, "#!/bin/sh\ncat >/dev/null\nsleep 2 &\nprintf 'STARTED b yes\\n'\n");
+  const startedAt = Date.now();
+  const result = await runHook([script], { label: "b" }, 5000, { name: "bringUp", label: "b" });
+  assert.equal(result.outcome, "up");
+  assert.equal(result.stdoutTruncated, true);
+  assert.equal(startedFromHookResult(result, "b"), null);
+  assert.ok(Date.now() - startedAt < 1500);
 });
 
 describe("ownership and release planning", () => {

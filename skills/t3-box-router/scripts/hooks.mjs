@@ -3,7 +3,7 @@
  * handoff, fetch) runs through runHook:
  *   - only the configured argument vector, no shell;
  *   - one JSON object on stdin, never the router's state;
- *   - stdout and stderr discarded (they could carry tokens), so a service the hook starts never inherits a pipe;
+ *   - stderr and non-bringUp stdout discarded; bringUp stdout is privately bounded and reduced by the caller;
  *   - its own process group, stopped with SIGTERM then SIGKILL at the timeout; a router told to stop kills every
  *     group still running before it exits. A process that leaves that group (setsid) escapes.
  *   - an optional result file (T3_BOXES_RESULT_FILE) in a private 0700 directory, of which at most
@@ -24,6 +24,7 @@ export const HOOK_BACKSTOP_MS = 2_000; // SIGKILL to giving up on the exit event
 // A claim's deadline: the timeout, both grace periods and a margin. Past it, any transaction finalizes the claim.
 export const HOOK_CLAIM_MARGIN_MS = 10_000;
 export const RESULT_MAX_BYTES = 4096;
+const STDOUT_DRAIN_MS = 100;
 
 const errorMessage = (e) => (e instanceof Error ? e.message : String(e));
 
@@ -126,7 +127,7 @@ export function runHook(argv, input, timeoutMs, { name = "bringUp", label = inpu
     let child;
     try {
       child = spawn(argv[0], argv.slice(1), {
-        stdio: ["pipe", "ignore", "ignore"],
+        stdio: ["pipe", name === "bringUp" ? "pipe" : "ignore", "ignore"],
         env,
         shell: false,
         // Its own process group, so a timeout stops everything the hook started, not just the hook.
@@ -138,6 +139,11 @@ export function runHook(argv, input, timeoutMs, { name = "bringUp", label = inpu
     }
     let settled = false;
     let timedOut = false;
+    const chunks = [];
+    let stdoutBytes = 0;
+    let stdoutTruncated = false;
+    let stdoutEnded = !child.stdout;
+    let exitResult = null;
     const timers = [];
     trackHookGroup(child.pid);
     const settle = (r) => {
@@ -147,6 +153,7 @@ export function runHook(argv, input, timeoutMs, { name = "bringUp", label = inpu
       untrackHookGroup(child.pid);
       try {
         child.stdin?.destroy();
+        child.stdout?.destroy();
         child.unref();
       } catch {
         // already closed
@@ -155,9 +162,28 @@ export function runHook(argv, input, timeoutMs, { name = "bringUp", label = inpu
         const res = readResult(file);
         if (res) Object.assign(r, { resultText: res.text, resultTruncated: res.truncated });
       }
+      if (child.stdout && r.outcome === "up") {
+        Object.assign(r, { stdoutText: Buffer.concat(chunks).toString("utf8"), stdoutTruncated: stdoutTruncated || !stdoutEnded });
+      }
       cleanup();
       resolve(r);
     };
+    if (child.stdout) {
+      child.stdout.on("data", (chunk) => {
+        const remaining = RESULT_MAX_BYTES - stdoutBytes;
+        if (chunk.length > remaining) stdoutTruncated = true;
+        if (remaining > 0) {
+          const part = chunk.subarray(0, remaining);
+          chunks.push(part);
+          stdoutBytes += part.length;
+        }
+      });
+      child.stdout.on("error", () => { stdoutTruncated = true; });
+      child.stdout.on("end", () => {
+        stdoutEnded = true;
+        if (exitResult) settle(exitResult);
+      });
+    }
     const stop = (sig) => {
       try {
         if (process.platform !== "win32" && child.pid) process.kill(-child.pid, sig);
@@ -191,7 +217,13 @@ export function runHook(argv, input, timeoutMs, { name = "bringUp", label = inpu
         stop("SIGKILL");
         return settle({ outcome: "timeout", detail: `No exit within ${timeoutMs} ms; stopped.`, ...(signal ? { signal } : { exitCode: code }) });
       }
-      if (code === 0) return settle({ outcome: "up", detail: "Hook exited 0.", exitCode: 0 });
+      if (code === 0) {
+        exitResult = { outcome: "up", detail: "Hook exited 0.", exitCode: 0 };
+        if (stdoutEnded) return settle(exitResult);
+        // A detached service may inherit stdout indefinitely. Never wait for it beyond this bound.
+        timers.push(setTimeout(() => settle(exitResult), STDOUT_DRAIN_MS));
+        return;
+      }
       if (code === HOOK_BUSY_EXIT) {
         return settle({ outcome: "refused-busy", detail: "The hook's idle check found the box busy (exit 75). Nothing was changed.", exitCode: code });
       }
@@ -237,4 +269,22 @@ export function parseStartedMarker(text, label, { truncated = false } = {}) {
   }
   if (seen.size !== 1) return null;
   return seen.has("yes");
+}
+
+/** Reconcile the optional private result file and stdout; malformed or conflicting claims fail closed. */
+export function startedFromHookResult(res, label) {
+  if (res.outcome !== "up" || res.resultTruncated || res.stdoutTruncated) return null;
+  const file = res.resultText;
+  const stdout = res.stdoutText;
+  const filePresent = typeof file === "string" && file.trim() !== "";
+  // Ordinary stdout is allowed, but marker-like lines or JSON are an attempted claim.
+  const stdoutPresent = typeof stdout === "string" && (/^\s*\{/m.test(stdout) || /^\s*STARTED\b/m.test(stdout));
+  const values = [];
+  for (const [present, text] of [[filePresent, file], [stdoutPresent, stdout]]) {
+    if (!present) continue;
+    const value = parseStartedMarker(text, label);
+    if (value === null) return null;
+    values.push(value);
+  }
+  return values.length && values.every((value) => value === values[0]) ? values[0] : null;
 }
