@@ -562,7 +562,7 @@ export function bringUpCandidates({ config, state, options, repo, now, exclude =
  * no slot or lease on that box.
  *   limit       how many hooks this acquisition may start (its shortfall)
  *   unusable    Map label -> problem, for hooks whose executable failed the check made before the transaction
- *   makeClaim   (label) -> claim record { id, run, pid, startedAt, deadline }
+ *   makeClaim   (label) -> claim record { id, run, pid, startedAt, deadline }; environmentId is added from config
  * Returns { state, claimed: [{label, claim}], report: [{label, outcome, detail}] }.
  */
 export function planBringUps({ config, state, options, repo, now, exclude, retryMs, limit, unusable = new Map(), makeClaim }) {
@@ -576,7 +576,9 @@ export function planBringUps({ config, state, options, repo, now, exclude, retry
       report.push({ label: c.label, outcome: "skipped", detail: unusable.get(c.label) });
       continue;
     }
-    const claim = makeClaim(c.label);
+    // The claim names the environment the hook is about to start. Adoption and tear-down later act only while
+    // the label still maps to it, so a label reassigned in config never inherits this start.
+    const claim = { ...makeClaim(c.label), environmentId: config.machines[c.label].environmentId };
     bringUp[c.label] = claim;
     claimed.push({ label: c.label, claim });
   }

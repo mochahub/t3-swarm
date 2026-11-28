@@ -12,9 +12,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseStartedMarker, runHook, startedFromHookResult, RESULT_MAX_BYTES } from "../../skills/t3-box-router/scripts/hooks.mjs";
-import { adoptStarted, planRelease, annotatePlacement, transferInfo } from "../../skills/t3-box-router/scripts/lifecycle.mjs";
+import { adoptStarted, planRelease, annotatePlacement, transferInfo, transferTarget } from "../../skills/t3-box-router/scripts/lifecycle.mjs";
 import { decide } from "../../skills/t3-box-router/scripts/engine.mjs";
-import { validateConfig } from "../../skills/t3-box-router/scripts/store.mjs";
+import { validateConfig, pruneState } from "../../skills/t3-box-router/scripts/store.mjs";
 
 const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../skills/t3-box-router/scripts/box-router.mjs");
 const REPO = "github.com/o/r";
@@ -302,19 +302,32 @@ describe("ownership and release planning", () => {
     },
     repos: {},
   };
-  const finished = (run, extra = {}) => ({ id: "c1", run, startedAt: later, deadline: later, finishedAt: new Date(NOW - 1000).toISOString(), outcome: "up", started: true, ...extra });
+  const finished = (run, extra = {}) => ({ id: "c1", environmentId: "e-od", run, startedAt: later, deadline: later, finishedAt: new Date(NOW - 1000).toISOString(), outcome: "up", started: true, ...extra });
   const base = (bringUp, leases) => ({ version: 1, observations: {}, health: {}, slots: {}, leases, bringUp });
 
   test("adoption needs a confirmed start by the same run, once", () => {
-    const leases = { r1: { machines: ["od", "aon"], expiresAt: later } };
-    const own = adoptStarted(base({ od: finished("r1") }, leases), "r1", NOW);
+    const leases = { r1: { machines: ["od", "aon"], environments: { od: "e-od", aon: "e-aon" }, expiresAt: later } };
+    const own = adoptStarted(base({ od: finished("r1") }, leases), "r1", NOW, config);
     assert.deepEqual(own.adopted, ["od"]);
     assert.deepEqual(own.state.leases.r1.startedByRouter, ["od"]);
+    assert.deepEqual(own.state.leases.r1.startedEnvironments, { od: "e-od" });
     assert.ok(own.state.bringUp.od.adoptedAt);
-    assert.deepEqual(adoptStarted(own.state, "r1", NOW).adopted, [], "adopted once");
+    assert.deepEqual(adoptStarted(own.state, "r1", NOW, config).adopted, [], "adopted once");
     for (const rec of [finished("r2"), finished("r1", { started: false }), finished("r1", { started: undefined }), finished("r1", { outcome: "failed" }), finished("r1", { hook: "tearDown" }), finished("r1", { finishedAt: undefined })]) {
-      assert.deepEqual(adoptStarted(base({ od: rec }, leases), "r1", NOW).adopted, [], JSON.stringify(rec));
+      assert.deepEqual(adoptStarted(base({ od: rec }, leases), "r1", NOW, config).adopted, [], JSON.stringify(rec));
     }
+    // Identity: a legacy record (no environmentId), a record for another environment, a lease taken under another
+    // environment, or a call without config never adopts.
+    for (const rec of [finished("r1", { environmentId: undefined }), finished("r1", { environmentId: "e-other" })]) {
+      assert.deepEqual(adoptStarted(base({ od: rec }, leases), "r1", NOW, config).adopted, [], JSON.stringify(rec));
+    }
+    assert.deepEqual(adoptStarted(base({ od: finished("r1") }, { r1: { machines: ["od"], expiresAt: later } }), "r1", NOW, config).adopted, []);
+    assert.deepEqual(adoptStarted(base({ od: finished("r1") }, { r1: { machines: ["od"], environments: { od: "e-x" }, expiresAt: later } }), "r1", NOW, config).adopted, []);
+    assert.deepEqual(adoptStarted(base({ od: finished("r1") }, leases), "r1", NOW).adopted, []);
+    // The label now names another environment than the one the bring-up started.
+    const moved = { ...config, machines: { ...config.machines, od: { ...config.machines.od, environmentId: "e-new" } } };
+    const movedLease = { r1: { machines: ["od"], environments: { od: "e-new" }, expiresAt: later } };
+    assert.deepEqual(adoptStarted(base({ od: finished("r1") }, movedLease), "r1", NOW, moved).adopted, []);
   });
 
   test("an engine acquire keeps startedByRouter for boxes it keeps", () => {
@@ -322,10 +335,12 @@ describe("ownership and release planning", () => {
       const env1 = (value, ttl) => ({ observedAt: new Date(NOW - 1000).toISOString(), validUntil: new Date(NOW + ttl).toISOString(), value });
       return { environmentId: env, link: env1({ status: "reachable", access: "full-access", expiresAt: FAR }, 600_000), providers: env1(["claude"], 3_600_000), projects: env1({ [REPO]: "p" }, 3_600_000) };
     };
-    const state = { ...base({}, { r1: { machines: ["od"], startedByRouter: ["od"], expiresAt: later } }), observations: { od: fresh("e-od") } };
+    const state = { ...base({}, { r1: { machines: ["od"], startedByRouter: ["od"], startedEnvironments: { od: "e-od" }, expiresAt: later } }), observations: { od: fresh("e-od") } };
     const out = decide("acquire", { config, state, options: { run: "r1" }, repo: REPO, now: NOW, newId: () => "x" });
     assert.equal(out.result.ok, true, JSON.stringify(out.result));
     assert.deepEqual(out.state.leases.r1.startedByRouter, ["od"]);
+    assert.deepEqual(out.state.leases.r1.startedEnvironments, { od: "e-od" });
+    assert.deepEqual(out.state.leases.r1.environments, { od: "e-od" });
   });
 
   test("release plans a tear-down only for an owned box nothing else holds", () => {
@@ -340,10 +355,11 @@ describe("ownership and release planning", () => {
         makeClaim: () => ({ id: `t${++n}`, run: "r1", startedAt: later, deadline: later }),
         ...opts,
       });
-    const owned = { r1: { machines: ["od", "aon"], startedByRouter: ["od"], expiresAt: later } };
+    const owned = { r1: { machines: ["od", "aon"], startedByRouter: ["od"], startedEnvironments: { od: "e-od" }, expiresAt: later } };
     const ok = plan(base({}, owned));
     assert.deepEqual(ok.claimed.map((c) => c.label), ["od"]);
     assert.equal(ok.state.bringUp.od.hook, "tearDown");
+    assert.equal(ok.state.bringUp.od.environmentId, "e-od");
     assert.equal(ok.state.leases.r1, undefined);
     assert.deepEqual(ok.result.kept, ["aon", "od"]);
 
@@ -353,6 +369,13 @@ describe("ownership and release planning", () => {
       [base({ od: { id: "b", hook: "bringUp", startedAt: later, deadline: later } }, owned), /bringUp hook is running/],
       [{ ...base({}, owned), lifecycle: { keepAlive: { od: { id: "k", deadline: later } } } }, /keepAlive hook is running/],
       [base({}, { r1: { machines: ["od"], expiresAt: later } }), /Not started by the router/],
+      // Identity: a legacy ownership record (label only) or one bound to another environment fails closed.
+      [base({}, { r1: { machines: ["od"], startedByRouter: ["od"], expiresAt: later } }), /names no environment/],
+      [base({}, { r1: { machines: ["od"], startedByRouter: ["od"], startedEnvironments: { od: "e-before" }, expiresAt: later } }), /different environment/],
+      // Quietness by environment: another run's lease, a hook claim or a keep-alive under another label naming e-od.
+      [base({}, { ...owned, r2: { machines: ["x"], environments: { x: "e-od" }, expiresAt: later } }), /Still leased to run r2/],
+      [base({ x: { id: "b", hook: "bringUp", environmentId: "e-od", startedAt: later, deadline: later } }, owned), /bringUp hook is running/],
+      [{ ...base({}, owned), lifecycle: { keepAlive: { x: { id: "k", environmentId: "e-od", deadline: later } } } }, /keepAlive hook is running/],
     ];
     for (const [state, why] of blocked) {
       const p = plan(state);
@@ -362,8 +385,32 @@ describe("ownership and release planning", () => {
     assert.match(entry(plan(base({}, owned), { keep: true }).result.tearDown, "od").detail, /--keep/);
     assert.match(entry(plan(base({}, owned), { unusable: new Map([["od", "tearDown[0] /x is missing or not executable."]]) }).result.tearDown, "od").detail, /not executable/);
 
+    // A slot booked on e-od under a label since removed from config survives pruning and still blocks.
+    const orphan = { ...base({}, structuredClone(owned)), slots: { s1: { label: "gone", environmentId: "e-od", run: "r9", expiresAt: later }, s2: { label: "gone2", run: "r9", expiresAt: later } } };
+    pruneState(config, orphan, NOW);
+    assert.deepEqual(Object.keys(orphan.slots), ["s1"], "a legacy orphan slot is pruned; one naming its environment is kept");
+    const orphanPlan = plan(orphan);
+    assert.equal(orphanPlan.claimed.length, 0);
+    assert.match(entry(orphanPlan.result.tearDown, "od").detail, /1 live slot/);
+    // So does another run's lease on e-od under a removed label: pruning empties its machines, not its environments.
+    const goneLease = base({}, { ...structuredClone(owned), r2: { machines: ["gone"], environments: { gone: "e-od" }, expiresAt: later } });
+    pruneState(config, goneLease, NOW);
+    assert.deepEqual(goneLease.leases.r2.machines, []);
+    assert.match(entry(plan(goneLease).result.tearDown, "od").detail, /Still leased to run r2/);
+    // A slot under the same label but naming another environment still blocks: the label match is kept, conservatively.
+    const sameLabel = plan({ ...base({}, owned), slots: { s1: { label: "od", environmentId: "e-old", run: "r9", expiresAt: later } } });
+    assert.equal(sameLabel.claimed.length, 0);
+
     const alwaysOn = plan(base({}, { r1: { machines: ["aon"], expiresAt: later } }));
     assert.deepEqual(alwaysOn.result, { ok: true, run: "r1", stopped: [], kept: ["aon"] }, "always-on release keeps its shape");
+  });
+
+  test("a transfer hook runs only for the environment the slot was booked on", () => {
+    const cfg = { machines: { od: { environmentId: "e-od", handoff: ["/x"] } } };
+    const slot = (extra) => ({ state: { slots: { s1: { label: "od", expiresAt: later, ...extra } } } });
+    assert.equal(transferTarget(cfg, slot({ environmentId: "e-od" }).state, "s1", "handoff", NOW).error, undefined);
+    assert.match(transferTarget(cfg, slot({ environmentId: "e-before" }).state, "s1", "handoff", NOW).error, /another environment/);
+    assert.match(transferTarget(cfg, slot({}).state, "s1", "handoff", NOW).error, /names no environment/);
   });
 
   test("placement metadata names commands, never hook argv", () => {
@@ -697,6 +744,57 @@ test("handoff and fetch run the user's hooks for a live slot, with metadata in p
   assert.equal(dead.code, 1);
   assert.match(dead.json.error, /not live/);
   assert.equal(t.runs("od-box", "handoff"), 2);
+  t.assertNoLeak();
+});
+
+test("a label reassigned in config never lets release or a transfer hook act on another environment", async () => {
+  const t = setup({
+    machines: {
+      "od-a": { env: "env-a", kind: "on-demand", hooks: ["bringUp", "tearDown", "handoff"], tags: ["linux", "gpu"] },
+      "od-b": { env: "env-b", kind: "on-demand", hooks: ["bringUp", "tearDown", "handoff"] },
+    },
+    links: { "env-a": "offline", "env-b": "reachable" },
+    linksUp: { "env-a": "reachable", "env-b": "reachable" },
+    linksDown: { "env-a": "offline", "env-b": "reachable" },
+  });
+  await observe(t, [...factRecords("env-a"), ...factRecords("env-b")]);
+  // r1 needs gpu, which only od-a has, so its bring-up starts od-a (env-a); od-b stays free for a slot.
+  const first = await t.run(["acquire", "--run", "r1", "--needs", "gpu"], { env: { HOOK_RESULT: "STARTED od-a yes" } });
+  assert.equal(entry(first.json.bringUp, "od-a")?.outcome, "up", JSON.stringify(first.json));
+  await observe(t, factRecords("env-a"));
+  const second = await t.run(["acquire", "--run", "r1", "--needs", "gpu"]);
+  assert.equal(second.code, 0, JSON.stringify(second.json));
+  assert.deepEqual(second.json.startedByRouter, ["od-a"]);
+  const lease = t.readState().leases.r1;
+  assert.deepEqual(lease.startedEnvironments, { "od-a": "env-a" });
+  assert.equal(t.readState().bringUp["od-a"].environmentId, "env-a");
+
+  const placed = await t.run(["place", "--place", "od-b"]);
+  assert.equal(placed.code, 0, JSON.stringify(placed.json));
+  const slot = placed.json.placement.slot.id;
+  assert.equal(t.readState().slots[slot].environmentId, "env-b");
+
+  // Synthetic config change: the two labels swap environments.
+  const swapped = structuredClone(t.config);
+  swapped.machines["od-a"].environmentId = "env-b";
+  swapped.machines["od-b"].environmentId = "env-a";
+  const configPath = path.join(t.dirs.home, "config.json");
+  fs.writeFileSync(configPath, JSON.stringify(swapped, null, 2), { mode: 0o600 });
+  fs.chmodSync(configPath, 0o600);
+
+  // The slot was booked on env-b; od-b now names env-a, so its handoff hook must not run.
+  const h = await t.run(["handoff", "--slot", slot]);
+  assert.equal(h.code, 1, JSON.stringify(h.json));
+  assert.match(h.json.error, /another environment/);
+  assert.equal(t.runs("od-b", "handoff"), 0);
+
+  // r1 started env-a under od-a; od-a now names env-b. Release must stop nothing.
+  const rel = await t.run(["release", "--run", "r1"]);
+  assert.equal(rel.code, 0, JSON.stringify(rel.json));
+  assert.deepEqual(rel.json.stopped, []);
+  assert.match(entry(rel.json.tearDown, "od-a").detail, /different environment/);
+  assert.equal(t.runs("od-a", "tearDown"), 0);
+  assert.equal(t.runs("od-b", "tearDown"), 0);
   t.assertNoLeak();
 });
 

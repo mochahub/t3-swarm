@@ -211,7 +211,7 @@ async function decideWith(command, { config, options, repo, patch }) {
     let merged = facts.mergeFactPatch(config, state, clean, now);
     if (clean?.[profile.DISCOVERY_PATCH_KEY]) merged = profile.recordDiscovered(merged, clean[profile.DISCOVERY_PATCH_KEY]);
     const decision = engine.decide(command, { config, state: merged, options, repo, now, newId });
-    const out = command === "acquire" ? lifecycle.adoptAfterAcquire(decision, options.run, now) : decision;
+    const out = command === "acquire" ? lifecycle.adoptAfterAcquire(decision, options.run, now, config) : decision;
     const result = out?.result;
     if (!PROFILE_REPORT_COMMANDS.has(command) || !result || typeof result !== "object" || Array.isArray(result)) return out;
     const unprofiledBoxes = profile.unprofiledBoxes({ config, state: out.state ?? merged, now, proposeLabel: facts.proposeLabel });

@@ -94,7 +94,7 @@ describe('place: single placement', () => {
       'Run on home-box. In its project checkout, run git fetch origin && git worktree add ~/work/feat-x -b feat-x origin/main. Work there, then push your branch to origin.',
     );
     assert.deepEqual(state.slots.s1, {
-      label: 'home-box', run: null, repo: REPO, exclusive: [], placedAt: iso(NOW), expiresAt: iso(NOW + 180 * MIN),
+      label: 'home-box', environmentId: 'env-home', run: null, repo: REPO, exclusive: [], placedAt: iso(NOW), expiresAt: iso(NOW + 180 * MIN),
     });
   });
 

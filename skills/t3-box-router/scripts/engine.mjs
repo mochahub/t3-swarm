@@ -571,6 +571,8 @@ function decidePlace(config, state, options, repo, now, newId) {
     const expiresAt = iso(now + d.slotTtlMinutes * MINUTE);
     next.slots[id] = {
       label: machine.label,
+      // A remote slot names its environment, so a label later reassigned in config cannot hide it (lifecycle).
+      ...(machine.remote ? { environmentId: machine.environmentId } : {}),
       run,
       repo: repo ?? null,
       exclusive: req.needs.filter((t) => machine.exclusive.includes(t)),
@@ -754,12 +756,19 @@ function decideAcquire(config, state, options, repo, now) {
   }
   const d = defaultsOf(config);
   const next = structuredClone(state);
-  // Other lease fields (startedByRouter, recorded by the lifecycle module) survive, narrowed to the boxes kept.
+  // Other lease fields (startedByRouter and its startedEnvironments binding, recorded by the lifecycle module)
+  // survive, narrowed to the boxes kept. The binding is never recomputed from config: it names the environment the
+  // run's bring-up started. environments maps each leased label to the environment it was leased under now.
   const labels = chosen.map((m) => m.label);
   const owned = arr(current?.startedByRouter).filter((l) => labels.includes(l));
-  next.leases[run] = { ...(current ?? {}), machines: labels, expiresAt: iso(now + d.leaseTtlHours * HOUR) };
+  const environments = Object.fromEntries(chosen.map((m) => [m.label, m.environmentId]));
+  next.leases[run] = { ...(current ?? {}), machines: labels, environments, expiresAt: iso(now + d.leaseTtlHours * HOUR) };
   if (owned.length) next.leases[run].startedByRouter = owned;
   else delete next.leases[run].startedByRouter;
+  const bound = current?.startedEnvironments && typeof current.startedEnvironments === 'object' ? current.startedEnvironments : {};
+  const keptBinding = Object.fromEntries(owned.filter((l) => typeof bound[l] === 'string').map((l) => [l, bound[l]]));
+  if (Object.keys(keptBinding).length) next.leases[run].startedEnvironments = keptBinding;
+  else delete next.leases[run].startedEnvironments;
   const result = {
     ok: true,
     machines: chosen.map((m) => ({ label: m.label, environmentId: m.environmentId })),
