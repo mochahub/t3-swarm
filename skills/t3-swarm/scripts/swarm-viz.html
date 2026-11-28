@@ -120,6 +120,30 @@ button:focus-visible{outline:2px solid var(--work);outline-offset:1px}
 #minimap svg{width:100%;height:100%;display:block}
 #minimap .mm-mask{fill:color-mix(in srgb,var(--bg) 62%,transparent);fill-rule:evenodd}
 #err{left:50%;top:12px;transform:translateX(-50%);padding:8px 12px;color:var(--fail);border-color:var(--fail);font:12px var(--mono);display:none}
+body.ended .node.working .dot{animation:none;background:var(--done)}
+body.ended .node.working{border-color:var(--line)}
+#hud .pill.done{color:var(--done);border-color:color-mix(in srgb,var(--done) 45%,var(--line));cursor:pointer}
+#hud .pill.escalate{color:var(--wait);border-color:color-mix(in srgb,var(--wait) 45%,var(--line));cursor:pointer}
+#done-veil{position:absolute;inset:0;z-index:5;display:none;place-items:center;padding:24px;
+  background:color-mix(in srgb,var(--bg) 56%,transparent);backdrop-filter:blur(2px)}
+#done-veil.on{display:grid}
+#done-card{width:min(440px,100%);background:var(--panel);border:1px solid var(--panel-line);border-radius:12px;
+  padding:20px 22px;box-shadow:0 16px 48px rgba(0,0,0,.38);text-align:left}
+#done-card .badge{display:inline-flex;align-items:center;gap:7px;font:11px var(--mono);text-transform:uppercase;
+  letter-spacing:.05em;padding:3px 9px;border-radius:999px;border:1px solid color-mix(in srgb,var(--done) 45%,var(--line));color:var(--done)}
+#done-card .badge i{width:7px;height:7px;border-radius:50%;background:var(--done)}
+#done-card.escalate .badge{color:var(--wait);border-color:color-mix(in srgb,var(--wait) 45%,var(--line))}
+#done-card.escalate .badge i{background:var(--wait)}
+#done-card.neutral .badge{color:var(--mute);border-color:var(--line)}
+#done-card.neutral .badge i{background:var(--mute)}
+#done-card h2{margin:12px 0 6px;font-size:16px;font-weight:600;line-height:1.35}
+#done-card .goal{margin:0 0 12px;color:var(--mute);font-size:12.5px;line-height:1.45}
+#done-card .stats{font:11.5px/1.6 var(--mono);color:var(--fg);background:var(--card);border:1px solid var(--line);
+  border-radius:8px;padding:8px 10px;margin-bottom:12px}
+#done-card .note{font-size:11.5px;color:var(--faint);margin:0 0 14px}
+#done-card .actions{display:flex;gap:8px;flex-wrap:wrap}
+#done-card .actions button.primary{background:color-mix(in srgb,var(--done) 18%,var(--ctrl));border-color:color-mix(in srgb,var(--done) 45%,var(--ctrl-line))}
+#done-card .actions button.primary:hover{background:color-mix(in srgb,var(--done) 28%,var(--ctrl))}
 
 /* inspector */
 #inspector{position:fixed;top:0;right:0;bottom:0;width:380px;background:var(--panel);border-left:1px solid var(--panel-line);
@@ -158,6 +182,19 @@ body.inspecting #inspector{transform:none}
   </div>
   <div class="panel" id="minimap" title="Click to move the view"><svg id="mm"></svg></div>
   <div class="panel" id="err"></div>
+  <div id="done-veil" role="dialog" aria-modal="false" aria-labelledby="done-title">
+    <div id="done-card">
+      <div class="badge"><i></i><span id="done-badge">Swarm complete</span></div>
+      <h2 id="done-title">Swarm complete</h2>
+      <p class="goal" id="done-goal"></p>
+      <div class="stats" id="done-stats"></div>
+      <p class="note">Live viewer stopped · waiting for next swarm (auto-resumes on new run)</p>
+      <div class="actions">
+        <button id="done-inspect" class="primary" type="button">Inspect graph</button>
+        <button id="done-replay" type="button">▶ Replay</button>
+      </div>
+    </div>
+  </div>
 </div>
 <aside id="inspector" aria-label="Agent details"></aside>
 <script>
@@ -170,7 +207,7 @@ const FLY = new Set(Object.keys(COLORS).filter((k) => k !== "poll" && k !== "can
 const CARD_W = 248, CARD_H = 64, YOU_W = 64, YOU_H = 32, LESS_H = 30, COL_GAP = 76, ROW_GAP = 12, COLLAPSE_AT = 8;
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 
-const S = { meta: null, nodes: new Map(), events: [], lastSeq: -1, sel: null, replay: null, connected: false, expanded: new Set(), serverId: null, ended: false };
+const S = { meta: null, nodes: new Map(), events: [], lastSeq: -1, sel: null, replay: null, connected: false, expanded: new Set(), serverId: null, ended: false, endedAt: null, endDismissed: false };
 const V = { x: 0, y: 0, k: 1, user: false };
 const cards = new Map(), edges = new Map();
 let G = null, L = null, structKey = "";
@@ -217,7 +254,7 @@ function buildGraph() {
   for (const [p, cs] of [...kids]) {
     if (p === "you") continue;
     if (S.expanded.has(p)) { const id = `less:${p}`; groups.set(id, { id, less: true, parent: p }); cs.push(id); continue; }
-    const parentFinished = p !== root && !subtreeActive(p) && !subtreeSel(p);
+    const parentFinished = p !== root && (S.ended || (!subtreeActive(p) && !subtreeSel(p)));
     const fold = (pred, kind, label, minCount) => {
       const members = cs.filter(pred);
       if (members.length < minCount) return;
@@ -228,7 +265,7 @@ function buildGraph() {
     };
     // Finished subtrees (e.g. earlier completed Leads in the same thread) collapse all finished leaves into 1 compact pill.
     // Active parents keep working/waiting/failed cards expanded and collapse finished leaves once >= 2 are done.
-    fold((id) => byId.get(id)?.status === "done" && !kids.has(id) && id !== S.sel, "done", "finished", parentFinished ? 1 : 2);
+    fold((id) => (byId.get(id)?.status === "done" || (S.ended && byId.get(id)?.status === "working")) && !kids.has(id) && id !== S.sel, "done", "finished", parentFinished ? 1 : 2);
     fold((id) => id.startsWith("plan:"), "plan", "not started", parentFinished ? 1 : 3);
   }
   return { kids, plans: new Map(plans.map((g) => [g.id, g])), groups, alias };
@@ -316,14 +353,15 @@ function cardContent(id) {
   const pl = G.plans.get(id);
   if (pl) return { cls: "plan", name: `${pl.label} ${pl.desc}`, meta: [(pl.tier || ""), "not started"].filter(Boolean).join(" · "), act: pl.state };
   const n = S.nodes.get(id);
-  const r = n.run, live = r && (r.status === "running" || r.status === "starting");
+  const r = n.run, live = !S.ended && r && (r.status === "running" || r.status === "starting");
   const since = live ? dur(Date.now() - Date.parse(r.startedAt)) : "";
+  const shownStatus = S.ended && (n.status === "working" || n.status === "delegating") ? "done" : n.status;
   const calls = (n.commands || 0) + (n.toolCalls || 0);
   const nm = n.role === "worker" && n.ledgerLabel && !n.title.startsWith(n.ledgerLabel) ? n.ledgerLabel + " · " + n.title : n.title;
   const a = n.activity;
   return {
-    cls: n.status, role: n.role === "coordinator" ? "coord" : n.role === "lead" && n.stream ? "lead · " + n.stream : n.role, roleCls: n.role, name: nm, where: n.machine ? n.machine : n.remote ? "remote" : "",
-    meta: [modelShort(n.model) || n.provider, n.effort, n.status + (since ? " " + since : ""), calls ? calls + " calls" : ""].filter(Boolean).join(" · "),
+    cls: shownStatus, role: n.role === "coordinator" ? "coord" : n.role === "lead" && n.stream ? "lead · " + n.stream : n.role, roleCls: n.role, name: nm, where: n.machine ? n.machine : n.remote ? "remote" : "",
+    meta: [modelShort(n.model) || n.provider, n.effort, shownStatus + (since ? " " + since : ""), calls ? calls + " calls" : ""].filter(Boolean).join(" · "),
     actMark: a ? (a.kind === "cmd" ? "$ " : a.kind === "tool" ? "⚙ " : a.kind === "say" ? "“ " : "· ") : "", act: a ? a.text : n.remote ? "details live on " + (n.machine || "another machine") : "",
     far: n.role === "lead" && n.stream ? `${n.stream} lead` : n.role === "coordinator" ? "Coordinator" : "", // zoomed-out label
   };
@@ -418,7 +456,7 @@ function drawEdges() {
 function paintEdgeState() {
   for (const e of edges.values()) {
     const child = S.nodes.get(e.c);
-    const live = !S.replay && child && (child.status === "working" || child.status === "delegating" || child.status === "waiting");
+    const live = !S.replay && !S.ended && child && (child.status === "working" || child.status === "delegating" || child.status === "waiting");
     const cls = "edge" + (live ? " live" : "") + (S.sel && (S.sel === e.c || S.sel === e.p) ? " hl" : "") + (e.c.startsWith("plan:") || G.groups.get(e.c)?.kind === "plan" ? " plan" : "");
     if (e.cls !== cls) { e.cls = cls; e.path.setAttribute("class", cls); }
   }
@@ -620,21 +658,64 @@ function ping(id, color) {
 }
 
 // ------------------------------------------------------------ header panel
+function paintDoneOverlay() {
+  const veil = $("#done-veil"), card = $("#done-card");
+  document.body.classList.toggle("ended", S.ended);
+  if (!S.ended || S.endDismissed || !S.meta) { veil.classList.remove("on"); return; }
+  const m = S.meta, nodes = [...S.nodes.values()], root = S.nodes.get(m.root);
+  const st = (m.ledger?.status || "").toUpperCase();
+  const isComplete = st === "COMPLETE", isEsc = st === "ESCALATE";
+  card.className = isComplete ? "" : isEsc ? "escalate" : "neutral";
+  const label = isComplete ? "Swarm complete" : isEsc ? "Swarm escalated" : "Swarm ended";
+  setText($("#done-badge"), label);
+  setText($("#done-title"), root ? root.title : label);
+  const goalEl = $("#done-goal");
+  const goal = m.ledger?.goal || "";
+  goalEl.hidden = !goal;
+  setText(goalEl, goal);
+  const doneN = nodes.filter((n) => n.status === "done" || n.status === "working" || n.status === "delegating").length;
+  const failN = nodes.filter((n) => n.status === "failed").length;
+  const machines = new Set(nodes.map((n) => n.machine).filter(Boolean));
+  const firstAt = nodes.reduce((min, n) => (n.createdAt && (!min || n.createdAt < min) ? n.createdAt : min), "");
+  const endMs = S.endedAt ? Date.parse(S.endedAt) : Date.now();
+  const span = firstAt ? dur(endMs - Date.parse(firstAt)) : "";
+  setText($("#done-stats"), [
+    `${nodes.length} agents`,
+    `${doneN} done`,
+    failN && `${failN} failed`,
+    machines.size && `${machines.size + 1} machines`,
+    span && `duration ${span}`,
+    S.endedAt && `finished ${fmtHM(S.endedAt)}`,
+  ].filter(Boolean).join(" · "));
+  veil.classList.add("on");
+}
+$("#done-inspect").onclick = () => { S.endDismissed = true; paintDoneOverlay(); };
+$("#done-replay").onclick = () => { S.endDismissed = true; paintDoneOverlay(); $("#replay").click(); };
+$("#runstatus").onclick = () => { if (S.ended) { S.endDismissed = false; paintDoneOverlay(); } };
 function paintHud() {
   const m = S.meta, nodes = [...S.nodes.values()], root = S.nodes.get(m.root);
   setText($("#title"), root ? root.title : "Swarm");
-  document.title = (root ? root.title + " · " : "") + "Swarm Live";
-  setText($("#runstatus"), (m.ledger ? "ledger: " + (m.ledger.status || "?") : "no ledger") + (S.ended ? " · ended" : !S.connected ? " · reconnecting" : ""));
+  document.title = (root ? root.title + " · " : "") + (S.ended ? "Swarm Done" : "Swarm Live");
+  const pill = $("#runstatus");
+  const lst = (m.ledger?.status || "").toUpperCase();
+  const statusText = S.ended
+    ? (lst === "COMPLETE" ? "Swarm complete" : lst === "ESCALATE" ? "Swarm escalated" : "Swarm ended") + (S.endDismissed ? " · summary" : "")
+    : (m.ledger ? "ledger: " + (m.ledger.status || "?") : "no ledger") + (!S.connected ? " · reconnecting" : "");
+  setText(pill, statusText);
+  pill.className = "pill" + (S.ended ? (lst === "ESCALATE" ? " escalate" : " done") : "");
   const c = (s) => nodes.filter((n) => n.status === s).length;
   const machines = new Set(nodes.map((n) => n.machine).filter(Boolean));
-  setText($("#counts"), [`${nodes.length} agents`, `${c("working")} working`, `${c("done")} done`, c("failed") && `${c("failed")} failed`, c("waiting") && `${c("waiting")} need you`, m.pending?.length && `${m.pending.length} pending`, machines.size && `${machines.size + 1} machines`].filter(Boolean).join(" · "));
+  const workingN = S.ended ? 0 : c("working");
+  const doneN = S.ended ? nodes.filter((n) => n.status === "done" || n.status === "working" || n.status === "delegating").length : c("done");
+  setText($("#counts"), [`${nodes.length} agents`, workingN && `${workingN} working`, `${doneN} done`, c("failed") && `${c("failed")} failed`, !S.ended && c("waiting") && `${c("waiting")} need you`, !S.ended && m.pending?.length && `${m.pending.length} pending`, machines.size && `${machines.size + 1} machines`].filter(Boolean).join(" · "));
   let last = "";
   for (const n of nodes) for (const t of [n.activity?.ts, n.run?.startedAt, n.run?.completedAt]) if (t && t > last) last = t;
   const lastEv = S.events[S.events.length - 1]; if (lastEv?.ts > last) last = lastEv.ts;
-  setText($("#updated"), S.replay ? "replaying " + fmtHM(S.replay.iso) : last ? "Last update " + fmtHM(last) : "");
-  $("#live").classList.toggle("on", S.connected && !m.lastError);
+  setText($("#updated"), S.replay ? "replaying " + fmtHM(S.replay.iso) : S.ended && S.endedAt ? "Finished " + fmtHM(S.endedAt) : last ? "Last update " + fmtHM(last) : "");
+  $("#live").classList.toggle("on", S.connected && !S.ended && !m.lastError);
   $("#legend-peer").hidden = nodes.filter((n) => n.role === "lead").length < 2;
   const err = $("#err"); err.style.display = m.lastError ? "block" : "none"; setText(err, m.lastError || "");
+  paintDoneOverlay();
 }
 
 // ------------------------------------------------------------ inspector (tap a card)
@@ -665,13 +746,14 @@ function renderInspector() {
     return;
   }
   const n = S.nodes.get(S.sel); if (!n) { select(S.sel); return; }
-  if (detail.id === n.id && Date.now() - detail.at > 2000) loadDetail(n.id); // keep it live while open
+  if (!S.ended && detail.id === n.id && Date.now() - detail.at > 2000) loadDetail(n.id); // keep it live while open
   const d = detail.id === n.id ? detail.data : null;
   head.append(el("h3", null, (n.ledgerLabel && !n.title.startsWith(n.ledgerLabel) ? n.ledgerLabel + " · " : "") + n.title), close);
   const kvs = el("div", "kv");
   const kv = (k, v) => { if (!v) return; const r = el("div"); r.append(document.createTextNode(k + ": "), el("b", null, v)); kvs.append(r); };
   const r = n.run;
-  kv("status", n.status + (r?.status === "running" ? " for " + dur(Date.now() - Date.parse(r.startedAt)) : r?.completedAt ? " · finished " + fmtHM(r.completedAt) : ""));
+  const shownSt = S.ended && (n.status === "working" || n.status === "delegating") ? "done" : n.status;
+  kv("status", shownSt + (!S.ended && r?.status === "running" ? " for " + dur(Date.now() - Date.parse(r.startedAt)) : r?.completedAt ? " · finished " + fmtHM(r.completedAt) : S.ended && S.endedAt ? " · finished " + fmtHM(S.endedAt) : ""));
   kv("model", [n.provider, n.model, n.effort].filter(Boolean).join(" · ")); kv("machine", n.machine || (n.remote ? "another machine" : "this machine"));
   kv("role", n.role); kv("tier", n.tier); kv("ledger", n.ledgerState); kv("calls", (n.commands || 0) + " commands · " + (n.toolCalls || 0) + " tool calls");
   const parts = [head, kvs];
@@ -727,6 +809,9 @@ function resetForNewRun() {
   $("#labels").replaceChildren();
   $("#fx").replaceChildren();
   L = null; structKey = ""; V.user = false;
+  S.ended = false; S.endedAt = null; S.endDismissed = false;
+  document.body.classList.remove("ended");
+  $("#done-veil").classList.remove("on");
 }
 function isDifferentRun(meta) {
   if (!S.meta || !meta) return false;
@@ -738,13 +823,13 @@ function isDifferentRun(meta) {
 function applyInit(d) {
   const switched = isDifferentRun(d.meta);
   if (switched) resetForNewRun();
-  S.meta = d.meta; S.serverId = d.meta?.serverId || null; S.ended = false;
+  S.meta = d.meta; S.serverId = d.meta?.serverId || null; S.ended = false; S.endedAt = null; S.endDismissed = false;
   S.nodes = new Map(d.nodes.map((n) => [n.id, n]));
   S.events = d.events.slice().sort((a, b) => a.seq - b.seq); S.lastSeq = S.events.length ? S.events[S.events.length - 1].seq : -1;
   S.connected = true; refresh(switched);
 }
 function applyTick(d) {
-  S.meta = d.meta; S.serverId = d.meta?.serverId || S.serverId; S.connected = true; S.ended = false;
+  S.meta = d.meta; S.serverId = d.meta?.serverId || S.serverId; S.connected = true; S.ended = false; S.endedAt = null; S.endDismissed = false;
   for (const u of d.upserts || []) S.nodes.set(u.id, u);
   for (const id of d.removed || []) S.nodes.delete(id);
   refresh(false);
@@ -790,10 +875,14 @@ function connect() {
         got = true; clearTimeout(fallback);
         applyTick(JSON.parse(m.data));
       });
-      s.addEventListener("ended", () => {
+      s.addEventListener("ended", (m) => {
         if (es !== s) return;
         clearTimeout(fallback);
-        S.connected = false; S.ended = true; if (S.meta) paintHud();
+        let payload = null;
+        try { payload = m.data ? JSON.parse(m.data) : null; } catch {}
+        S.connected = false; S.ended = true; S.endedAt = payload?.endedAt || new Date().toISOString(); S.endDismissed = false;
+        if (payload?.ledger && S.meta) S.meta = { ...S.meta, ledger: payload.ledger };
+        if (S.meta) refresh(true);
         closeEs();
         scheduleReconnect(1500);
       });
@@ -817,5 +906,5 @@ function connect() {
 }
 applyView();
 if (window.__INIT) applyInit(window.__INIT); else connect();
-setInterval(() => { if (!S.meta || S.replay) return; for (const [id, c] of cards) if (c.cls.includes("working")) paintCard(id, c); paintHud(); if (S.sel) renderInspector(); }, 1000);
+setInterval(() => { if (!S.meta || S.replay || S.ended) return; for (const [id, c] of cards) if (c.cls.includes("working")) paintCard(id, c); paintHud(); if (S.sel) renderInspector(); }, 1000);
 </script></body></html>

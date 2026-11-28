@@ -443,9 +443,12 @@ function claimsFrom(posts) {
 // ledger is found by an agent's thread or task id in it: the Workstreams rows hold each Lead's thread.
 let ledgerId = RUN ? path.basename(RUN) : null, ledgerScanAt = 0;
 function findLedgerFile() {
-  const leads = [...nodes.values()].filter((n) => n.branch?.startsWith("swarm/"));
-  const fromBranch = leads.length ? parseSwarmBranch(leads[0].branch).runId : null;
-  if (fromBranch) ledgerId = fromBranch;
+  if (!RUN) {
+    const leads = [...nodes.values()].filter((n) => n.branch?.startsWith("swarm/"))
+      .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+    const fromBranch = leads.length ? parseSwarmBranch(leads[0].branch).runId : null;
+    if (fromBranch) ledgerId = fromBranch;
+  }
   const inDir = (id) => [RUNS_DIR, ARCHIVE_DIR].map((d) => path.join(d, id + ".md")).find((f) => fs.existsSync(f)) ?? null;
   if (ledgerId) return inDir(ledgerId);
   if (Date.now() - ledgerScanAt < 10_000) return null;
@@ -787,8 +790,12 @@ function shutdown() {
     const d = v2Diff();
     broadcast(v2clients, "tick", { meta: meta(), ...d, events: fresh });
   } catch {}
-  broadcast(clients, "ended", { serverId: SERVER_ID, run: RUN });
-  broadcast(v2clients, "ended", { serverId: SERVER_ID, run: RUN });
+  const endedPayload = {
+    serverId: SERVER_ID, run: RUN, endedAt: new Date().toISOString(),
+    ledger: ledger && { runId: ledger.runId, status: ledger.status, goal: ledger.goal },
+  };
+  broadcast(clients, "ended", endedPayload);
+  broadcast(v2clients, "ended", endedPayload);
   for (const res of [...clients, ...v2clients]) { try { res.end(); } catch {} }
   clients.clear(); v2clients.clear();
   try { server.close(); } catch {}
