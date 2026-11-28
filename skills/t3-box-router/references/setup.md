@@ -10,6 +10,8 @@ For the Coordinator or a standalone top-level agent, with the user. Workers and 
 - `state.json`: written only by the CLI (slots, leases, cooldowns, cached observations). Never edit it. If it
   stops parsing, the CLI moves it to `state.json.corrupt.<ms>` once and starts empty.
 - Use one router home per Coordinator machine. Install the skill on orchestrating machines only; boxes don't need it.
+- `defaults.slotTtlMinutes` (180) is when a slot stops counting toward capacity. A task that runs longer is no
+  longer counted, so raise it if typical tasks run longer than that.
 
 ## 1. Discover
 
@@ -66,7 +68,9 @@ array on stdin to `box-router observe`, one record per call, with every page of 
 
 The router keeps only link status, access, expiry and a short error; providers where `canRunChildTask` is true;
 and the canonical repo key to project ID map. Link facts are fresh for 15 minutes, provider and project facts for
-24 hours. If a T3 read fails, say so to the caller as missing evidence. Don't invent a reply.
+24 hours. With the T3 CLI installed (observed on v0.1.x), the router reads links itself through
+`t3 environment list --json`; the CLI has no project list, so provider and project facts always come from these
+agent reads. If a T3 read fails, say so to the caller as missing evidence. Don't invent a reply.
 
 ## Bring-up hook
 
@@ -77,7 +81,8 @@ service), set `machines.<label>.bringUp`:
 "bringUp": { "command": ["/Users/you/bin/start-home-box", "home-box"], "timeoutMs": 300000 }
 ```
 
-- **When it runs:** only during `acquire`, only for a selected box that is not ready. Never during `place`.
+- **When it runs:** only during `acquire`, only for a selected box that fresh evidence shows is unreachable or
+  unlinked. Never during `place`, and never just because facts are missing (observe first).
 - **Bounded:** `command` is an argument vector of strings, absolute path first, run without a shell. `timeoutMs`
   is required; the process is stopped when it runs out. It comes from user config only, never from a repo file.
 - **Idle check is the user's:** if the script can restart T3 or anything a running task depends on, the script

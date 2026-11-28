@@ -58,17 +58,17 @@ work local regardless of priority.
 ## Standalone recipe
 
 ```sh
-R="node ~/.claude/skills/t3-box-router/scripts/box-router.mjs"
+box_router() { node "$HOME/.claude/skills/t3-box-router/scripts/box-router.mjs" "$@"; }
 git push -u origin feature/base
-$R place --needs linux --provider claudeAgent --base feature/base --branch feature/worker-1
-# ok:false + needsObservation → make the listed T3 reads, pipe them to `$R observe`, place again
+box_router place --needs linux --provider claudeAgent --base feature/base --branch feature/worker-1
+# ok:false + needsObservation → make the listed T3 reads, pipe them to `box_router observe`, place again
 ```
 
 Then call `delegate_task` with `target` = your provider plus the placement's `environmentId` and `projectId`, no
 `isolation`, and the full task with `briefAddendum` appended. When it returns:
 
 ```sh
-$R done --slot <slotId> --outcome ok        # failed: task problem; unreachable: machine lost
+box_router done --slot <slotId> --outcome ok   # failed: task problem; unreachable: machine lost
 git fetch origin feature/worker-1
 ```
 
@@ -92,8 +92,8 @@ The full sequence is in [swarm.md](../../skills/t3-box-router/references/swarm.m
 ## Bring-up hook
 
 If a box sometimes needs starting, point `machines.<label>.bringUp` at your own script: an argument vector run
-without a shell, with a required `timeoutMs`. It runs only during `acquire`, only for a selected box that isn't
-ready, and never while the router holds a slot there. If your script can restart T3 on the box, it must check that
+without a shell, with a required `timeoutMs`. It runs only during `acquire`, only for a selected box that fresh
+evidence shows is unreachable or unlinked (never just to fill a cold cache), and never while the router holds a slot there. If your script can restart T3 on the box, it must check that
 the box is idle itself and exit nonzero when it isn't: an expired slot is not proof of idleness. After it succeeds
 the router re-observes the box before leasing it. Details:
 [setup.md](../../skills/t3-box-router/references/setup.md#bring-up-hook).
