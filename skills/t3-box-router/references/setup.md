@@ -108,17 +108,12 @@ Set `machines.<label>.bringUp` to an argument vector: an absolute path to an exe
   `requireIdleCheck`, `note`. Environment: `T3_BOXES_HOOK=bringUp`, `T3_BOXES_IDLE_CHECK=required`, `T3_BOXES_LABEL`.
 - **Idle check.** Before restarting anything, the hook must check for active work and exit `75` if the box is busy
   (`refused-busy`; nothing is expired). The router's own slot check covers only tasks placed through this installation.
-- **Output.** Stdout and stderr are discarded. Nothing the hook prints reaches results or state.
-- **Result file (ownership).** `T3_BOXES_RESULT_FILE` names a file in a private 0700 directory. After the hook exits the
-  router reads at most 4096 bytes and keeps only the boolean. Write one of these forms:
-  - `STARTED <label> yes` or `STARTED <label> no` (one or more identical lines; other lines are ignored);
-  - `{"started": true}` or `{"started": false}`, optionally with `"label": "<label>"`, as the whole file.
-
-  Only `yes` makes the box owned by this run (`startedByRouter`). Missing, cut short, malformed, mixed or naming another
-  label means **not owned**, and an unowned box is never torn down.
-- **Stdout marker: not read yet.** A `STARTED` line or JSON object on stdout is ignored, because the runner discards
-  stdout. Stdout support is underway. Until it lands, a hook that only prints the marker gets no ownership: write the
-  result file.
+- **Start confirmation.** On successful exit, the hook may report ownership on stdout or in the private file
+  named by `T3_BOXES_RESULT_FILE`. Emit `STARTED <label> yes` when this invocation started the machine, or
+  `STARTED <label> no` when it was already running. A complete JSON object such as `{"started":true}` is also
+  accepted, with an optional matching `label`. The router retains only the boolean and discards stderr.
+  Each channel has a 4 KiB limit. Conflicting, truncated or malformed confirmations leave ownership unconfirmed.
+  Redirect a background service's stdout to its own log so it can keep writing after the hook exits.
 - **Outcomes.** `acquire` reports each attempt in its `bringUp` array: `up` (exit 0), `failed`, `timeout`,
   `refused-busy`, `in-progress`, `recent` or `skipped`, each with `detail`. `list` shows a running hook and when a retry
   is allowed; `doctor` checks that each hook is executable.
@@ -131,8 +126,7 @@ Set `machines.<label>.bringUp` to an argument vector: an absolute path to an exe
 (no shell, own process group, bounded by `hookTimeoutMs`, output discarded). `tearDown` needs kind `on-demand` or
 `ephemeral`. `keepAlive`, `handoff` and `fetch` work on any kind.
 
-**Ownership.** A run owns a box only when that run's `acquire` leased it right after a `bringUp` exited 0 and wrote
-`started: yes` to the result file. The lease records it as `startedByRouter`.
+**Ownership.** A run owns a box only when that run's `acquire` leased it right after a `bringUp` exited 0 and confirmed that it started the machine. The lease records it as `startedByRouter`.
 
 **Teardown.** `release --run <id>` runs `tearDown` only when all of these hold:
 

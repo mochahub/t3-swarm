@@ -240,9 +240,8 @@ test("an invalid or foreign stored profile is ignored with a warning that does n
   assert.ok(!JSON.stringify(w).includes(CANARY));
 });
 
-test("the example config validates as before: no new warnings, same tags and capacity", () => {
+test("the documented example validates with its explicit tags, capacity and probe TTL", () => {
   const example = JSON.parse(fs.readFileSync(path.join(root, "skills/t3-box-router/references/config.example.json"), "utf8"));
-  example.machines["home-box"].environmentId = "env-home"; // the file holds a placeholder
   const v = validateConfig(example);
   assert.equal(v.ok, true, v.errors.join("; "));
   assert.deepEqual(v.warnings, []);
@@ -253,7 +252,7 @@ test("the example config validates as before: no new warnings, same tags and cap
   assert.equal(box.profile, undefined);
   assert.equal(v.config.local.maxConcurrent, 4);
   assert.equal(v.config.local.priority, 0);
-  assert.equal(v.config.defaults.probeTtlDays, undefined);
+  assert.equal(v.config.defaults.probeTtlDays, 7);
 });
 
 // ---------------------------------------------------------------------------------------------------------------
