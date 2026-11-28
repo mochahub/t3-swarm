@@ -57,7 +57,12 @@ export const DEFAULTS = Object.freeze({
  * these keys only when the user sets them.
  */
 export const BRINGUP_LIMITS = Object.freeze({ minTimeoutMs: 1000, maxTimeoutMs: 600_000, defaultTimeoutMs: 120_000, defaultRetryMinutes: 10 });
-const BRINGUP_DEFAULT_KEYS = ["bringUpTimeoutMs", "bringUpRetryMinutes"];
+const BRINGUP_DEFAULT_KEYS = ["bringUpTimeoutMs", "bringUpRetryMinutes", "hookTimeoutMs"];
+
+/** Machine kinds. always-on is never stopped by the router; on-demand and ephemeral may be, with a tearDown hook. */
+export const MACHINE_KINDS = Object.freeze(["always-on", "on-demand", "ephemeral"]);
+/** Lifecycle hooks besides bringUp, each an argument vector like bringUp. */
+export const LIFECYCLE_HOOKS = Object.freeze(["tearDown", "keepAlive", "handoff", "fetch"]);
 
 export const LOCAL_DEFAULTS = Object.freeze({ priority: 0, weight: 1, maxConcurrent: 4 });
 export const MACHINE_DEFAULTS = Object.freeze({ kind: "always-on", priority: 10, weight: 1, maxConcurrent: 2, worktreeRoot: "~/work", renew: "manual" });
@@ -139,6 +144,7 @@ const KNOWN_LOCAL = new Set(["tags", "deviceHostId", "priority", "weight", "maxC
 const KNOWN_MACHINE = new Set([
   "kind", "environmentId", "url", "ssh", "tags", "deviceHostId", "priority", "weight", "maxConcurrent", "exclusive",
   "worktreeRoot", "renew", "bringUp", "bringUpTimeoutMs", "checks", "profile", "extraTags", "denyTags",
+  ...LIFECYCLE_HOOKS, "hookTimeoutMs",
 ]);
 const KNOWN_REPO = new Set(["needs", "prefers", "deny", "pin", "priority", "maxConcurrent", "worktreeCommand", "allowWorktreeScripts"]);
 
@@ -274,6 +280,9 @@ export function validateConfig(raw) {
     if (d.bringUpTimeoutMs !== undefined) {
       config.defaults.bringUpTimeoutMs = checkTimeoutMs(d.bringUpTimeoutMs, "config.defaults.bringUpTimeoutMs", errors);
     }
+    if (d.hookTimeoutMs !== undefined) {
+      config.defaults.hookTimeoutMs = checkTimeoutMs(d.hookTimeoutMs, "config.defaults.hookTimeoutMs", errors);
+    }
     if (d.bringUpRetryMinutes !== undefined) {
       config.defaults.bringUpRetryMinutes = checkNumber(d.bringUpRetryMinutes, "config.defaults.bringUpRetryMinutes", errors, {
         fallback: BRINGUP_LIMITS.defaultRetryMinutes, positive: true,
@@ -340,9 +349,8 @@ export function validateConfig(raw) {
     warnUnknown(m, KNOWN_MACHINE, where, warnings);
     const entry = {};
     const kind = m.kind === undefined ? MACHINE_DEFAULTS.kind : m.kind;
-    if (kind === "ephemeral") errors.push(`${where}.kind ephemeral is a Phase 4 sketch and is not supported.`);
-    else if (kind !== "always-on") errors.push(`${where}.kind must be "always-on".`);
-    entry.kind = "always-on";
+    if (!MACHINE_KINDS.includes(kind)) errors.push(`${where}.kind must be one of ${MACHINE_KINDS.map((k) => `"${k}"`).join(", ")}.`);
+    entry.kind = MACHINE_KINDS.includes(kind) ? kind : MACHINE_DEFAULTS.kind;
     if (typeof m.environmentId !== "string" || !ID_PATTERN.test(m.environmentId)) {
       errors.push(`${where}.environmentId is required and must be a T3 environment ID.`);
     } else {
@@ -389,6 +397,22 @@ export function validateConfig(raw) {
     if (m.bringUpTimeoutMs !== undefined) {
       entry.bringUpTimeoutMs = checkTimeoutMs(m.bringUpTimeoutMs, `${where}.bringUpTimeoutMs`, errors);
       if (m.bringUp === undefined) warnings.push(`${where}.bringUpTimeoutMs has no bringUp hook to bound.`);
+    }
+    for (const hook of LIFECYCLE_HOOKS) {
+      if (m[hook] === undefined) continue;
+      const problem = bringUpArgvProblem(m[hook]);
+      if (problem) errors.push(`${where}.${problem.replaceAll("bringUp", hook)}`);
+      else entry[hook] = m[hook].slice();
+    }
+    if (m.tearDown !== undefined && entry.kind === "always-on") {
+      errors.push(`${where}.tearDown needs kind "on-demand" or "ephemeral": the router never stops an always-on box.`);
+    }
+    if (m.hookTimeoutMs !== undefined) {
+      entry.hookTimeoutMs = checkTimeoutMs(m.hookTimeoutMs, `${where}.hookTimeoutMs`, errors);
+      if (!LIFECYCLE_HOOKS.some((h) => m[h] !== undefined)) warnings.push(`${where}.hookTimeoutMs has no tearDown, keepAlive, handoff or fetch hook to bound.`);
+    }
+    if (entry.kind === "on-demand" && m.bringUp === undefined) {
+      warnings.push(`${where} is on-demand without a bringUp hook; the router cannot start it.`);
     }
     for (const f of PHASE2_MACHINE_FIELDS) {
       if (m[f] === undefined) continue;
@@ -644,6 +668,7 @@ export function normalizeState(raw) {
   const state = emptyState();
   for (const k of ["observations", "health", "leases", "slots"]) state[k] = isObj(raw[k]) ? raw[k] : {};
   if (isObj(raw.bringUp)) state.bringUp = raw.bringUp;
+  if (isObj(raw.lifecycle)) state.lifecycle = raw.lifecycle;
   if (isObj(raw.credits)) state.credits = raw.credits;
   if (isObj(raw.affinity)) state.affinity = raw.affinity;
   if (isObj(raw.discovered)) state.discovered = raw.discovered;
@@ -662,6 +687,8 @@ const ENVELOPE_KINDS = ["link", "probe", "providers", "projects"];
  *   - leases: expired; held labels filtered to configured machines.
  *   - bringUp: entries for unconfigured labels, and finished attempts older than the retry window. An unfinished
  *     claim is never dropped here: the router finalizes it (and expires that box's facts) once its deadline passes.
+ *     A finished bringUp that confirmed it started the box, not yet adopted by a lease, is kept for leaseTtlHours.
+ *   - lifecycle.keepAlive: running keep-alive claims past their deadline or on unconfigured labels.
  *   - affinity (Phase 2): expired or unknown label. credits (Phase 2): unknown label.
  */
 export function pruneState(config, state, now) {
@@ -717,11 +744,28 @@ export function pruneState(config, state, now) {
     for (const label of Object.keys(state.bringUp)) {
       const b = state.bringUp[label];
       const finished = isObj(b) && b.finishedAt != null;
-      if (!hasOwn(machines, label) || !isObj(b) || (finished && !(parseTime(b.finishedAt) + retryMs > now))) {
+      // A start the hook confirmed and no lease has adopted yet is kept for the lease TTL, so the acquire that
+      // follows the fact refresh can still record it as this run's. Losing it is safe: no ownership, no teardown.
+      const keepMs = finished && b.started === true && !b.adoptedAt ? Math.max(retryMs, (Number(config?.defaults?.leaseTtlHours) || DEFAULTS.leaseTtlHours) * 3_600_000) : retryMs;
+      if (!hasOwn(machines, label) || !isObj(b) || (finished && !(parseTime(b.finishedAt) + keepMs > now))) {
         delete state.bringUp[label];
         changed = true;
       }
     }
+  }
+  if (isObj(state.lifecycle)) {
+    // keepAlive: running keep-alive hooks, one per box, dropped at their deadline or when the box leaves config.
+    const ka = isObj(state.lifecycle.keepAlive) ? state.lifecycle.keepAlive : {};
+    for (const label of Object.keys(ka)) {
+      if (!hasOwn(machines, label) || !isObj(ka[label]) || expired(ka[label].deadline)) {
+        delete ka[label];
+        changed = true;
+      }
+    }
+    if (!Object.keys(ka).length) {
+      delete state.lifecycle;
+      changed = true;
+    } else state.lifecycle = { ...state.lifecycle, keepAlive: ka };
   }
   if (state.affinity) {
     for (const repo of Object.keys(state.affinity)) {
