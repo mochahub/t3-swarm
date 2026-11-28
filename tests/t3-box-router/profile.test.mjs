@@ -338,6 +338,16 @@ test("unprofiledBoxes lists new, unprofiled and stale linked boxes and skips the
   assert.deepEqual(later, []);
 });
 
+test("new links get unique usable labels and expired links are skipped", () => {
+  const config = { machines: { BUILD: { environmentId: "original" } } };
+  const links = ["local", "build", "build", "gone"].map((label, i) => ({
+    environmentId: "env-" + i, label, status: i === 3 ? "expired" : "reachable",
+  }));
+  const state = recordDiscovered(emptyState(), discoveryEnvelope("agent", links, NOW, 60_000));
+  const boxes = unprofiledBoxes({ config, state, now: NOW, proposeLabel });
+  assert.deepEqual(boxes.map((b) => b.label), ["build-2", "build-3", "local-2"]);
+});
+
 test("the discovered cache survives state normalization and is pruned when stale", () => {
   const env = discoveryEnvelope("agent", [{ environmentId: "env-1", label: "a", status: "reachable", urls: [] }], NOW, 60_000);
   const s = normalizeState({ ...emptyState(), discovered: env });

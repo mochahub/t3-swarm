@@ -375,7 +375,7 @@ export function unprofiledBoxes({ config, state, now, proposeLabel = (l, id) => 
   for (const [label, m] of Object.entries(machines)) if (isObj(m) && m.environmentId) byEnv.set(m.environmentId, label);
   const seen = new Map();
   const consider = (environmentId, t3Label, status, urls) => {
-    if (status === "revoked") return;
+    if (["expired", "missing", "removed", "revoked", "unlinked"].includes(status)) return;
     const prev = seen.get(environmentId);
     if (prev) {
       for (const u of urls) if (!prev.urls.includes(u) && prev.urls.length < LIMITS.urls) prev.urls.push(u);
@@ -411,6 +411,17 @@ export function unprofiledBoxes({ config, state, now, proposeLabel = (l, id) => 
     if (!isObj(obs) || obs.environmentId !== m?.environmentId || !isObj(link) || !(parseTime(link.validUntil) > now)) continue;
     if (!isObj(link.value)) continue; // a complete read found no link: unlinked, nothing to probe
     consider(m.environmentId, label, link.value.status, []);
+  }
+  // Two links may advertise the same display name. Every suggested label must work with apply-probe.
+  const taken = new Set(["local", "box", ...Object.keys(machines).map((label) => label.toLowerCase())]);
+  for (const box of [...seen.values()].sort((a, b) => a.environmentId.localeCompare(b.environmentId))) {
+    if (box.reason !== "new") continue;
+    const base = box.label;
+    for (let n = 2; taken.has(box.label.toLowerCase()); n++) {
+      const suffix = `-${n}`;
+      box.label = base.slice(0, 64 - suffix.length) + suffix;
+    }
+    taken.add(box.label.toLowerCase());
   }
   return [...seen.values()].sort((a, b) => (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
 }
