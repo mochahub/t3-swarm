@@ -417,3 +417,14 @@ test("proposeLabel produces valid labels", () => {
   assert.equal(proposeLabel(null, "e9"), "box-e9");
   assert.equal(proposeLabel("x".repeat(100), "e").length, 64);
 });
+
+test("raw MCP pages yield the same observations as their structured payloads", () => {
+  const records = specRecords();
+  const wrapped = records.map(record => ({
+    ...record, pages: record.pages.map(page => ({ structuredContent: page, content: [] })),
+  }));
+  const accept = input => applyObservations(config(), emptyState(), input, NOW);
+  assert.deepEqual(accept(wrapped), accept(records));
+  wrapped[0].pages[0].isError = true;
+  assert.throws(() => accept(wrapped), /T3 reported an error/);
+});

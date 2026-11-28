@@ -136,9 +136,12 @@ function readRecord(rec, index) {
   if (!OBSERVABLE_TOOLS.includes(tool)) fail(index, null, `tool must be one of ${OBSERVABLE_TOOLS.join(", ")}.`);
   const args = rec.args === undefined ? {} : rec.args;
   if (!isObj(args)) fail(index, tool, "args must be an object.");
-  const pages = rec.pages;
-  if (!Array.isArray(pages) || pages.length === 0) fail(index, tool, "pages must be a non-empty array of raw replies.");
-  if (pages.length > LIMITS.pages) fail(index, tool, `has more than ${LIMITS.pages} pages.`);
+  if (!Array.isArray(rec.pages) || rec.pages.length === 0) fail(index, tool, "pages must be a non-empty array of raw replies.");
+  if (rec.pages.length > LIMITS.pages) fail(index, tool, `has more than ${LIMITS.pages} pages.`);
+  const pages = rec.pages.map((reply, p) => {
+    if (reply?.isError) fail(index, tool, `T3 reported an error on page ${p}.`);
+    return reply?.structuredContent ?? reply;
+  });
   let environmentId;
   if (args.environmentId !== undefined) {
     if (typeof args.environmentId !== "string" || !ID_PATTERN.test(args.environmentId)) fail(index, tool, "args.environmentId is invalid.");
