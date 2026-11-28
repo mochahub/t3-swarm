@@ -15,32 +15,61 @@ A **profile** records a machine's hardware and toolchain in `config.json` (`mach
 ]
 ```
 
-| `reason` | Meaning | Action |
-| --- | --- | --- |
-| `new` | Linked in T3 but not in config. `label` is a proposed router label. | Ask the user whether to add it; if yes, probe and apply with `--environment-id`. |
-| `unprofiled` | Configured, never probed. | Probe and apply when convenient. |
-| `stale` | Profile older than `defaults.probeTtlDays` (default 7), or probed on another environment. | Probe again and apply. |
+| `reason` | Meaning |
+| --- | --- |
+| `new` | Linked in T3 but not in config. `label` is a proposed router label. |
+| `unprofiled` | Configured, never probed. |
+| `stale` | Profile older than `defaults.probeTtlDays` (default 7), or probed on another environment. |
 
-The list is information only. It never blocks a placement, never changes `ok` and never asks for an observation.
-Ready machines keep being placed while a box waits for its probe.
+The list is information only. It never blocks a placement, never changes `ok` and never asks for an observation. Ready
+machines keep being placed while a box waits for its probe. `profile: false` on a machine opts it out.
 
 Where the router learns about links:
 
-- **t3 CLI on `PATH`:** every routing command reads `t3 environment list --json` when the discovered-links cache is
-  older than `linkTtlMinutes` (15).
-- **No CLI:** send a `t3_environment_links` record to `observe`, exactly as for `needsObservation`
-  ([setup.md](setup.md#observation-records)). Links for unconfigured environments are kept in `state.json` (label,
-  status and credential-free URL origins only) until the cache expires.
+- **t3 CLI on `PATH`:** routing commands read `t3 environment list --json` when the discovered-links cache is older than
+  `linkTtlMinutes` (15).
+- **No CLI:** send a `t3_environment_links` record to `observe`, as for `needsObservation`
+  ([setup.md](setup.md#observation-records)). Links for unconfigured environments are kept in `state.json` (label, status
+  and credential-free URL origins only) until the cache expires.
 
-Revoked links are skipped: they need relinking, not probing. To stop a configured machine from being listed, set
-`"profile": false` on it.
+Revoked links are skipped: they need relinking, not probing.
 
-## Probe a box
+## Automatic probe flow (Coordinator)
 
-The probe is `scripts/probe.mjs` in this skill. It is self-contained (Node 18+, built-in modules only), so it
-can run on a box that doesn't have the skill installed.
+The Coordinator runs this in the normal flow, never as a separate setup step. It does not wait for the probe.
 
-It is read-only. It reads:
+1. **Trigger.** Whenever `place`, `acquire` or `list` returns a non-empty `unprofiledBoxes`, take each entry whose
+   `reason` is `new`, `unprofiled` or `stale`.
+2. **Dedupe.** Start at most one probe per `environmentId` at a time. Once a profile is applied its `probedAt` is fresh
+   for `defaults.probeTtlDays` and the box leaves the list, so it is not probed again inside that window. The router
+   does not record in-flight or failed attempts; keep that in the Coordinator's own notes for the session. A failed
+   probe is retried only after the window has passed since the attempt.
+3. **Dispatch.** `delegate_task` to the cheapest fast provider that can run child tasks on that environment (from
+   `orchestrator_capabilities` for that `environmentId`), with `target` = that provider plus the `environmentId` (and a
+   `projectId` if T3 requires one for the target; the probe reads no repository). No `isolation`. The task is read-only:
+   paste the full source of `scripts/probe.mjs`, have the child save it outside any repo, run `node <file>`, delete the
+   file, and reply with the JSON exactly as printed. Include `--attest` lines only if the owner declared them (see
+   below). Nothing else.
+4. **Continue.** Carry on with placements and other work while the probe runs. Follow the task's `next`; do not poll it.
+5. **Register.** When the reply arrives, save it as `probe.json` and apply it straight away, with no owner step:
+   - configured machine: `box-router apply-probe <label> < probe.json`;
+   - new box: `box-router apply-probe <label> --environment-id <environmentId> < probe.json`, using the `label` and
+     `environmentId` from `unprofiledBoxes`.
+
+   The probe fills tags, `maxConcurrent` and `priority` only where the config leaves them unset (see below). Check the
+   result's `effective` values and run `box-router doctor` if anything looks off.
+6. **Failures.** A reply that is not one valid probe report is rejected by `apply-probe` and nothing is written. Report
+   the error for that label and leave the box unprofiled for now; the next run picks it up again.
+
+Push access is still not checked by the router. If a new box needs it, `setup.md` covers it.
+
+## Probe a box locally
+
+1. **This machine:** `box-router probe | box-router apply-probe local`.
+2. **Any other machine by hand:** the same steps as in the Coordinator flow above.
+
+The probe is `scripts/probe.mjs` in this skill. It is self-contained (Node 18+, built-in modules only), so it can run on a
+box without the skill installed. It is read-only. It reads:
 
 - the OS, the architecture, the CPU count and the total memory;
 - whether specific files exist;
@@ -48,45 +77,27 @@ It is read-only. It reads:
 - a fixed list of environment variables (`PATH`, `PATHEXT`, `HOME`, `DISPLAY`, `WAYLAND_DISPLAY`, `ANDROID_HOME`,
   `ANDROID_SDK_ROOT`, `DEVELOPER_DIR`).
 
-It runs no programs, makes no network requests and writes nothing. It never looks for credentials, environment
-files, key stores or sign-ins.
+It runs no programs, makes no network requests and writes nothing. It never looks for credentials, environment files,
+key stores or sign-ins.
 
-1. **This machine:** `box-router probe | box-router apply-probe local`.
-2. **A box:** delegate a read-only task to the box's environment. Paste the full source of `scripts/probe.mjs`
-   into the task. The task asks the child to:
-   - save the source to a temporary file outside any repo;
-   - run `node <file>`;
-   - delete the file;
-   - reply with the JSON exactly as printed, and do nothing else.
+## Owner attestations (cred: and secret: only)
 
-   Do not ask the child to install anything or change the box. Save the reply as `probe.json`.
-3. **Apply it:**
-   - Configured machine: `box-router apply-probe <label> < probe.json`.
-   - New box, after the user agrees to add it: `box-router apply-probe <label> --environment-id <environmentId> < probe.json`.
-     Use the `label` and `environmentId` from `unprofiledBoxes` unless the user picks another label. Then confirm
-     priority, capacity and push access with the user, as for any new machine ([setup.md](setup.md#1-discover)),
-     and run `box-router doctor`.
-
-## Credentials: attestations only
-
-The probe never detects credentials. When the owner says a credential is present on the machine, pass it as an
-attestation. Names are lowercase `cred:<name>` or `secret:<name>`, and values are exactly `true` or `false`:
+The probe never detects credentials. Only `cred:<name>` and `secret:<name>` tags come from the owner, as attestations
+with a value that is exactly `true` or `false`. Pass them only when the owner says so, never by inspecting a machine:
 
 ```sh
 node probe.mjs --attest secret:build-signing=true --attest cred:play-store=false
 ```
 
-Attestations are opt-in. Add them only when the owner declares them, never by inspecting the machine. Only a
-`true` attestation becomes a tag. If any attestation is malformed, or any value is not strictly `true` or `false`,
-the whole report is rejected. Error messages name only the field (`attestations`) and never repeat the input.
-Never put a secret's value in an attestation, a task or a reply.
+Other tags are never attested. If any attestation is malformed, the whole report is rejected. Error messages name only the
+field and never repeat the input. Never put a secret's value in an attestation, a task or a reply.
 
 ## What apply-probe does
 
-`apply-probe` reads the report on stdin and validates every field. It drops unknown fields and reports how many it
-dropped as `ignoredFields`. If a field has the wrong type or range, it rejects the report and names only the field.
+`apply-probe` reads the report on stdin and validates every field. It drops unknown fields and reports how many as
+`ignoredFields`. A field with the wrong type or range rejects the report, naming only the field.
 
-It then takes the router's state lock and does the following, all under that one lock:
+It then takes the router's state lock and, in that lock:
 
 1. Re-reads `config.json` as the user wrote it.
 2. Replaces only the target's `profile` (adding the machine entry for a new box).

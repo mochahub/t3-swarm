@@ -84,7 +84,12 @@ box-router release --run "$run_id"
 ```
 
 Keep `run_id` from `init`: after `finish` the branch no longer resolves to a run. `release` is idempotent and
-applies even when swarm never got a snapshot. Always-on boxes come back in `kept`; nothing is stopped.
+applies even when swarm never got a snapshot. Always-on boxes come back in `kept`. An on-demand or ephemeral box that
+this run started is stopped by its `tearDown` hook only when no other run or slot holds it; anything skipped is listed in
+`result.tearDown` with its reason, and [setup.md](setup.md#lifecycle-hooks) says what to do by hand.
+
+For a run longer than the lease (`defaults.leaseTtlHours`, default 24), run `box-router keep-alive --run "$run_id"`
+before it lapses. It renews the lease and runs each leased box's `keepAlive` hook.
 
 ## Known gap
 
