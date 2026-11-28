@@ -100,7 +100,7 @@ The full sequence is in [swarm.md](../../skills/t3-box-router/references/swarm.m
   owner step. Dedupe and the flow: [probe.md](../../skills/t3-box-router/references/probe.md). Owner attestations
   cover `cred:` and `secret:` tags only.
 - **Bring-up.** `acquire` may run a box's `bringUp` hook when it is down. The router owns the box for the run only if
-  the hook writes `STARTED <label> yes` (or `{"started": true}`) to stdout or the private file named by `T3_BOXES_RESULT_FILE`.
+  the hook writes `STARTED <label> yes` (or `{"started": true}`) to the private file named by `T3_BOXES_RESULT_FILE`, or to stdout with `bringUpStdout: true`.
 - **Teardown, keep-alive, handoff, fetch.** `release` stops only owned on-demand or ephemeral boxes, when no other
   run, slot, hook or keep-alive holds them. `keep-alive` renews a lease. `handoff` and `fetch` call the user's own
   transfer hooks for uncommitted work. The contract, conditions and manual steps when a release leaves a box running:

@@ -762,8 +762,10 @@ function decideAcquire(config, state, options, repo, now) {
   // survive, narrowed to the boxes kept. The binding is never recomputed from config: it names the environment the
   // run's bring-up started. environments maps each leased label to the environment it was leased under now.
   const labels = chosen.map((m) => m.label);
-  const owned = arr(current?.startedByRouter).filter((l) => labels.includes(l));
   const environments = Object.fromEntries(chosen.map((m) => [m.label, m.environmentId]));
+  const previousOwned = arr(current?.startedByRouter);
+  const owned = previousOwned.filter((l) => labels.includes(l) && current.startedEnvironments?.[l] === environments[l]);
+  const dropped = previousOwned.filter((l) => !owned.includes(l));
   next.leases[run] = { ...(current ?? {}), machines: labels, environments, expiresAt: iso(now + d.leaseTtlHours * HOUR) };
   if (owned.length) next.leases[run].startedByRouter = owned;
   else delete next.leases[run].startedByRouter;
@@ -775,6 +777,10 @@ function decideAcquire(config, state, options, repo, now) {
     ok: true,
     machines: chosen.map((m) => ({ label: m.label, environmentId: m.environmentId })),
     errors: chosen.length < count ? errors : [],
+    ...(dropped.length ? {
+      droppedStartedBoxes: dropped.map((label) => ({ label, environmentId: bound[label] ?? null })),
+      cleanup: 'These boxes left router ownership. Check whether each original environment is idle before stopping it manually.',
+    } : {}),
   };
   if (chosen.length < count) {
     result.shortfall = count - chosen.length;
@@ -898,7 +904,7 @@ function bringUpSummary(config, state, label, now) {
     ...(typeof b.started === 'boolean' ? { started: b.started } : {}),
     startedAt: b.startedAt ?? null,
     finishedAt: b.finishedAt,
-    ...(retryAt > now ? { retryAfter: iso(retryAt) } : {}),
+    ...(b.hook !== 'tearDown' && retryAt > now ? { retryAfter: iso(retryAt) } : {}),
   };
 }
 

@@ -108,12 +108,13 @@ Set `machines.<label>.bringUp` to an argument vector: an absolute path to an exe
   `requireIdleCheck`, `note`. Environment: `T3_BOXES_HOOK=bringUp`, `T3_BOXES_IDLE_CHECK=required`, `T3_BOXES_LABEL`.
 - **Idle check.** Before restarting anything, the hook must check for active work and exit `75` if the box is busy
   (`refused-busy`; nothing is expired). The router's own slot check covers only tasks placed through this installation.
-- **Start confirmation.** On successful exit, the hook may report ownership on stdout or in the private file
-  named by `T3_BOXES_RESULT_FILE`. Emit `STARTED <label> yes` when this invocation started the machine, or
+- **Start confirmation.** On successful exit, the hook may report ownership in the private file named by
+  `T3_BOXES_RESULT_FILE`. To use stdout, set `machines.<label>.bringUpStdout` to `true`. By default hooks inherit
+  a discard device for stdout so background services can continue writing after the hook exits. Emit `STARTED <label> yes` when this invocation started the machine, or
   `STARTED <label> no` when it was already running. A complete JSON object such as `{"started":true}` is also
   accepted, with an optional matching `label`. The router retains only the boolean and discards stderr.
   Each channel has a 4 KiB limit. Conflicting, truncated or malformed confirmations leave ownership unconfirmed.
-  Redirect a background service's stdout to its own log so it can keep writing after the hook exits.
+  With stdout capture enabled, redirect a background service's stdout to its own log so it can keep writing after the hook exits.
 - **Outcomes.** `acquire` reports each attempt in its `bringUp` array: `up` (exit 0), `failed`, `timeout`,
   `refused-busy`, `in-progress`, `recent` or `skipped`, each with `detail`. `list` shows a running hook and when a retry
   is allowed; `doctor` checks that each hook is executable.

@@ -3,7 +3,7 @@
  * handoff, fetch) runs through runHook:
  *   - only the configured argument vector, no shell;
  *   - one JSON object on stdin, never the router's state;
- *   - stderr and non-bringUp stdout discarded; bringUp stdout is privately bounded and reduced by the caller;
+ *   - stderr and non-bringUp stdout discarded; opt-in bringUp stdout is privately bounded and reduced by the caller;
  *   - its own process group, stopped with SIGTERM then SIGKILL at the timeout; a router told to stop kills every
  *     group still running before it exits. A process that leaves that group (setsid) escapes.
  *   - an optional result file (T3_BOXES_RESULT_FILE) in a private 0700 directory, of which at most
@@ -111,7 +111,7 @@ function readResult(file) {
  *   idleCheck   true sets T3_BOXES_IDLE_CHECK=required
  *   resultFile  true offers T3_BOXES_RESULT_FILE and returns what the hook wrote there (bounded, raw: reduce it)
  */
-export function runHook(argv, input, timeoutMs, { name = "bringUp", label = input?.label ?? "", idleCheck = true, resultFile = false } = {}) {
+export function runHook(argv, input, timeoutMs, { name = "bringUp", label = input?.label ?? "", idleCheck = true, resultFile = false, captureStdout = false } = {}) {
   return new Promise((resolve) => {
     const dir = resultFile ? makeResultDir() : null;
     const file = dir ? path.join(dir, "result") : null;
@@ -127,7 +127,7 @@ export function runHook(argv, input, timeoutMs, { name = "bringUp", label = inpu
     let child;
     try {
       child = spawn(argv[0], argv.slice(1), {
-        stdio: ["pipe", name === "bringUp" ? "pipe" : "ignore", "ignore"],
+        stdio: ["pipe", name === "bringUp" && captureStdout ? "pipe" : "ignore", "ignore"],
         env,
         shell: false,
         // Its own process group, so a timeout stops everything the hook started, not just the hook.
@@ -163,7 +163,7 @@ export function runHook(argv, input, timeoutMs, { name = "bringUp", label = inpu
         if (res) Object.assign(r, { resultText: res.text, resultTruncated: res.truncated });
       }
       if (child.stdout && r.outcome === "up") {
-        Object.assign(r, { stdoutText: Buffer.concat(chunks).toString("utf8"), stdoutTruncated: stdoutTruncated || !stdoutEnded });
+        Object.assign(r, { stdoutText: Buffer.concat(chunks).toString("utf8"), stdoutTruncated, stdoutOpen: !stdoutEnded });
       }
       cleanup();
       resolve(r);
@@ -279,6 +279,7 @@ export function startedFromHookResult(res, label) {
   const file = res.resultText;
   const stdout = res.stdoutText;
   const filePresent = typeof file === "string" && file.trim() !== "";
+  if (res.stdoutOpen && !filePresent) return null;
   // Ordinary stdout is allowed, but marker-like lines or JSON are an attempted claim.
   const stdoutPresent = typeof stdout === "string" && (/^\s*\{/m.test(stdout) || /^\s*STARTED\b/m.test(stdout));
   const values = [];

@@ -97,6 +97,7 @@ function setup({ machines, defaults = {}, links = {}, linksUp = null, linksDown 
         label,
         {
           environmentId: m.env,
+          ...(m.bringUpStdout !== undefined ? { bringUpStdout: m.bringUpStdout } : {}),
           ...(m.kind ? { kind: m.kind } : {}),
           tags: m.tags ?? ["linux"],
           priority: m.priority ?? 10,
@@ -268,7 +269,7 @@ test("bringUp stdout is bounded, private and reconciled with the result file", a
     ["STARTED od-box yes", "bad result", null],
     ["STARTED od-box yes\n" + "x".repeat(RESULT_MAX_BYTES), "", null],
   ]) {
-    const t = setup({ machines: { "od-box": { env: "env-od", kind: "on-demand", hooks: ["bringUp"] } }, links: { "env-od": "offline" }, linksUp: { "env-od": "reachable" } });
+    const t = setup({ machines: { "od-box": { env: "env-od", kind: "on-demand", bringUpStdout: true, hooks: ["bringUp"] } }, links: { "env-od": "offline" }, linksUp: { "env-od": "reachable" } });
     const r = await t.run(["acquire", "--run", "r1"], { env: { HOOK_STDOUT: stdout, HOOK_RESULT: file } });
     assert.equal(entry(r.json.bringUp, "od-box")?.started, expected);
     t.assertNoLeak();
@@ -282,11 +283,29 @@ test("a descendant retaining stdout cannot delay bringUp completion", { timeout:
   const script = path.join(dir, "hook.sh");
   writeExec(script, "#!/bin/sh\ncat >/dev/null\nsleep 2 &\nprintf 'STARTED b yes\\n'\n");
   const startedAt = Date.now();
-  const result = await runHook([script], { label: "b" }, 5000, { name: "bringUp", label: "b" });
+  const result = await runHook([script], { label: "b" }, 5000, { name: "bringUp", label: "b", captureStdout: true });
   assert.equal(result.outcome, "up");
-  assert.equal(result.stdoutTruncated, true);
+  assert.equal(result.stdoutOpen, true);
+  assert.equal(startedFromHookResult({ ...result, resultText: "STARTED b yes" }, "b"), true);
   assert.equal(startedFromHookResult(result, "b"), null);
   assert.ok(Date.now() - startedAt < 1500);
+});
+
+test("default bringUp keeps a background writer alive and honors its hook's result file", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "box-router-bg-writer-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const script = path.join(dir, "hook.sh");
+  const alive = path.join(dir, "alive");
+  writeExec(script, `#!/bin/sh
+cat >/dev/null
+( sleep 0.3; echo log && echo alive > "$1" ) &
+echo 'STARTED b yes' > "$T3_BOXES_RESULT_FILE"
+`);
+  const result = await runHook([script, alive], { label: "b" }, 5000, { resultFile: true });
+  assert.equal(startedFromHookResult(result, "b"), true);
+  const deadline = Date.now() + 3000;
+  while (!fs.existsSync(alive) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(fs.readFileSync(alive, "utf8").trim(), "alive");
 });
 
 describe("ownership and release planning", () => {
@@ -484,7 +503,9 @@ test("a confirmed start makes the box the run's; release stops it once and expir
   const providers = after.observations["od-box"]?.providers;
   assert.ok(!providers || Date.parse(providers.validUntil) <= Date.parse(after.bringUp["od-box"].finishedAt), JSON.stringify(providers));
   // The tear-down left the link offline; the box is not placeable on its old facts.
-  assert.equal((await t.run(["list"])).json.machines.find((m) => m.label === "od-box").state, "cooling");
+  const stoppedBox = (await t.run(["list"])).json.machines.find((m) => m.label === "od-box");
+  assert.equal(stoppedBox.state, "cooling");
+  assert.equal(stoppedBox.bringUp.retryAfter, undefined);
   assert.equal((await t.run(["place", "--place", "od-box"])).code, 1);
 
   const again = await t.run(["release", "--run", "r1"]);

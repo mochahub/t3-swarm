@@ -143,7 +143,7 @@ const KNOWN_TOP = new Set(["version", "scriptPath", "allowProjectOverride", "def
 const KNOWN_LOCAL = new Set(["tags", "deviceHostId", "priority", "weight", "maxConcurrent", "exclusive", "profile", "extraTags", "denyTags"]);
 const KNOWN_MACHINE = new Set([
   "kind", "environmentId", "url", "ssh", "tags", "deviceHostId", "priority", "weight", "maxConcurrent", "exclusive",
-  "worktreeRoot", "renew", "bringUp", "bringUpTimeoutMs", "checks", "profile", "extraTags", "denyTags",
+  "worktreeRoot", "renew", "bringUp", "bringUpTimeoutMs", "bringUpStdout", "checks", "profile", "extraTags", "denyTags",
   ...LIFECYCLE_HOOKS, "hookTimeoutMs",
 ]);
 const KNOWN_REPO = new Set(["needs", "prefers", "deny", "pin", "priority", "maxConcurrent", "worktreeCommand", "allowWorktreeScripts"]);
@@ -393,6 +393,10 @@ export function validateConfig(raw) {
       if (problem) errors.push(`${where}.${problem}`);
       // Kept exactly as written: the router passes this argument vector to the hook unchanged, with no shell.
       else entry.bringUp = m.bringUp.slice();
+    }
+    if (m.bringUpStdout !== undefined) {
+      if (typeof m.bringUpStdout === "boolean") entry.bringUpStdout = m.bringUpStdout;
+      else errors.push(`${where}.bringUpStdout must be a boolean.`);
     }
     if (m.bringUpTimeoutMs !== undefined) {
       entry.bringUpTimeoutMs = checkTimeoutMs(m.bringUpTimeoutMs, `${where}.bringUpTimeoutMs`, errors);

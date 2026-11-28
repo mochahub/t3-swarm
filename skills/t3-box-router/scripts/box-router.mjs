@@ -268,9 +268,9 @@ async function runClaimed(config, { label, claim }, run) {
     requireIdleCheck: true,
     kind: machine.kind ?? "always-on",
     note: "The router holds no slot on this box, which does not prove it is idle. Run your own idle check before restarting T3 and exit 75 if the box is busy.",
-    confirm: "Optional: write STARTED <label> yes|no, or {\"started\": true|false}, to stdout or the file named by T3_BOXES_RESULT_FILE to say whether this hook started the box. Only yes lets release stop it later.",
+    confirm: "Optional: write STARTED <label> yes|no, or {\"started\": true|false}, to the file named by T3_BOXES_RESULT_FILE (or stdout when bringUpStdout is enabled) to say whether this hook started the box. Only yes lets release stop it later.",
   };
-  const res = await runHook(machine.bringUp, input, timeoutMs, { name: "bringUp", label, idleCheck: true, resultFile: true });
+  const res = await runHook(machine.bringUp, input, timeoutMs, { name: "bringUp", label, idleCheck: true, resultFile: true, captureStdout: machine.bringUpStdout === true });
   // Reduce both private channels to one boolean; their text goes no further.
   const started = startedFromHookResult(res, label);
   return { label, claimId: claim.id, startedAt: claim.startedAt, timeoutMs, ...lifecycle.publicHookResult(res), started, finishedAt: Date.now() };

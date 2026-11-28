@@ -459,6 +459,14 @@ describe('TTL and leases', () => {
     assert.equal(result.ok, true);
   });
 
+  test('reacquire identifies a previously started environment that now needs manual cleanup', () => {
+    const leases = { r1: { machines: ['old'], startedByRouter: ['old'], startedEnvironments: { old: 'env-old' }, expiresAt: iso(NOW + HOUR) } };
+    const state = mkState({ 'home-box': freshObs('env-home') }, { leases });
+    const { result } = run('acquire', { state, options: { run: 'r1' } });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.droppedStartedBoxes, [{ label: 'old', environmentId: 'env-old' }]);
+  });
+
   test('reacquire keeps held boxes, then prefers unheld over shared boxes', () => {
     const config = mkConfig({ machines: { a: box('env-a', { priority: 10 }), b: box('env-b', { priority: 10 }), c: box('env-c', { priority: 1 }) } });
     const obs = { a: freshObs('env-a'), b: freshObs('env-b'), c: freshObs('env-c') };
