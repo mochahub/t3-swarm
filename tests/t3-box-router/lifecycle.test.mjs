@@ -520,6 +520,29 @@ test("a confirmed start makes the box the run's; release stops it once and expir
   t.assertNoLeak();
 });
 
+test("reacquire preserves dropped ownership when it brings up a replacement", async () => {
+  const t = setup({
+    machines: {
+      first: { env: "env-first", kind: "on-demand", hooks: ["bringUp"], tags: ["gpu"] },
+      ready: { env: "env-ready" },
+      spare: { env: "env-spare", kind: "on-demand", hooks: ["bringUp"] },
+    },
+    links: { "env-first": "offline", "env-ready": "reachable", "env-spare": "offline" },
+    linksUp: { "env-first": "reachable", "env-ready": "reachable", "env-spare": "offline" },
+  });
+  await observe(t, ["env-first", "env-ready", "env-spare"].flatMap(factRecords));
+  const args = ["acquire", "--run", "r1"];
+  const initial = await t.run([...args, "--needs", "gpu"], { env: { HOOK_RESULT: "STARTED first yes" } });
+  assert.equal(entry(initial.json.bringUp, "first").outcome, "up");
+  await observe(t, factRecords("env-first"));
+  const acquired = await t.run([...args, "--needs", "gpu"]);
+  assert.deepEqual(acquired.json.startedByRouter, ["first"]);
+  const reacquired = await t.run([...args, "--needs", "linux", "--count", "2"]);
+  assert.equal(entry(reacquired.json.bringUp, "spare").outcome, "up");
+  assert.deepEqual(reacquired.json.droppedStartedBoxes, [{ label: "first", environmentId: "env-first" }]);
+  assert.match(reacquired.json.cleanup, /manually/);
+});
+
 test("no marker, a no, a wrong label or a failed hook never make the box the run's", async () => {
   for (const [marker, upExit, label] of [
     [undefined, 0, "none"],

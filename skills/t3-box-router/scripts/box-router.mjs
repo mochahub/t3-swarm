@@ -281,7 +281,7 @@ async function acquireWithBringUp({ config, options, repo }) {
   const snapErr = snapshotOrError(snap);
   if (snapErr) return snapErr;
   let patch = await refreshPatch(config, snap.state);
-  let result = await decideWith("acquire", { config, options, repo, patch });
+  const result = await decideWith("acquire", { config, options, repo, patch });
 
   const shortfall = acquireShortfall(result, options.count);
   if (!shortfall) return result;
@@ -344,8 +344,13 @@ async function acquireWithBringUp({ config, options, repo }) {
 
   // Re-read links (the invalidated ones are stale now) and decide again on fresh evidence.
   patch = await refreshPatch(config, finished.state);
-  result = await decideWith("acquire", { config, options, repo, patch });
-  return withBringUp(result, report);
+  const refreshed = await decideWith("acquire", { config, options, repo, patch });
+  // The initial decision may already have committed a lease change before the hooks ran.
+  if (result.droppedStartedBoxes?.length) {
+    refreshed.droppedStartedBoxes = [...result.droppedStartedBoxes, ...(refreshed.droppedStartedBoxes ?? [])];
+    refreshed.cleanup = result.cleanup;
+  }
+  return withBringUp(refreshed, report);
 }
 
 function withBringUp(result, report) {
