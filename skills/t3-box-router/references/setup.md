@@ -38,8 +38,8 @@ Ask the user to resolve label collisions and links that map to no machine.
 
 ## 2. Write config
 
-Start from [config.example.json](config.example.json). Run `box-router init` once the user confirms the inventory.
-Keep only the fields shown there: other fields are not active.
+Start from [config.example.json](config.example.json). Save the inventory the user confirmed as `confirmed-config.json`, then run
+`box-router init < confirmed-config.json`. Running `init` without input creates a local-only inventory.
 
 Per-repo rules go under `repos["<canonical origin key>"]`: `needs`, `prefers`, `deny`, `pin`, `worktreeCommand`.
 Caller needs add to repo needs; pins and denies narrow. Conflicting hard rules can leave no machine, which is

@@ -42,7 +42,7 @@ const OUTCOMES = new Set(["ok", "failed", "unreachable"]);
 
 export const COMMANDS = {
   help: { flags: [], positionals: [0, 1], usage: "help [command]", summary: "Print command usage in JSON." },
-  init: { flags: [], positionals: [0, 0], usage: "init", summary: "Create a user-confirmed config and empty state, or report an existing setup." },
+  init: { flags: [], positionals: [0, 0], usage: "init [< confirmed-config.json]", summary: "Create a user-confirmed config and empty state, or report an existing setup." },
   discover: {
     flags: [],
     positionals: [0, 0],
@@ -387,46 +387,6 @@ export function observationRecordsProblem(records) {
 }
 
 export const ts = (v) => (typeof v === "number" ? v : v == null ? NaN : Date.parse(v));
-
-const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-
-/** Labels whose observations changed between two states. */
-export function changedObservationLabels(before, after) {
-  const a = before?.observations || {};
-  const b = after?.observations || {};
-  return [...new Set([...Object.keys(a), ...Object.keys(b)])].filter((l) => !sameJson(a[l], b[l])).sort();
-}
-
-/**
- * Merge a refreshFacts patch onto the latest observations. Runs under the state lock, so the state is the one
- * just reloaded. A fact already newer than the patch's (for example an agent observation that landed while the
- * CLI read was running) is kept. A patch for an environment the config no longer names is dropped, and facts
- * recorded for a different environment ID are cleared rather than mixed.
- */
-export function mergeFactsPatch(state, patch, config) {
-  if (!patch || typeof patch !== "object") return state;
-  const observations = { ...(state.observations || {}) };
-  let changed = false;
-  for (const [label, entry] of Object.entries(patch)) {
-    const machine = config?.machines?.[label];
-    if (!machine || !entry || typeof entry !== "object") continue;
-    if (entry.environmentId !== machine.environmentId) continue;
-    const cur = observations[label];
-    const next = cur && cur.environmentId === entry.environmentId ? { ...cur } : { environmentId: entry.environmentId };
-    for (const kind of FACT_KINDS) {
-      const env = entry[kind];
-      if (!env || typeof env !== "object") continue;
-      const have = next[kind];
-      if (have && ts(have.observedAt) > ts(env.observedAt)) continue;
-      next[kind] = env;
-    }
-    if (!sameJson(next, cur)) {
-      observations[label] = next;
-      changed = true;
-    }
-  }
-  return changed ? { ...state, observations } : state;
-}
 
 /**
  * After a bring-up hook ran, every fact about that box observed before the hook finished is suspect. Mark those

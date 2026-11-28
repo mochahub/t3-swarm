@@ -32,8 +32,6 @@ import {
   canonicalRepoKey,
   renderPolicyLine,
   observationRecordsProblem,
-  changedObservationLabels,
-  mergeFactsPatch,
   expireFactsBefore,
   activeSlotCount,
   bringUpCandidates,
@@ -174,7 +172,7 @@ function cleanPatch(patch) {
 // One transaction: merge refreshed facts onto the latest observations, then decide.
 async function decideWith(command, { config, options, repo, patch }) {
   return store.transaction(HOME, config, (state, now) => {
-    const merged = mergeFactsPatch(state, cleanPatch(patch), config);
+    const merged = facts.mergeFactPatch(config, state, cleanPatch(patch), now);
     return engine.decide(command, { config, state: merged, options, repo, now, newId });
   });
 }
@@ -482,8 +480,8 @@ async function cmdObserve(config) {
   const problem = observationRecordsProblem(records);
   if (problem) return { ok: false, error: problem };
   return store.transaction(HOME, config, (state, now) => {
-    const next = facts.applyObservations(config, state, records, now);
-    return { state: next, result: { ok: true, updated: changedObservationLabels(state, next) } };
+    const accepted = facts.applyObservationsDetailed(config, state, records, now);
+    return { state: accepted.state, result: { ok: true, updated: accepted.updated } };
   });
 }
 
@@ -547,7 +545,10 @@ async function cmdDoctor(config, options, repo, patch) {
 async function main(argv) {
   const { command, options } = parseArgv(argv);
   if (command === "help") return helpPayload(options.args[0]);
-  if (command === "init") return store.init(HOME);
+  if (command === "init") {
+    const text = await readStdin({ idleMs: 1500 });
+    return store.init(HOME, text.trim() ? parseJsonInput(text, "Confirmed config") : undefined);
+  }
   if (command === "discover") return cmdDiscover();
 
   const loaded = await loadConfigOrError();
@@ -593,5 +594,5 @@ function warnBringUpInProgress(result) {
 }
 
 main(process.argv.slice(2)).then(emit, (e) => {
-  emit({ ok: false, error: errorMessage(e), ...(e instanceof UsageError ? { usage: true } : {}) });
+  emit(e.result ?? { ok: false, error: errorMessage(e), ...(e instanceof UsageError ? { usage: true } : {}) });
 });

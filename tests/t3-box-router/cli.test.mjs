@@ -9,12 +9,13 @@ import {
   canonicalRepoKey,
   renderPolicyLine,
   observationRecordsProblem,
-  mergeFactsPatch,
   expireFactsBefore,
   bringUpCandidates,
   acquireShortfall,
   checkKnownLabels,
 } from "../../skills/t3-box-router/scripts/cli.mjs";
+
+import { mergeFactPatch } from "../../skills/t3-box-router/scripts/facts.mjs";
 
 const NOW = Date.parse("2030-01-01T10:00:00Z");
 const iso = (ms) => new Date(ms).toISOString();
@@ -112,12 +113,12 @@ test("mergeFactsPatch keeps newer facts and drops stale environments", () => {
     "spare-box": { environmentId: "env-2", link: env(NOW, NOW + 900000, { status: "reachable" }) },
     "plain-box": { environmentId: "env-wrong", link: env(NOW, NOW + 900000, { status: "reachable" }) },
   };
-  const next = mergeFactsPatch(state, patch, config);
+  const next = mergeFactPatch(config, state, patch, NOW);
   assert.equal(next.observations["home-box"].link.value.status, "reachable");
   assert.deepEqual(next.observations["home-box"].providers.value, ["p2"]);
   assert.deepEqual(Object.keys(next.observations["spare-box"]).sort(), ["environmentId", "link"]);
   assert.equal(next.observations["plain-box"], undefined);
-  assert.equal(mergeFactsPatch(state, null, config), state);
+  assert.deepEqual(mergeFactPatch(config, state, null, NOW), state);
 });
 
 test("expireFactsBefore invalidates only facts older than the cutoff", () => {
