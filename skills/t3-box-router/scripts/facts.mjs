@@ -147,14 +147,17 @@ function readRecord(rec, index) {
 
   if (tool === "t3_environment_links") {
     const links = new Map();
+    let seen = 0;
     pages.forEach((page, p) => {
       for (const link of itemsOf(page, "links", index, tool, p)) {
+        seen += 1;
         if (!isObj(link) || typeof link.environmentId !== "string" || !ID_PATTERN.test(link.environmentId)) continue;
         if (!links.has(link.environmentId)) {
           links.set(link.environmentId, { ...reduceLink(link), label: typeof link.label === "string" ? link.label.slice(0, LIMITS.string) : null });
         }
       }
     });
+    if (seen > 0 && links.size === 0) fail(index, tool, "no link has a readable environmentId.");
     return { tool, links };
   }
 
@@ -310,7 +313,8 @@ export function parseT3EnvironmentList(text) {
   }
   if (!list) throw new Error("Unrecognized t3 environment list output.");
   const outList = [];
-  for (const e of list.slice(0, LIMITS.itemsPerPage)) {
+  const entries = list.slice(0, LIMITS.itemsPerPage);
+  for (const e of entries) {
     if (!isObj(e)) continue;
     const environmentId = e.environmentId ?? e.id ?? e.environment_id;
     if (typeof environmentId !== "string" || !ID_PATTERN.test(environmentId)) continue;
@@ -326,6 +330,8 @@ export function parseT3EnvironmentList(text) {
       }),
     });
   }
+  // A non-empty list with no readable ID means the output shape is not understood; absent links would be wrong.
+  if (entries.length > 0 && outList.length === 0) throw new Error("No entry in t3 environment list output had a readable environment ID.");
   return outList;
 }
 
@@ -409,7 +415,7 @@ export async function refreshFactsDetailed(config, state, now, opts = {}) {
   };
   const patch = {};
   const put = (label, envId, kind, env) => {
-    if (!patch[label]) patch[label] = { environmentId: envId };
+    if (!hasOwn(patch, label)) patch[label] = { environmentId: envId };
     patch[label][kind] = env;
   };
 

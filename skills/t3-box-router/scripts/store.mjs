@@ -21,8 +21,13 @@
  *       fn(state, now) must be synchronous and return { state, result }. `state` is the reloaded and pruned
  *       state; `now` is epoch milliseconds. Return `state: undefined` to keep the pruned state.
  *
+ *   readState(home, config, now?)       -> lock-free pruned snapshot, for refreshFacts outside the lock
+ *
  * Helpers: resolveHome, homePaths, validateConfig, inspectConfig, defaultConfig, emptyState, normalizeState,
- * pruneState, localPlatformTags, isoTime, parseTime, StoreError, and the validation patterns.
+ * pruneState, acquireLock, releaseLock, localPlatformTags, isoTime, parseTime, StoreError, validation patterns.
+ *
+ * Config maps (machines, repos) are plain objects and labels such as `constructor` are valid: look up any
+ * caller-supplied label with Object.hasOwn, never `config.machines[label]` alone.
  */
 
 import crypto from "node:crypto";
@@ -707,6 +712,23 @@ function loadStateLocked(statePath) {
       corruptPath,
     },
   };
+}
+
+/**
+ * Lock-free, read-only snapshot of state, normalized and pruned at `now`, for work that must stay outside the lock
+ * (such as refreshFacts). A missing, unreadable, corrupt or other-version file reads as empty state; nothing is moved
+ * or written. Decisions must still be re-checked against state inside a transaction.
+ */
+export function readState(home, config, now = Date.now()) {
+  let state = null;
+  try {
+    state = normalizeState(JSON.parse(fs.readFileSync(homePaths(home).state, "utf8")));
+  } catch {
+    state = null;
+  }
+  state = state || emptyState();
+  pruneState(config, state, now);
+  return state;
 }
 
 /**

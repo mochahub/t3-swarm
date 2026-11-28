@@ -16,6 +16,7 @@ import {
   loadConfig,
   localPlatformTags,
   pruneState,
+  readState,
   transaction,
   validateConfig,
 } from "../../skills/t3-box-router/scripts/store.mjs";
@@ -416,4 +417,18 @@ test("a changed environmentId in config clears that label's observations on the 
   const config = loadConfig(home);
   const obs = await transaction(home, config, (state) => ({ result: state.observations }), { now: NOW });
   assert.deepEqual(obs, {});
+});
+
+test("readState gives a pruned snapshot without locking, moving or writing anything", async () => {
+  const { home, config, paths } = await setup();
+  const live = iso(NOW + MIN);
+  const text = JSON.stringify({ ...emptyState(), slots: { a: { label: "home-box", expiresAt: live }, b: { label: "home-box", expiresAt: iso(NOW - MIN) } } });
+  fs.writeFileSync(paths.state, text);
+  fs.writeFileSync(paths.lock, `${process.pid}.held\n`);
+  assert.deepEqual(Object.keys(readState(home, config, NOW).slots), ["a"]);
+  assert.equal(fs.readFileSync(paths.state, "utf8"), text);
+  fs.writeFileSync(paths.state, "{ corrupt");
+  assert.deepEqual(readState(home, config, NOW), emptyState());
+  assert.equal(fs.readFileSync(paths.state, "utf8"), "{ corrupt");
+  fs.rmSync(paths.lock);
 });

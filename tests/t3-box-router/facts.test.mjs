@@ -329,10 +329,40 @@ test("probes fail closed on server errors, network errors and timeouts", async (
   assert.equal(patch["home-box"].probe.value, false);
 });
 
+test("t3 output or agent links with no readable environment ID fail safe instead of marking boxes unlinked", async () => {
+  const t3 = t3List([{ environment: { id: "env-home" } }]);
+  const r = await refreshFactsDetailed(config(), emptyState(), NOW, { t3Bin: t3.bin, fetch: fakeFetch(() => respond(200)) });
+  assert.equal(r.t3.available, true);
+  assert.equal(r.t3.ok, false);
+  assert.equal(r.patch["home-box"].link, undefined);
+  assert.equal(r.patch["spare-box"], undefined);
+  assert.throws(
+    () => applyObservations(config(), emptyState(), [linksRecord([{ environment: { id: "env-home" } }])], NOW),
+    (err) => err instanceof ObservationError && /readable environmentId/.test(err.result.error),
+  );
+  const empty = await refreshFactsDetailed(config(), emptyState(), NOW, { t3Bin: t3List([]).bin, fetch: fakeFetch(() => respond(200)) });
+  assert.equal(empty.t3.ok, true);
+  assert.equal(empty.patch["home-box"].link.value, null, "an empty list really means no links");
+});
+
+test("labels that shadow Object builtins work in patches and merges", async () => {
+  const cfg = config({ constructor: { environmentId: "env-ctor", url: "https://ctor.example" } });
+  const t3 = t3List([{ environmentId: "env-ctor", status: "reachable" }]);
+  const patch = await refreshFacts(cfg, emptyState(), NOW, { t3Bin: t3.bin, fetch: fakeFetch(() => respond(200)) });
+  assert.ok(Object.hasOwn(patch, "constructor"));
+  assert.equal(patch.constructor.link.value.status, "reachable");
+  assert.equal(patch.constructor.probe.value, true);
+  const merged = mergeFactPatch(cfg, emptyState(), patch, NOW);
+  assert.equal(merged.observations.constructor.environmentId, "env-ctor");
+  const observed = applyObservations(cfg, emptyState(), [linksRecord([{ environmentId: "env-ctor", status: "reachable" }])], NOW);
+  assert.equal(observed.observations.constructor.link.value.status, "reachable");
+});
+
 test("parseT3EnvironmentList accepts plausible shapes and rejects others", () => {
   assert.equal(parseT3EnvironmentList(JSON.stringify([{ environmentId: "e1", label: "a", status: "reachable" }]))[0].environmentId, "e1");
   assert.equal(parseT3EnvironmentList(JSON.stringify({ links: [{ id: "e2" }] }))[0].environmentId, "e2");
-  assert.deepEqual(parseT3EnvironmentList(JSON.stringify({ data: [{ id: "__proto__ x" }, 5] })), []);
+  assert.deepEqual(parseT3EnvironmentList(JSON.stringify({ data: [] })), []);
+  assert.throws(() => parseT3EnvironmentList(JSON.stringify({ data: [{ id: "__proto__ x" }, 5] })), /readable environment ID/);
   assert.throws(() => parseT3EnvironmentList(JSON.stringify({ unexpected: true })), /Unrecognized/);
 });
 
