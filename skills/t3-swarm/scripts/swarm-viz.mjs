@@ -51,6 +51,7 @@ const ARCHIVE_DIR = path.join(SWARM_HOME, "archive");
 const FIRST_PORT = Number(arg("port", "4777"));
 const INTERVAL = Math.max(250, Number(arg("interval", "1000")));
 const RUN = arg("run", null);
+const SERVER_ID = `${process.pid}-${Date.now()}`;
 const PID_FILE = RUN ? path.join(RUNS_DIR, `${path.basename(RUN)}.viz.pid`) : null;
 let ROOT = arg("root", null);
 
@@ -121,10 +122,11 @@ function itemCols() {
     ${j("$.toolName")} AS toolName, substr(${j("$.title")}, 1, 200) AS title,
     ${j("$.childThreadId")} AS childThreadId, ${j("$.subagentId")} AS subagentId,
     ${j("$.remoteChild.threadId")} AS remoteThread, ${j("$.remoteChild.environmentId")} AS remoteEnv, ${j("$.remoteChild.label")} AS remoteLabel,
-    CASE WHEN type = 'subagent' THEN substr(${j("$.result")}, 1, 600) END AS resultHead,
+    CASE WHEN type = 'subagent' THEN substr(${j("$.result")}, 1, 4000) END AS resultHead,
     ${j("$.providerInstanceId")} AS providerInstanceId,
-    CASE WHEN type = 'subagent' THEN substr(${j("$.prompt")}, 1, 400) END AS promptHead,
+    CASE WHEN type = 'subagent' THEN substr(${j("$.prompt")}, 1, 20000) END AS promptHead,
     CASE WHEN type = 'dynamic_tool' THEN ${j("$.input.target.environmentId")} END AS toolEnv,
+    CASE WHEN type = 'dynamic_tool' THEN ${j("$.input.target.model")} END AS toolModel,
     CASE WHEN type = 'dynamic_tool' THEN substr(${j("$.output.content")}, 1, 400) END AS toolOut,
     coalesce(${j("$.environmentId")}, ${j("$.target.environmentId")}, ${j("$.childEnvironmentId")}) AS environmentId,
     ${j("$.senderThreadId")} AS senderThreadId, ${j("$.inputIntent")} AS inputIntent,
@@ -160,6 +162,7 @@ const itemsByThread = new Map(); // threadId -> { maxOrdinal, open: Map<id, stat
 const subagentToThread = new Map(); // subagent node id (= ledger taskId) -> child threadId
 const childInfo = new Map(); // child threadId -> what its parent's subagent item says about it
 const taskEnv = new Map(); // delegated task id -> the environment the Lead's delegate_task sent it to
+const taskModel = new Map(); // delegated task id -> the model the parent's delegate_task asked for
 const envLabels = new Map(); // linked T3 environment id -> its label (the machine name you gave it)
 function readEnvLabels() {
   try {
@@ -262,10 +265,11 @@ function absorbItem(it, isNewItem, prevStatus) {
     // (delegated to another machine), this is all we can show for it.
     if (childId) childInfo.set(childId, {
       parentId: it.threadId, title: it.title, status: it.status, provider: it.providerInstanceId,
+      model: (it.subagentId && taskModel.get(it.subagentId)) || null,
       // the brief the parent sent says the role, even when the child's own thread is elsewhere
       role: /\[SWARM ROLE: LEAD\]/.test(it.promptHead || "") ? "lead" : /\[SWARM ROLE: WORKER\]/.test(it.promptHead || "") ? "worker" : null,
       environmentId: it.remoteEnv || it.environmentId || (it.subagentId && taskEnv.get(it.subagentId)) || null,
-      machineLabel: it.remoteLabel || null, result: it.resultHead || null, startedAt: it.startedAt, completedAt: it.completedAt,
+      machineLabel: it.remoteLabel || null, prompt: it.promptHead || null, result: it.resultHead || null, startedAt: it.startedAt, completedAt: it.completedAt,
     });
     if (TERMINAL.has(it.status) && it.status !== prevStatus && childId) {
       const child = nodes.get(childId);
@@ -276,10 +280,11 @@ function absorbItem(it, isNewItem, prevStatus) {
     }
   }
 
-  // --- where a delegate went: the delegate_task call names target.environmentId; its result names the taskId
-  if (it.type === "dynamic_tool" && toolShort(it.toolName) === "delegate_task" && it.toolEnv && it.toolOut) {
+  // --- where a delegate went: the delegate_task call names target.environmentId/model; its result names the taskId
+  if (it.type === "dynamic_tool" && toolShort(it.toolName) === "delegate_task" && it.toolOut) {
     const tid = String(it.toolOut).match(/"taskId"\s*:\s*"([^"]+)"/)?.[1];
-    if (tid) taskEnv.set(tid, it.toolEnv);
+    if (tid && it.toolEnv) taskEnv.set(tid, it.toolEnv);
+    if (tid && it.toolModel) taskModel.set(tid, it.toolModel);
   }
 
   // --- communication: parent checking on / waiting for / messaging a child
@@ -434,7 +439,7 @@ function claimsFrom(posts) {
 // Which run ledger belongs to this tree. A Lead's branch names it (swarm/<run-id>[--<stream>]) once the
 // Lead has switched to it; before that (and for an integration Lead still on a T3-named branch) the
 // ledger is found by an agent's thread or task id in it: the Workstreams rows hold each Lead's thread.
-let ledgerId = null, ledgerScanAt = 0;
+let ledgerId = RUN ? path.basename(RUN) : null, ledgerScanAt = 0;
 function findLedgerFile() {
   const leads = [...nodes.values()].filter((n) => n.branch?.startsWith("swarm/"));
   const fromBranch = leads.length ? parseSwarmBranch(leads[0].branch).runId : null;
@@ -571,11 +576,16 @@ function tick() {
       if (existing && !existing.remote) continue;
       if (!existing && q.thread.get(cid)) continue; // local thread outside this tree's lineage index; skip
       const n = existing || { id: cid, recent: [], brief: null, lastText: null, toolCalls: 0, commands: 0, activity: null };
+      const lastText = c.result || n.lastText || null;
+      const brief = n.brief || (c.prompt ? briefBody(c.prompt) : null);
+      const activity = lastText
+        ? { kind: "say", text: short(lastText, 120), status: c.status, ts: c.completedAt || c.startedAt }
+        : n.activity;
       Object.assign(n, {
         remote: true, machine: (c.environmentId && envLabels.get(c.environmentId)) || c.machineLabel || c.environmentId || null,
-        lastText: n.lastText || c.result || null,
+        brief, lastText, activity,
         parentId: c.parentId, title: c.title || "Subagent",
-        role: c.role || (n.role === "agent" || !n.role ? "worker" : n.role), provider: c.provider || null, createdAt: c.startedAt,
+        role: c.role || (n.role === "agent" || !n.role ? "worker" : n.role), provider: c.provider || null, model: c.model || n.model || null, createdAt: c.startedAt,
         run: { ordinal: 1, status: c.status === "running" ? "running" : c.status, startedAt: c.startedAt, completedAt: c.completedAt },
       });
       nodes.set(cid, n);
@@ -635,6 +645,7 @@ function liteNode(n) {
 function meta() {
   const pending = (ledger?.tasks || []).filter((t) => !t.taskId).map((t) => ({ label: t.label, desc: t.desc, tier: t.tier, state: t.state, stream: t.stream ?? null }));
   return {
+    serverId: SERVER_ID, run: RUN,
     root: ROOT, now: new Date().toISOString(), lastTickAt, lastError, pending,
     ledger: ledger && { runId: ledger.runId, status: ledger.status, goal: ledger.goal },
     ...(ledger?.streams?.length ? { streams: ledger.streams, contracts: ledger.contracts } : {}),
@@ -716,7 +727,7 @@ const server = http.createServer((req, res) => {
     const n = nodes.get(url.searchParams.get("id") || "");
     res.writeHead(n ? 200 : 404, { "Content-Type": "application/json", "Cache-Control": "no-cache" });
     res.end(JSON.stringify(n ? {
-      id: n.id, brief: clip(String(n.brief || "").replace(/^-{3,}\s*/, ""), 4000), lastText: clip(n.lastText, 2000), recent: n.recent.slice(-10),
+      id: n.id, brief: clip(String(n.brief || "").replace(/^-{3,}\s*/, ""), 4000), lastText: clip(n.lastText, 4000), recent: n.recent.slice(-10),
     } : { error: "unknown agent" }));
     return;
   }
@@ -761,12 +772,29 @@ server.on("listening", () => {
   console.log(`swarm-viz: ${url}  root=${ROOT}  nodes=${nodes.size}  events=${events.length}`);
 });
 server.listen(port, "127.0.0.1");
+let shuttingDown = false;
 function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    ledgerReadAt = 0;
+    const fresh = tick();
+    lastError = null;
+    version++;
+    if (clients.size) broadcast(clients, "state", { snapshot: snapshot(), events: fresh });
+    const d = v2Diff();
+    broadcast(v2clients, "tick", { meta: meta(), ...d, events: fresh });
+  } catch {}
+  broadcast(clients, "ended", { serverId: SERVER_ID, run: RUN });
+  broadcast(v2clients, "ended", { serverId: SERVER_ID, run: RUN });
+  for (const res of [...clients, ...v2clients]) { try { res.end(); } catch {} }
+  clients.clear(); v2clients.clear();
+  try { server.close(); } catch {}
   try { db.close(); } catch {}
   try {
     if (PID_FILE && JSON.parse(fs.readFileSync(PID_FILE, "utf8")).pid === process.pid) fs.unlinkSync(PID_FILE);
   } catch {}
-  process.exit(0);
+  setTimeout(() => process.exit(0), 120).unref();
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

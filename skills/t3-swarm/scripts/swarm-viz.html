@@ -170,7 +170,7 @@ const FLY = new Set(Object.keys(COLORS).filter((k) => k !== "poll" && k !== "can
 const CARD_W = 248, CARD_H = 64, YOU_W = 64, YOU_H = 32, LESS_H = 30, COL_GAP = 76, ROW_GAP = 12, COLLAPSE_AT = 8;
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 
-const S = { meta: null, nodes: new Map(), events: [], lastSeq: -1, sel: null, replay: null, connected: false, expanded: new Set() };
+const S = { meta: null, nodes: new Map(), events: [], lastSeq: -1, sel: null, replay: null, connected: false, expanded: new Set(), serverId: null, ended: false };
 const V = { x: 0, y: 0, k: 1, user: false };
 const cards = new Map(), edges = new Map();
 let G = null, L = null, structKey = "";
@@ -609,7 +609,7 @@ function paintHud() {
   const m = S.meta, nodes = [...S.nodes.values()], root = S.nodes.get(m.root);
   setText($("#title"), root ? root.title : "Swarm");
   document.title = (root ? root.title + " · " : "") + "Swarm Live";
-  setText($("#runstatus"), m.ledger ? "ledger: " + (m.ledger.status || "?") : "no ledger");
+  setText($("#runstatus"), (m.ledger ? "ledger: " + (m.ledger.status || "?") : "no ledger") + (S.ended ? " · ended" : !S.connected ? " · reconnecting" : ""));
   const c = (s) => nodes.filter((n) => n.status === s).length;
   const machines = new Set(nodes.map((n) => n.machine).filter(Boolean));
   setText($("#counts"), [`${nodes.length} agents`, `${c("working")} working`, `${c("done")} done`, c("failed") && `${c("failed")} failed`, c("waiting") && `${c("waiting")} need you`, m.pending?.length && `${m.pending.length} pending`, machines.size && `${machines.size + 1} machines`].filter(Boolean).join(" · "));
@@ -673,7 +673,7 @@ function renderInspector() {
   }
   if (d?.lastText) parts.push(el("div", "sec", "Latest message"), el("pre", null, d.lastText));
   if (d?.brief) parts.push(el("div", "sec", n.role === "coordinator" ? "Your first message" : "Brief"), el("pre", null, d.brief));
-  if (n.remote) parts.push(el("div", "sec", "Another machine"), el("div", "kv", "This agent runs on " + (n.machine || "another machine") + ". Its steps and messages live in that machine's T3."));
+  if (n.remote) parts.push(el("div", "sec", "Another machine"), el("div", "kv", d?.lastText ? "This agent ran on " + (n.machine || "another machine") + ". Intermediate steps live in that machine's T3; its brief and latest message are shown above." : "This agent runs on " + (n.machine || "another machine") + ". Intermediate steps live in that machine's T3; its final message will appear here when it finishes."));
   const scroll = box.scrollTop; box.replaceChildren(...parts); box.scrollTop = scroll;
 }
 addEventListener("keydown", (e) => { if (e.key === "Escape" && S.sel) select(S.sel); });
@@ -698,34 +698,107 @@ $("#replay").onclick = () => {
 };
 
 // ------------------------------------------------------------ data in (v2: summaries once, then only what changed)
+function resetForNewRun() {
+  if (S.replay) { S.replay.stop = true; S.replay = null; setText($("#replay"), "▶ Replay"); }
+  if (S.sel) { S.sel = null; document.body.classList.remove("inspecting"); }
+  detail = { id: null, data: null, at: 0 };
+  S.expanded.clear();
+  pingUntil.clear();
+  for (const c of cards.values()) c.e.remove();
+  cards.clear();
+  for (const e of edges.values()) e.path.remove();
+  edges.clear();
+  $("#frames").replaceChildren();
+  $("#labels").replaceChildren();
+  $("#fx").replaceChildren();
+  L = null; structKey = ""; V.user = false;
+}
+function isDifferentRun(meta) {
+  if (!S.meta || !meta) return false;
+  if (meta.serverId && S.serverId && meta.serverId !== S.serverId) return true;
+  if (meta.root && S.meta.root && meta.root !== S.meta.root) return true;
+  if (meta.run && S.meta.run && meta.run !== S.meta.run) return true;
+  return false;
+}
 function applyInit(d) {
-  S.meta = d.meta; S.nodes = new Map(d.nodes.map((n) => [n.id, n]));
+  const switched = isDifferentRun(d.meta);
+  if (switched) resetForNewRun();
+  S.meta = d.meta; S.serverId = d.meta?.serverId || null; S.ended = false;
+  S.nodes = new Map(d.nodes.map((n) => [n.id, n]));
   S.events = d.events.slice().sort((a, b) => a.seq - b.seq); S.lastSeq = S.events.length ? S.events[S.events.length - 1].seq : -1;
-  S.connected = true; refresh(false);
+  S.connected = true; refresh(switched);
 }
 function applyTick(d) {
-  S.meta = d.meta; S.connected = true;
+  S.meta = d.meta; S.serverId = d.meta?.serverId || S.serverId; S.connected = true; S.ended = false;
   for (const u of d.upserts || []) S.nodes.set(u.id, u);
   for (const id of d.removed || []) S.nodes.delete(id);
   refresh(false);
   for (const ev of d.events || []) { if (ev.seq <= S.lastSeq) continue; S.lastSeq = ev.seq; S.events.push(ev); if (!S.replay) pulse(ev); }
 }
 function connect() {
-  let polling = false, got = false;
-  const poll = async () => {
-    try {
-      const d = await (await fetch("/v2/state?since=" + S.lastSeq, { cache: "no-store" })).json();
-      if (!S.meta) applyInit(d); else applyTick({ meta: d.meta, upserts: d.nodes, removed: [...S.nodes.keys()].filter((id) => !d.nodes.some((n) => n.id === id)), events: d.events });
-    } catch { S.connected = false; if (S.meta) paintHud(); }
-    setTimeout(poll, 1000);
+  let es = null, retryTimer = 0, pollTimer = 0, polling = false;
+  const stopPoll = () => { if (pollTimer) { clearTimeout(pollTimer); pollTimer = 0; } };
+  const closeEs = () => { if (es) { try { es.close(); } catch {} es = null; } };
+  const scheduleReconnect = (delay = 1500) => {
+    if (retryTimer) return;
+    retryTimer = setTimeout(() => { retryTimer = 0; openStream(); }, delay);
   };
-  try {
-    const es = new EventSource("/v2/events");
-    es.addEventListener("init", (m) => { got = true; if (!polling) applyInit(JSON.parse(m.data)); });
-    es.addEventListener("tick", (m) => { got = true; if (!polling) applyTick(JSON.parse(m.data)); });
-    es.onerror = () => { if (!polling && S.meta) { S.connected = false; paintHud(); } };
-    setTimeout(() => { if (!got) { es.close(); polling = true; poll(); } }, 5000);
-  } catch { polling = true; poll(); }
+  const poll = async () => {
+    pollTimer = 0;
+    try {
+      let d = await (await fetch("/v2/state?since=" + S.lastSeq, { cache: "no-store" })).json();
+      if (!S.meta || isDifferentRun(d.meta)) {
+        if (S.lastSeq >= 0) d = await (await fetch("/v2/state?since=-1", { cache: "no-store" })).json();
+        applyInit(d);
+      } else {
+        applyTick({ meta: d.meta, upserts: d.nodes, removed: [...S.nodes.keys()].filter((id) => !d.nodes.some((n) => n.id === id)), events: d.events });
+      }
+    } catch { S.connected = false; if (S.meta) paintHud(); }
+    pollTimer = setTimeout(poll, 1500);
+  };
+  function openStream() {
+    closeEs();
+    let got = false;
+    try {
+      const s = new EventSource("/v2/events");
+      es = s;
+      const fallback = setTimeout(() => {
+        if (!got && es === s && !S.meta) { closeEs(); polling = true; poll(); }
+      }, 5000);
+      s.addEventListener("init", (m) => {
+        if (es !== s) return;
+        got = true; polling = false; stopPoll(); clearTimeout(fallback);
+        applyInit(JSON.parse(m.data));
+      });
+      s.addEventListener("tick", (m) => {
+        if (es !== s) return;
+        got = true; clearTimeout(fallback);
+        applyTick(JSON.parse(m.data));
+      });
+      s.addEventListener("ended", () => {
+        if (es !== s) return;
+        clearTimeout(fallback);
+        S.connected = false; S.ended = true; if (S.meta) paintHud();
+        closeEs();
+        scheduleReconnect(1500);
+      });
+      s.onerror = () => {
+        if (es !== s) return;
+        clearTimeout(fallback);
+        if (S.meta) { S.connected = false; paintHud(); }
+        closeEs();
+        scheduleReconnect(1500);
+      };
+    } catch { polling = true; poll(); }
+  }
+  const wake = () => {
+    if (document.visibilityState === "hidden") return;
+    if (polling) { stopPoll(); poll(); }
+    else if (!S.connected) { if (retryTimer) { clearTimeout(retryTimer); retryTimer = 0; } openStream(); }
+  };
+  document.addEventListener("visibilitychange", wake);
+  addEventListener("focus", wake);
+  openStream();
 }
 applyView();
 if (window.__INIT) applyInit(window.__INIT); else connect();
