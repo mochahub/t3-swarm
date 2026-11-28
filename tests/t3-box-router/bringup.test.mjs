@@ -20,14 +20,15 @@ const FAKE_T3 = `#!/bin/sh
 cat "$FAKE_T3_LINKS"
 `;
 
-// Appends a run marker, saves its stdin and argv, optionally waits, optionally fixes the box, then exits.
+// Appends a run marker, saves its stdin and argv, optionally waits for a gate file (at most 20 s), optionally
+// fixes the box, then exits.
 const UP_HOOK = `#!/bin/sh
 label="$1"
 echo run >> "$MARK_DIR/$label.runs"
 cat > "$MARK_DIR/$label.input.json"
 : > "$MARK_DIR/$label.args"
 for a in "$@"; do printf '%s\\n' "$a" >> "$MARK_DIR/$label.args"; done
-if [ -n "$HOOK_SLEEP" ]; then sleep "$HOOK_SLEEP"; fi
+if [ -n "$HOOK_GATE" ]; then i=0; while [ ! -e "$HOOK_GATE" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; fi
 if [ -n "$FAKE_T3_LINKS_AFTER" ]; then cp "$FAKE_T3_LINKS_AFTER" "$FAKE_T3_LINKS"; fi
 exit "\${HOOK_EXIT:-0}"
 `;
@@ -35,6 +36,7 @@ exit "\${HOOK_EXIT:-0}"
 // Ignores SIGTERM and leaves a grandchild in its process group, so only the group SIGKILL stops it.
 const STUCK_HOOK = `#!/bin/sh
 trap '' TERM
+echo $$ > "$MARK_DIR/hook.pid"
 sleep 60 &
 echo $! > "$MARK_DIR/grandchild.pid"
 echo run >> "$MARK_DIR/$1.runs"
@@ -156,6 +158,15 @@ async function observe(t, records) {
 const entry = (report, label) => (report || []).find((e) => e.label === label);
 const listed = async (t, label) => (await t.run(["list"])).json.machines.find((m) => m.label === label);
 
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code !== "ESRCH";
+  }
+}
+
 async function waitFor(pred, ms = 5000) {
   const until = Date.now() + ms;
   while (Date.now() < until) {
@@ -268,7 +279,8 @@ test("held slots and cooldown block the hook", async () => {
 test("concurrent acquires start one hook, and no slot is booked there while it runs", async () => {
   const t = setup({ machines: { "home-box": { env: "env-home", hook: "up" } }, links: { "env-home": "offline" }, linksAfter: { "env-home": "reachable" } });
   await observe(t, factRecords("env-home"));
-  const env = { HOOK_SLEEP: "1.5" };
+  const gate = path.join(t.root, "gate");
+  const env = { HOOK_GATE: gate };
   const a = t.run(["acquire", "--run", "ra"], { env });
   assert.ok(await waitFor(() => t.runs("home-box") === 1), "the first hook started");
 
@@ -287,6 +299,7 @@ test("concurrent acquires start one hook, and no slot is booked there while it r
   assert.equal(shown.bringUp.running, true);
   assert.equal(shown.bringUp.run, "ra");
 
+  fs.writeFileSync(gate, "");
   const first = await a;
   assert.equal(entry(first.json.bringUp, "home-box").outcome, "up");
   assert.equal(t.runs("home-box"), 1);
@@ -334,15 +347,7 @@ test("a hook past its timeout is stopped with its whole process group, within th
   // 1 s timeout + 5 s SIGTERM grace, with slack for process start; never the hook's own 60 s.
   assert.ok(r.ms < 12_000, `took ${r.ms} ms`);
   const pid = Number(fs.readFileSync(path.join(t.dirs.marks, "grandchild.pid"), "utf8"));
-  const gone = await waitFor(() => {
-    try {
-      process.kill(pid, 0);
-      return false;
-    } catch (e) {
-      return e.code === "ESRCH";
-    }
-  }, 3000);
-  assert.ok(gone, `grandchild ${pid} survived`);
+  assert.ok(await waitFor(() => !alive(pid), 3000), `grandchild ${pid} survived`);
   assert.equal(t.readState().bringUp["home-box"].outcome, "timeout");
   assert.ok(t.readState().bringUp["home-box"].invalidatedAt);
 });
@@ -391,4 +396,30 @@ test("doctor reports hooks as active config with their bounds, and a broken hook
   assert.deepEqual(r.json.machines.map((m) => m.label), ["home-box"]);
   assert.match(entry(r.json.bringUp, "bad-box").detail, /not executable/);
   assert.equal(t.readState().bringUp, undefined, "nothing was claimed");
+});
+
+test("a router stopped mid-hook takes the hook's process group with it; the claim lapses at its deadline", { timeout: 30_000 }, async () => {
+  const t = setup({ machines: { "home-box": { env: "env-home", hook: "stuck", timeoutMs: 60_000 } }, links: { "env-home": "offline" } });
+  await observe(t, factRecords("env-home"));
+  const child = spawn(process.execPath, [SCRIPT, "acquire", "--run", "r1"], {
+    cwd: t.dirs.repo,
+    env: { PATH: `${t.dirs.bin}:/usr/bin:/bin`, HOME: t.dirs.user, T3_BOXES_HOME: t.dirs.home, T3_SWARM_HOME: t.dirs.swarm, FAKE_T3_LINKS: path.join(t.root, "links.json"), MARK_DIR: t.dirs.marks },
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  const exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
+  const pidFile = (n) => path.join(t.dirs.marks, n);
+  assert.ok(await waitFor(() => fs.existsSync(pidFile("hook.pid")) && fs.existsSync(pidFile("grandchild.pid")), 10_000), "hook started");
+  const hookPid = Number(fs.readFileSync(pidFile("hook.pid"), "utf8"));
+  const grandchild = Number(fs.readFileSync(pidFile("grandchild.pid"), "utf8"));
+
+  child.kill("SIGTERM");
+  const end = await exited;
+  assert.equal(end.code, 143, JSON.stringify(end));
+  assert.ok(await waitFor(() => !alive(hookPid) && !alive(grandchild), 2000), `hook ${hookPid} or grandchild ${grandchild} survived`);
+
+  // The claim stays until its deadline, so the box stays unbookable while the restart may be half done.
+  const claim = t.readState().bringUp["home-box"];
+  assert.equal(claim.finishedAt, undefined);
+  assert.ok(Date.parse(claim.deadline) >= Date.parse(claim.startedAt) + 60_000);
+  assert.match((await listed(t, "home-box")).notes.join(" "), /Bring-up hook running/);
 });

@@ -242,6 +242,31 @@ function hookArgvProblem(argv) {
   return null;
 }
 
+// Process groups of hooks still running. If the router itself is told to stop (a caller's command timeout sends
+// SIGTERM, SIGINT or SIGHUP), it kills these groups before exiting, so a hook never outlives its router unless
+// the router is SIGKILLed. The claim then lapses at its deadline and the reaper expires the box's facts.
+const liveHookGroups = new Set();
+const STOP_SIGNALS = { SIGTERM: 15, SIGINT: 2, SIGHUP: 1 };
+function onStopSignal(sig) {
+  for (const pgid of liveHookGroups) {
+    try {
+      process.kill(-pgid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
+  process.exit(128 + STOP_SIGNALS[sig]);
+}
+function trackHookGroup(pgid) {
+  if (process.platform === "win32" || !pgid) return;
+  if (!liveHookGroups.size) for (const sig of Object.keys(STOP_SIGNALS)) process.on(sig, onStopSignal);
+  liveHookGroups.add(pgid);
+}
+function untrackHookGroup(pgid) {
+  if (!liveHookGroups.delete(pgid) || liveHookGroups.size) return;
+  for (const sig of Object.keys(STOP_SIGNALS)) process.off(sig, onStopSignal);
+}
+
 // Run the hook to completion or its bound. Resolves { outcome, detail, exitCode?, signal? }; never rejects.
 function runHook(argv, input, timeoutMs) {
   return new Promise((resolve) => {
@@ -260,10 +285,12 @@ function runHook(argv, input, timeoutMs) {
     let settled = false;
     let timedOut = false;
     const timers = [];
+    trackHookGroup(child.pid);
     const settle = (r) => {
       if (settled) return;
       settled = true;
       for (const t of timers) clearTimeout(t);
+      untrackHookGroup(child.pid);
       try {
         child.stdin?.destroy();
         child.unref();

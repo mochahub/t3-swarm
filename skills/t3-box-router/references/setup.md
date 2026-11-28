@@ -88,6 +88,11 @@ shell, in the hook's own process group, and discards its output. The default tim
 the hook's process group gets SIGTERM, then SIGKILL five seconds later. A process the hook detaches with `setsid`
 escapes that stop.
 
+Give the `acquire` command a timeout of at least `bringUpTimeoutMs` plus 30 seconds. If the caller stops the
+router early with SIGTERM, SIGINT or SIGHUP, the router kills the hook's process group before it exits. If the
+router is killed with SIGKILL, the hook keeps running, and the box stays blocked until the claim's deadline
+(about 17 seconds past the hook timeout). After that, the next command expires the box's facts.
+
 The hook runs only during `acquire`, only when the acquisition falls short, and only for a box whose fresh link
 read shows it linked but down. It never runs when:
 

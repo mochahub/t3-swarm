@@ -774,7 +774,9 @@ down (the open question in section 11, resolved in favour of Phase 1). The rules
   with one JSON object on stdin and its output discarded. At `bringUpTimeoutMs` (default two minutes, at most
   ten) the group gets SIGTERM, then SIGKILL five seconds later. A process that leaves the group (`setsid`)
   escapes that stop. The claim has a deadline a little past that bound; the first transaction after it finalizes
-  an abandoned claim, so a router that died mid-hook blocks the box for at most that long.
+  an abandoned claim, so a router that died mid-hook blocks the box for at most that long. A router stopped by
+  SIGTERM, SIGINT or SIGHUP kills its running hook groups before it exits; only a SIGKILLed router leaves a hook
+  running, and its claim still blocks the box until the deadline.
 - **Invalidation before eligibility.** Finishing lifts the claim and, in the same transaction, expires every fact
   about the box observed before the hook finished, including observations an agent handed in while it ran. A
   link refresh that was read before the hook finished is dropped if it arrives later. The router then re-reads
