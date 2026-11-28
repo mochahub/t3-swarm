@@ -24,7 +24,11 @@
  *   discover(config, opts?) -> Promise<{ ok, source, proposed, configured, ... }>. Writes nothing.
  *
  * Options for the router-read functions: t3Bin (path, or false to never run t3; default searches PATH),
- * t3TimeoutMs, fetch (a fetch-compatible function), probeTimeoutMs, force (ignore fresh cached facts), labels.
+ * t3TimeoutMs, fetch (a fetch-compatible function), probeTimeoutMs, force (ignore fresh cached facts), labels,
+ * links ("keep": return every link the t3 CLI read as t3.links; "read": also read links when no configured
+ * machine needs them, for discovering newly linked boxes).
+ *
+ * Parsed links carry `urls` (credential-free origins, profile.linkUrls) only when the reply had any.
  */
 
 import { execFile } from "node:child_process";
@@ -32,6 +36,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { DEFAULTS, ID_PATTERN, LABEL_PATTERN, RESERVED_LABELS, isoTime, parseTime } from "./store.mjs";
+import { linkUrls } from "./profile.mjs";
 
 export const OBSERVABLE_TOOLS = Object.freeze(["t3_environment_links", "orchestrator_capabilities", "t3_project_list"]);
 export const LIMITS = Object.freeze({
@@ -161,7 +166,12 @@ function readRecord(rec, index) {
         seen += 1;
         if (!isObj(link) || typeof link.environmentId !== "string" || !ID_PATTERN.test(link.environmentId)) continue;
         if (!links.has(link.environmentId)) {
-          links.set(link.environmentId, { ...reduceLink(link), label: typeof link.label === "string" ? link.label.slice(0, LIMITS.string) : null });
+          const urls = linkUrls(link);
+          links.set(link.environmentId, {
+            ...reduceLink(link),
+            label: typeof link.label === "string" ? link.label.slice(0, LIMITS.string) : null,
+            ...(urls.length ? { urls } : {}),
+          });
         }
       }
     });
@@ -218,9 +228,14 @@ export function applyObservationsDetailed(config, state, records, now) {
   const byEnv = machineByEnvironment(config);
   const updated = new Set();
   const ignored = [];
+  let links = null;
 
   parsed.forEach((r, i) => {
     if (r.tool === "t3_environment_links") {
+      links = links || [];
+      for (const [environmentId, l] of r.links) {
+        if (!links.some((x) => x.environmentId === environmentId)) links.push({ environmentId, label: l.label, status: l.status, urls: l.urls || [] });
+      }
       for (const [label, m] of Object.entries(config.machines || {})) {
         const link = r.links.get(m.environmentId);
         const value = link ? { status: link.status, access: link.access, expiresAt: link.expiresAt, lastError: link.lastError } : null;
@@ -244,7 +259,8 @@ export function applyObservationsDetailed(config, state, records, now) {
     updated.add(label);
   });
 
-  return { state: next, updated: [...updated].sort(), ignored };
+  // links: every link read (configured or not), for the discovered-links cache; null without a links record.
+  return { state: next, updated: [...updated].sort(), ignored, links };
 }
 
 /** applyObservationsDetailed, returning only the new state. */
@@ -328,9 +344,11 @@ export function parseT3EnvironmentList(text) {
     const environmentId = e.environmentId ?? e.id ?? e.environment_id;
     if (typeof environmentId !== "string" || !ID_PATTERN.test(environmentId)) continue;
     const label = e.label ?? e.name ?? e.displayName;
+    const urls = linkUrls(e);
     outList.push({
       environmentId,
       label: typeof label === "string" ? label.slice(0, LIMITS.string) : null,
+      ...(urls.length ? { urls } : {}),
       ...reduceLink({
         status: e.status ?? e.state,
         access: e.access,
@@ -430,12 +448,13 @@ export async function refreshFactsDetailed(config, state, now, opts = {}) {
 
   const needLink = machines.filter(([label, m]) => opts.force || !fresh(current(label, m.environmentId).link, now));
   const t3 = { available: false };
-  if (needLink.length > 0) {
+  if (needLink.length > 0 || opts.links === "read") {
     const bin = resolveT3(opts);
     if (bin) {
       t3.available = true;
       const read = await readT3Links(bin, { timeoutMs: opts.t3TimeoutMs });
       t3.ok = read.ok;
+      if (read.ok && (opts.links === "keep" || opts.links === "read")) t3.links = read.links;
       if (read.ok) {
         const byEnv = new Map(read.links.map((l) => [l.environmentId, l]));
         for (const [label, m] of needLink) {
