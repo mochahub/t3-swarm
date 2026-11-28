@@ -14,7 +14,7 @@ import {
   bringUpCandidates,
   acquireShortfall,
   checkKnownLabels,
-} from "../scripts/cli.mjs";
+} from "../../skills/t3-box-router/scripts/cli.mjs";
 
 const NOW = Date.parse("2030-01-01T10:00:00Z");
 const iso = (ms) => new Date(ms).toISOString();
