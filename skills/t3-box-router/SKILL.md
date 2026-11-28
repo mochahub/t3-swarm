@@ -11,7 +11,9 @@ description: >-
 # t3-box-router — Machine Placement
 
 `t3-swarm` (or you) chooses the provider and model. This skill chooses the **machine** and keeps advisory capacity
-slots. You still dispatch, cancel and read results through T3. Phase 1: always-on boxes, local, Git handoff.
+slots. You still dispatch, cancel and read results through T3. Machines are local, always-on, on-demand or ephemeral
+(see [references/setup.md](references/setup.md#machine-kinds)); the router only runs the user's own hooks to start or
+stop them, never provisions anything itself.
 
 > **ROLE GUARD (READ FIRST).** Find your role and do only that part.
 >
@@ -36,6 +38,10 @@ Every command prints one JSON object and exits 0 exactly when `ok` is true. The 
 Run `box-router doctor`. If there is no config, or it reports problems, follow
 [references/setup.md](references/setup.md) with the user. Never hand-edit `state.json`.
 
+**Machine profiles.** `place`, `acquire` and `list` report `unprofiledBoxes` (linked boxes that are new, never probed
+or stale). Probe them in the background as described in [references/probe.md](references/probe.md); never let a probe
+block a placement.
+
 ## Standalone: place → delegate → done
 
 1. **Place.** From the repo checkout whose `origin` the box will use:
@@ -58,6 +64,11 @@ Run `box-router doctor`. If there is no config, or it reports problems, follow
 **Box lost mid-task:** `task_cancel` first, then `done --slot <id> --outcome unreachable` (or
 `report <label> unreachable` if you hold no slot there), then re-place and restart from the last pushed branch.
 
+**On-demand and ephemeral boxes.** `acquire` may start one through its `bringUp` hook; `keep-alive --run <id>` renews
+the lease; `release --run <id>` stops only a box the router started for that run and only when nothing else holds it.
+`handoff`/`fetch` run the user's own transfer hooks for uncommitted work. The full contract, teardown conditions and
+the manual steps when a release leaves a box running are in [references/setup.md](references/setup.md#lifecycle-hooks).
+
 ## Swarm (Level 0)
 
 When t3-swarm asks for the user's box skill, follow [references/swarm.md](references/swarm.md): acquire,
@@ -75,4 +86,4 @@ observe, register-payload to a file, `swarm boxes register`, paste `policy-line`
   `acquire` ([references/setup.md](references/setup.md#bring-up-hook)). To relink, call `t3_environment_link` with
   the user's hint once; on `pending`, continue with the other machines and do not poll.
 - More: [references/transport.md](references/transport.md) (moving work and results),
-  [references/drivers.md](references/drivers.md) (what is not supported).
+  [references/drivers.md](references/drivers.md) (what the router does not provision).

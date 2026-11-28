@@ -2,7 +2,9 @@
 
 ## 1. Summary
 
-**Status — Proposal. No implementation.**
+**Status — Historical proposal (Phase 1 was implemented).** Version note: the integrated CLI has since added on-demand
+and ephemeral machines with bring-up ownership, teardown, keep-alive, probes and handoff/fetch hooks. Those are documented in
+[README.md](README.md) and in `skills/t3-box-router/references/`, which are authoritative. This file is kept for rationale.
 
 `t3-swarm` chooses the provider, model, depth and quota bucket. `t3-box-router` chooses the execution machine. The
 calling agent dispatches the work through T3 Code. A remote dispatch uses the selected machine's `environmentId`
