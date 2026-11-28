@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { decide, parseDuration, pruneExpired, validateConfig, DEFAULTS } from '../../skills/t3-box-router/scripts/engine.mjs';
+import { decide, parseDuration, pruneExpired, validateConfig, DEFAULTS, LINK_MISSING_STATUS } from '../../skills/t3-box-router/scripts/engine.mjs';
 
 const NOW = Date.UTC(2030, 0, 1, 10);
 const MIN = 60_000;
@@ -216,6 +216,27 @@ describe('place: filters', () => {
       { label: 'local', reason: 'No free slot (4 of 4 in use).' },
       { label: 'home-box', reason: 'Missing required tag xcode.' },
     ]);
+  });
+
+  test('batch with zero booked collapses to the No eligible machine error', () => {
+    const slots = Object.fromEntries([1, 2, 3, 4].map((i) => [`l${i}`, slot('local', { repo: null })]));
+    const { result } = run('place', { state: mkState({ 'home-box': freshObs('env-home') }, { slots }), options: { count: 2, needs: ['xcode'] } });
+    assert.deepEqual(result, {
+      ok: false,
+      error: 'No eligible machine.',
+      skipped: [
+        { label: 'local', reason: 'No free slot (4 of 4 in use).' },
+        { label: 'home-box', reason: 'Missing required tag xcode.' },
+      ],
+    });
+  });
+
+  test('link recorded as missing derives unlinked and is not re-requested', () => {
+    const state = mkState({ 'home-box': freshObs('env-home', { link: { status: LINK_MISSING_STATUS } }) });
+    assert.equal(run('list', { state }).result.machines[1].state, 'unlinked');
+    const r = run('place', { state }).result;
+    assert.equal(r.placement.label, 'local');
+    assert.match(r.placement.skipped[0].reason, /missing or expired/);
   });
 
   test('exclusive gpu: second gpu task rejected, CPU work still uses the box', () => {

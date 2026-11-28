@@ -8,6 +8,12 @@
 export const RESERVED_LABELS = new Set(['local', 'box']);
 export const OBSERVATION_TOOLS = Object.freeze(['t3_environment_links', 'orchestrator_capabilities', 't3_project_list']);
 export const OBSERVE_COMMAND = 'box-router observe';
+/**
+ * Link status `observe` must record when a configured environmentId is absent from a complete
+ * t3_environment_links reply. The engine treats it (and `unlinked`) as the `unlinked` state; writing no envelope
+ * instead would make place/acquire ask for the link read again on every call.
+ */
+export const LINK_MISSING_STATUS = 'missing';
 
 export const DEFAULTS = Object.freeze({
   minLinkHours: 24,
@@ -170,7 +176,7 @@ function linkVerdict(config, link, now) {
   const d = defaultsOf(config);
   const v = link.value ?? {};
   const expiresAt = toMs(v.expiresAt);
-  if (v.status === 'missing' || v.status === 'unlinked' || (expiresAt != null && expiresAt <= now)) {
+  if (v.status === LINK_MISSING_STATUS || v.status === 'unlinked' || (expiresAt != null && expiresAt <= now)) {
     return { state: 'unlinked', reason: 'Link is missing or expired. Ask the user to link this box.' };
   }
   if (v.status !== 'reachable') {
